@@ -23,8 +23,20 @@ use crate::proto::{
 };
 use crate::pty;
 
-/// How long to keep draining output after the remote process has exited.
+/// How long to keep reading a PTY after the remote process has exited.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// How long to wait for the job to die before escalating to the next signal.
+const TERMINATE_GRACE: Duration = Duration::from_secs(2);
+
+/// How long to wait for the peer to acknowledge the final frames.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// `Ctrl-D`: what a terminal's line discipline turns into end of file.
+const EOT: u8 = 0x04;
+
+/// Shortest gap between two reloads of the authorisation store.
+const RELOAD_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Run the server until the process is stopped.
 ///
@@ -88,12 +100,28 @@ pub async fn serve(
         crate::sync::read(&store).entries().count()
     );
 
+    let mut last_reload = tokio::time::Instant::now();
     while let Some(incoming) = endpoint.accept().await {
-        // Pick up `authorize`/`revoke` changes without a restart.
-        match AuthStore::load(&paths.authorized()) {
-            Ok(fresh) => *crate::sync::write(&store) = fresh,
-            Err(e) => eprintln!("qsh-server: keeping previous authorizations: {e:#}"),
+        // Make the peer prove it can receive at its claimed address before we
+        // spend anything on it. Without this, a spoofed-source flood would
+        // reach the work below on every packet.
+        if !incoming.remote_address_validated() {
+            incoming.retry().ok();
+            continue;
         }
+
+        // Pick up `authorize`/`revoke` changes without a restart, but at most
+        // once a second: re-reading and parsing the whole directory for every
+        // arriving Initial is a denial-of-service lever, since this runs
+        // before the handshake has authenticated anybody.
+        if last_reload.elapsed() >= RELOAD_INTERVAL {
+            last_reload = tokio::time::Instant::now();
+            match AuthStore::load(&paths.authorized()) {
+                Ok(fresh) => *crate::sync::write(&store) = fresh,
+                Err(e) => eprintln!("qsh-server: keeping previous authorizations: {e:#}"),
+            }
+        }
+
         let store = Arc::clone(&store);
         tokio::spawn(async move {
             if let Err(e) = handle_connection(incoming, store).await {
@@ -102,6 +130,15 @@ pub async fn serve(
         });
     }
     Ok(())
+}
+
+/// Seconds since the Unix epoch, saturating rather than failing.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .unwrap_or(i64::MAX)
 }
 
 /// Which authorised client is on the other end of this connection?
@@ -152,7 +189,13 @@ async fn handle_connection(incoming: quinn::Incoming, store: Arc<RwLock<AuthStor
 }
 
 /// Validate a request against what this key is allowed to do.
-fn authorize_request(entry: &AuthEntry, req: &Request) -> Result<()> {
+fn authorize_request(entry: &AuthEntry, req: &Request, now_unix: i64) -> Result<()> {
+    if entry.meta.is_expired(now_unix) {
+        bail!(
+            "the authorization for key `{}` has expired; ask an administrator to renew it",
+            entry.name
+        );
+    }
     if req.version != PROTOCOL_VERSION {
         bail!(
             "protocol version mismatch: client speaks {}, server speaks {}",
@@ -207,7 +250,7 @@ async fn handle_session(
     };
 
     let start = (|| -> Result<Spawned> {
-        authorize_request(&entry, &req)?;
+        authorize_request(&entry, &req, unix_now())?;
         let user = child::resolve_user(&entry.meta.user)?;
         child::spawn(&user, &req)
     })();
@@ -231,8 +274,73 @@ async fn handle_session(
         }
     };
 
-    write_frame(&mut send, &Frame::Started).await?;
     run_session(send, recv, spawned).await
+}
+
+/// Kills the remote process group if the session goes away.
+///
+/// Tokio deliberately leaves a child running when its handle is dropped, so
+/// without this a client that is killed — or a server that is shutting down —
+/// would leave `sleep 3600` behind forever. The guard fires on every exit path
+/// including task cancellation, which is the one path an `async` cleanup step
+/// could never cover.
+struct ProcessGroupGuard {
+    pid: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid }
+    }
+
+    /// The child was reaped normally; nothing left to kill.
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+
+    /// Ask the job to go away, escalating if it will not.
+    async fn terminate(&mut self) {
+        let Some(pid) = self.pid.take() else { return };
+        for sig in [libc::SIGHUP, libc::SIGTERM] {
+            child::signal_process_group(pid, sig);
+            // Anything that is going to exit on a hangup does so promptly.
+            if tokio::time::timeout(TERMINATE_GRACE, wait_for_exit(pid))
+                .await
+                .is_ok()
+            {
+                return;
+            }
+        }
+        child::signal_process_group(pid, libc::SIGKILL);
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            // No async available here, so skip straight to the signal that
+            // cannot be ignored.
+            child::signal_process_group(pid, libc::SIGKILL);
+        }
+    }
+}
+
+/// Poll until the process group has no members left.
+async fn wait_for_exit(pid: u32) {
+    loop {
+        if !child::process_group_alive(pid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Why the session stopped.
+enum Outcome {
+    /// The remote process exited on its own.
+    Exited(std::process::ExitStatus),
+    /// The client vanished; the remote process is still running.
+    Disconnected,
 }
 
 async fn run_session(
@@ -242,6 +350,9 @@ async fn run_session(
 ) -> Result<()> {
     let Spawned { mut child, io } = spawned;
     let pid = child.id();
+    // Armed before anything that can fail, so no error path can leak the job.
+    let mut guard = ProcessGroupGuard::new(pid);
+
     let (tx, mut rx) = mpsc::channel::<Frame>(64);
 
     // Single writer for the stream: stdout, stderr and the exit status all
@@ -255,6 +366,11 @@ async fn run_session(
         let _ = send.finish();
         send
     });
+
+    if tx.send(Frame::Started).await.is_err() {
+        guard.terminate().await;
+        bail!("client closed the session before it started");
+    }
 
     let mut outputs = Vec::new();
     let stdin_sink: Box<dyn AsyncWrite + Unpin + Send>;
@@ -279,38 +395,105 @@ async fn run_session(
         }
     }
 
-    let control = tokio::spawn(control_loop(recv, stdin_sink, pid, pty_fd));
+    let mut control = tokio::spawn(control_loop(recv, stdin_sink, pid, pty_fd));
 
-    let status = child
-        .wait()
-        .await
-        .context("waiting for the remote process")?;
+    // Race the process against the client going away. Waiting only on the
+    // child would let a killed client strand a `sleep` here forever.
+    let outcome = tokio::select! {
+        status = child.wait() => Outcome::Exited(status.context("waiting for the remote process")?),
+        _ = &mut control => Outcome::Disconnected,
+    };
 
-    // Give the output pumps a moment to drain whatever is still buffered. A
-    // background job can hold the PTY open forever, so they do not get to
-    // outlive the grace period — otherwise the exit status would never be
-    // written.
-    for mut task in outputs {
-        if tokio::time::timeout(DRAIN_GRACE, &mut task).await.is_err() {
-            task.abort();
-        }
+    if matches!(outcome, Outcome::Disconnected) {
+        guard.terminate().await;
+        let _ = child.wait().await;
+        return Ok(());
     }
+    guard.disarm();
     control.abort();
 
-    let _ = tx
-        .send(Frame::Exit(ExitStatus {
+    let drained = drain(outputs, pty_fd.is_some()).await;
+
+    let exit = match (&outcome, drained) {
+        (Outcome::Exited(status), Drained::Fully) => ExitStatus {
             code: status.code().unwrap_or(0),
             signal: status.signal(),
-        }))
-        .await;
+        },
+        // Never hand back a successful status over a truncated stream: a
+        // caller redirecting our stdout to a file would silently keep a short
+        // copy and believe it.
+        (_, Drained::Incomplete(why)) => {
+            let _ = tx
+                .send(Frame::Error(format!(
+                    "the remote output could not be delivered in full: {why}"
+                )))
+                .await;
+            ExitStatus {
+                code: 255,
+                signal: None,
+            }
+        }
+        (Outcome::Disconnected, _) => return Ok(()),
+    };
+
+    let _ = tx.send(Frame::Exit(exit)).await;
     drop(tx);
 
-    if let Ok(Ok(mut send)) = tokio::time::timeout(DRAIN_GRACE, writer).await {
+    if let Ok(Ok(mut send)) = tokio::time::timeout(SHUTDOWN_GRACE, writer).await {
         // Make sure the peer sees everything before the stream disappears.
         let _ = send.flush().await;
-        let _ = tokio::time::timeout(DRAIN_GRACE, send.stopped()).await;
+        let _ = tokio::time::timeout(SHUTDOWN_GRACE, send.stopped()).await;
     }
     Ok(())
+}
+
+/// Did every byte of the child's output make it onto the wire?
+enum Drained {
+    Fully,
+    Incomplete(&'static str),
+}
+
+/// Collect the output pumps once the remote process has exited.
+///
+/// Pipes have a definite end: the kernel reports EOF once the last writer
+/// closes them, so they are drained without a deadline and back-pressure from
+/// the frame channel keeps memory bounded. A PTY master has no such guarantee —
+/// a background job holding the terminal open would keep it readable forever —
+/// so those get a grace period instead.
+async fn drain(outputs: Vec<tokio::task::JoinHandle<PumpEnd>>, is_pty: bool) -> Drained {
+    let mut result = Drained::Fully;
+    for mut task in outputs {
+        let end = if is_pty {
+            if let Ok(joined) = tokio::time::timeout(DRAIN_GRACE, &mut task).await {
+                joined.ok()
+            } else {
+                task.abort();
+                // Expected for an interactive session that leaves a background
+                // job attached to the terminal.
+                None
+            }
+        } else {
+            task.await.ok()
+        };
+        match end {
+            Some(PumpEnd::Eof) | None if is_pty => {}
+            Some(PumpEnd::Eof) => {}
+            Some(PumpEnd::ReadError) => result = Drained::Incomplete("read error"),
+            Some(PumpEnd::ClientGone) => result = Drained::Incomplete("client stopped reading"),
+            None => result = Drained::Incomplete("output task failed"),
+        }
+    }
+    result
+}
+
+/// How an output pump finished.
+enum PumpEnd {
+    /// The stream reached a real end of file; everything was forwarded.
+    Eof,
+    /// Reading the child's output failed part way through.
+    ReadError,
+    /// Nobody is left to receive the frames.
+    ClientGone,
 }
 
 /// Forward one output stream of the child into frames.
@@ -318,15 +501,20 @@ async fn pump<R: AsyncRead + Unpin>(
     mut src: R,
     tx: mpsc::Sender<Frame>,
     wrap: fn(Vec<u8>) -> Frame,
-) {
+) -> PumpEnd {
     let mut buf = vec![0u8; CHUNK];
     loop {
         match src.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) => return PumpEnd::Eof,
+            Err(_) => return PumpEnd::ReadError,
             Ok(n) => {
-                let Some(chunk) = buf.get(..n) else { break };
+                let Some(chunk) = buf.get(..n) else {
+                    return PumpEnd::ReadError;
+                };
+                // `send` awaits when the channel is full, which is the
+                // back-pressure that stops a slow client ballooning memory.
                 if tx.send(wrap(chunk.to_vec())).await.is_err() {
-                    break;
+                    return PumpEnd::ClientGone;
                 }
             }
         }
@@ -351,8 +539,21 @@ async fn control_loop(
                 }
             }
             Ok(Some(Frame::StdinEof)) => {
-                // Dropping the writer closes the pipe, which the child sees as EOF.
-                stdin_sink = None;
+                if pty_fd.is_some() {
+                    // A terminal has no "close one end": dropping our write
+                    // half would leave the read half owning the same master,
+                    // so the child would never see EOF and `qsh -t host cat
+                    // < file` would hang. Send the line discipline's EOF
+                    // character instead, as ssh does.
+                    if let Some(sink) = stdin_sink.as_mut() {
+                        let _ = sink.write_all(&[EOT]).await;
+                        let _ = sink.flush().await;
+                    }
+                } else {
+                    // Dropping the writer closes the pipe, which the child
+                    // sees as EOF.
+                    stdin_sink = None;
+                }
             }
             Ok(Some(Frame::Resize(size))) => resize(pty_fd, pid, size),
             Ok(Some(Frame::Signal(name))) => {
@@ -413,10 +614,11 @@ mod tests {
             allow_shell: false,
             allow_exec: true,
             allowed_commands: vec!["rsync".into()],
+            expires_at_unix: None,
         });
-        assert!(authorize_request(&e, &request(None)).is_err());
-        assert!(authorize_request(&e, &request(Some(&["rsync", "--server"]))).is_ok());
-        assert!(authorize_request(&e, &request(Some(&["sh"]))).is_err());
+        assert!(authorize_request(&e, &request(None), 0).is_err());
+        assert!(authorize_request(&e, &request(Some(&["rsync", "--server"])), 0).is_ok());
+        assert!(authorize_request(&e, &request(Some(&["sh"])), 0).is_err());
     }
 
     #[test]
@@ -426,9 +628,10 @@ mod tests {
             allow_shell: true,
             allow_exec: false,
             allowed_commands: vec![],
+            expires_at_unix: None,
         });
-        assert!(authorize_request(&e, &request(None)).is_ok());
-        assert!(authorize_request(&e, &request(Some(&["ls"]))).is_err());
+        assert!(authorize_request(&e, &request(None), 0).is_ok());
+        assert!(authorize_request(&e, &request(Some(&["ls"])), 0).is_err());
     }
 
     #[test]
@@ -439,7 +642,7 @@ mod tests {
         });
         let mut req = request(Some(&["ls"]));
         req.version = PROTOCOL_VERSION + 1;
-        assert!(authorize_request(&e, &req).is_err());
+        assert!(authorize_request(&e, &req, 0).is_err());
     }
 
     #[test]
@@ -448,6 +651,20 @@ mod tests {
             user: "alice".into(),
             ..Default::default()
         });
-        assert!(authorize_request(&e, &request(Some(&[]))).is_err());
+        assert!(authorize_request(&e, &request(Some(&[])), 0).is_err());
+    }
+
+    #[test]
+    fn an_expired_authorization_is_refused() {
+        let e = entry(AuthMeta {
+            user: "alice".into(),
+            expires_at_unix: Some(1_000),
+            ..Default::default()
+        });
+        assert!(authorize_request(&e, &request(Some(&["ls"])), 999).is_ok());
+        let err = authorize_request(&e, &request(Some(&["ls"])), 1_001).unwrap_err();
+        assert!(err.to_string().contains("expired"), "{err}");
+        // A shell is refused for the same reason, not just exec.
+        assert!(authorize_request(&e, &request(None), 1_001).is_err());
     }
 }

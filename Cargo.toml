@@ -2,7 +2,7 @@
 name = "qsh"
 version = "1.0.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 description = "A minimal SSH replacement over QUIC: remote shell, remote exec and rsync transport"
 license = "MIT"
 repository = "https://github.com/ddidderr/qsh"

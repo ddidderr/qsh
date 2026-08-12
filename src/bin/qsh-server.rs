@@ -1,7 +1,7 @@
 //! `qsh-server` — the daemon plus its key-management subcommands.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
@@ -86,6 +86,11 @@ struct Authorize {
     /// program is allowed.
     #[arg(long = "command", value_name = "PROGRAM")]
     commands: Vec<String>,
+    /// Stop accepting this key after N days. The deadline is recorded here on
+    /// the server and enforced regardless of what certificate the client
+    /// later presents.
+    #[arg(long, value_name = "DAYS")]
+    expires_in_days: Option<u32>,
     /// Overwrite an existing entry with the same name.
     #[arg(long)]
     force: bool,
@@ -95,6 +100,34 @@ struct Authorize {
 struct Revoke {
     /// Entry name as shown by `qsh-server list`.
     name: String,
+}
+
+/// Seconds since the Unix epoch, saturating rather than failing.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .unwrap_or(i64::MAX)
+}
+
+/// Entry names become file names under a root-owned directory, so they must
+/// not be able to escape it.
+fn validate_entry_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("entry name must not be empty");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        || name.starts_with('.')
+    {
+        bail!(
+            "entry name `{name}` must be alphanumeric with `-`, `_` or `.`, \
+             and may not start with `.`"
+        );
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -211,13 +244,7 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| "client".into());
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        || name.starts_with('.')
-    {
-        bail!("entry name `{name}` must be alphanumeric with `-`, `_` or `.`");
-    }
+    validate_entry_name(&name)?;
 
     let dir = paths.authorized();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -230,20 +257,34 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
     }
 
     let existing = AuthStore::load(&dir)?;
+    let mut replaced: Option<String> = None;
     if let Some(other) = existing.lookup(&fp) {
-        if other.name != name && !args.force {
-            bail!(
-                "that key is already authorized as `{}`; revoke it first or pass --force",
-                other.name
-            );
+        if other.name != name {
+            if !args.force {
+                bail!(
+                    "that key is already authorized as `{}`; revoke it first or pass --force",
+                    other.name
+                );
+            }
+            // The old files have to go. Two entries for one key would be
+            // resolved by file name order, so the policy that actually applied
+            // would be a coin toss — and revoking the new name would quietly
+            // reinstate the old one.
+            remove_entry(&dir, &other.name)?;
+            replaced = Some(other.name.clone());
         }
     }
+
+    let expires = args
+        .expires_in_days
+        .map(|days| unix_now().saturating_add(i64::from(days).saturating_mul(86_400)));
 
     let meta = AuthMeta {
         user: args.user.clone(),
         allow_shell: !args.no_shell,
         allow_exec: !args.no_exec,
         allowed_commands: args.commands.clone(),
+        expires_at_unix: expires,
     };
 
     let pem = std::fs::read_to_string(&args.certificate)
@@ -258,6 +299,12 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
     )?;
 
     println!("Authorized `{name}` ({fp}) as user `{}`.", args.user);
+    if let Some(old) = replaced {
+        println!("Removed the previous authorization `{old}` for the same key.");
+    }
+    if let Some(days) = args.expires_in_days {
+        println!("Expires in {days} days; after that the key is refused.");
+    }
     if !meta.allowed_commands.is_empty() {
         println!("Restricted to: {}", meta.allowed_commands.join(", "));
     }
@@ -267,25 +314,34 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
     if !meta.allow_exec {
         println!("Remote commands are refused for this key.");
     }
-    println!("The change takes effect on the next connection; no restart needed.");
+    println!("The change takes effect within a second; no restart needed.");
     Ok(())
 }
 
 fn revoke(paths: &ServerPaths, args: &Revoke) -> Result<()> {
+    // Without this, `revoke ../server` would delete the host key, and an
+    // absolute name could reach any .crt/.toml on the filesystem.
+    validate_entry_name(&args.name)?;
     let dir = paths.authorized();
+    if remove_entry(&dir, &args.name)? == 0 {
+        bail!("no authorization named `{}`", args.name);
+    }
+    println!("Revoked `{}`.", args.name);
+    Ok(())
+}
+
+/// Delete both files backing one authorization. Returns how many existed.
+fn remove_entry(dir: &Path, name: &str) -> Result<usize> {
+    validate_entry_name(name)?;
     let mut removed = 0;
     for ext in ["crt", "toml"] {
-        let path = dir.join(format!("{}.{ext}", args.name));
+        let path = dir.join(format!("{name}.{ext}"));
         if path.exists() {
             std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
             removed += 1;
         }
     }
-    if removed == 0 {
-        bail!("no authorization named `{}`", args.name);
-    }
-    println!("Revoked `{}`.", args.name);
-    Ok(())
+    Ok(removed)
 }
 
 fn list(paths: &ServerPaths) -> Result<()> {
@@ -307,6 +363,14 @@ fn list(paths: &ServerPaths) -> Result<()> {
                 "commands={}",
                 entry.meta.allowed_commands.join("+")
             ));
+        }
+        if let Some(deadline) = entry.meta.expires_at_unix {
+            let now = unix_now();
+            notes.push(if now > deadline {
+                "EXPIRED".to_owned()
+            } else {
+                format!("expires in {}d", (deadline - now).saturating_div(86_400))
+            });
         }
         let suffix = if notes.is_empty() {
             String::new()

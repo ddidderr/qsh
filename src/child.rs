@@ -61,6 +61,23 @@ pub fn signal_process_group(pid: u32, sig: i32) {
     }
 }
 
+/// Does the process group still have any member left?
+///
+/// Uses signal 0, which performs the permission and existence checks without
+/// delivering anything.
+#[allow(
+    unsafe_code,
+    reason = "kill(2) has no safe wrapper; the pid comes from our own child"
+)]
+#[must_use]
+pub fn process_group_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: `kill` with signal 0 only probes; it reads two scalars.
+    unsafe { libc::kill(-pid, 0) == 0 }
+}
+
 impl Spawned {
     /// Send a signal to the process group of the remote process.
     pub fn signal(&self, sig: i32) {
@@ -154,11 +171,28 @@ pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
         }
     }
 
-    // Everything the pre-exec hook needs, prepared while allocation is still safe.
+    // Everything the pre-exec hook needs, resolved *before* the fork.
+    //
+    // The supplementary groups in particular: `initgroups` goes through NSS,
+    // which may load modules, allocate and take locks — none of it
+    // async-signal-safe. In a forked child of a multi-threaded process (which
+    // a tokio server always is) a lock held by another thread at fork time
+    // stays locked forever, so calling it after the fork can hang logins
+    // outright on an LDAP or SSSD host. Resolve the list here and apply the
+    // finished numbers with a bare `setgroups` in the child.
     let username = CString::new(user.name.as_str()).context("user name contains a NUL byte")?;
     let uid = user.uid.as_raw();
     let gid = user.gid.as_raw();
     let switch = must_switch;
+    let groups: Vec<libc::gid_t> = if must_switch {
+        nix::unistd::getgrouplist(&username, user.gid)
+            .with_context(|| format!("looking up the groups of `{}`", user.name))?
+            .into_iter()
+            .map(Gid::as_raw)
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let (io, spawned) = if let Some(p) = &req.pty {
         {
@@ -179,7 +213,7 @@ pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
                     if libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
-                    drop_privileges(switch, username.as_ptr(), uid, gid)
+                    drop_privileges(switch, &groups, uid, gid)
                 });
             }
             let child = cmd
@@ -198,7 +232,7 @@ pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
                     if libc::setsid() < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
-                    drop_privileges(switch, username.as_ptr(), uid, gid)
+                    drop_privileges(switch, &groups, uid, gid)
                 });
             }
             let mut child = cmd
@@ -225,22 +259,26 @@ fn describe(command: Option<&Vec<String>>, shell: &Path) -> String {
 }
 
 /// Runs between `fork` and `exec`; must stay async-signal-safe.
+///
+/// Every call here is a plain syscall. `groups` was resolved before the fork
+/// precisely so that no NSS lookup happens on this side of it.
 #[allow(
     unsafe_code,
-    reason = "setuid/setgid/initgroups have no safe wrappers and must run here"
+    reason = "setuid/setgid/setgroups have no safe wrappers and must run here"
 )]
 fn drop_privileges(
     switch: bool,
-    username: *const libc::c_char,
+    groups: &[libc::gid_t],
     uid: libc::uid_t,
     gid: libc::gid_t,
 ) -> std::io::Result<()> {
     if !switch {
         return Ok(());
     }
-    // SAFETY: async-signal-safe libc calls; `username` outlives the closure.
+    // SAFETY: async-signal-safe syscalls only. `groups` is owned by the
+    // closure, so the slice stays valid across the fork.
     unsafe {
-        if libc::initgroups(username, gid) != 0 {
+        if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
             return Err(std::io::Error::last_os_error());
         }
         if libc::setgid(gid) != 0 {

@@ -14,6 +14,7 @@
 )]
 
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -67,6 +68,12 @@ impl Fixture {
     /// Set up server and client identities, authorise the client, start the
     /// server and wait until it answers.
     fn start(extra_authorize: &[&str]) -> Self {
+        Self::start_with(extra_authorize, None)
+    }
+
+    /// `idle_timeout_secs` overrides how quickly the server gives up on a
+    /// silent peer, which is what bounds cleanup after a client is killed.
+    fn start_with(extra_authorize: &[&str], idle_timeout_secs: Option<u64>) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let server_dir = tmp.path().join("server");
         let client_dir = tmp.path().join("client");
@@ -95,6 +102,14 @@ impl Fixture {
             SERVER_BIN,
             &args.iter().map(String::as_str).collect::<Vec<_>>(),
         );
+
+        if let Some(idle) = idle_timeout_secs {
+            std::fs::write(
+                server_dir.join("qsh-server.toml"),
+                format!("idle_timeout_secs = {idle}\nkeepalive_secs = 1\n"),
+            )
+            .unwrap();
+        }
 
         // Let the kernel choose the port and learn it from the server's own
         // log line; picking a port up front would race with parallel tests.
@@ -310,6 +325,10 @@ fn revoking_a_key_takes_effect_without_a_restart() {
         SERVER_BIN,
         &["--dir", f.server_dir.to_str().unwrap(), "revoke", "tester"],
     );
+    // The server re-reads `authorized/` at most once a second, so that an
+    // unauthenticated packet flood cannot make it parse the directory over and
+    // over. Give it that long to notice.
+    std::thread::sleep(Duration::from_millis(1_200));
     assert_ne!(f.exec(&["true"]).0, 0, "revoked key still worked");
 }
 
@@ -347,6 +366,289 @@ fn a_changed_host_key_is_refused() {
         !out.status.success(),
         "connection with a wrong pin succeeded"
     );
+}
+
+#[test]
+fn a_restricted_key_cannot_run_a_lookalike_from_a_writable_path() {
+    // The regression behind the review: matching an allow-list entry by
+    // basename would let this key run anything it can drop on disk.
+    let f = Fixture::start(&["--command", "echo"]);
+    let planted = f.tmp.path().join("echo");
+    std::fs::write(&planted, "#!/bin/sh\necho pwned\n").unwrap();
+    std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (code, out, err) = f.exec(&[planted.to_str().unwrap(), "hello"]);
+    assert_ne!(code, 0, "a planted `echo` was executed: {out}");
+    assert!(
+        !out.contains("pwned"),
+        "a planted `echo` was executed: {out}"
+    );
+    assert!(err.contains("may not execute"), "stderr: {err}");
+
+    // The legitimate bare name still works, resolved through the server's PATH.
+    assert_eq!(f.exec(&["echo", "hi"]).1.trim(), "hi");
+}
+
+#[test]
+fn a_disconnected_client_does_not_strand_the_remote_process() {
+    // A killed client sends no close frame, so the server learns of it through
+    // the QUIC idle timeout. Shorten it so the test does not sit for a minute.
+    let f = Fixture::start_with(&[], Some(3));
+    // A marker file lets us identify this exact process afterwards.
+    let marker = f.tmp.path().join("victim");
+    let mut child = f
+        .client()
+        .args([
+            "sh",
+            "-c",
+            &format!("touch {}; sleep 300", marker.display()),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "remote command never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        sleep_processes_exist(),
+        "the remote sleep should be running"
+    );
+
+    // Kill the client the way a crash or a lost network would.
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while sleep_processes_exist() {
+        assert!(
+            Instant::now() < deadline,
+            "the remote process outlived its session"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Is any `sleep 300` (the one this test starts) still running?
+fn sleep_processes_exist() -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let cmdline = entry.path().join("cmdline");
+        if let Ok(raw) = std::fs::read(&cmdline) {
+            let parts: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+            if parts.first().is_some_and(|p| p.ends_with(b"sleep"))
+                && parts.get(1).is_some_and(|p| *p == b"300")
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[test]
+fn output_is_never_truncated_behind_a_success_status() {
+    let f = Fixture::start(&[]);
+    // Far more than the frame channel or any socket buffer can hold, so the
+    // pump only finishes if it is genuinely drained to EOF.
+    let (code, out, err) = f.exec(&["sh", "-c", "yes abcdefghij | head -n 200000"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out.lines().count(), 200_000, "output was truncated");
+}
+
+#[test]
+fn a_forced_terminal_still_delivers_end_of_file() {
+    let f = Fixture::start(&[]);
+    // `-t` with redirected input: the PTY has to receive an EOF character,
+    // because a terminal has no half to close.
+    let mut child = Command::new(CLIENT_BIN)
+        .args([
+            "-i",
+            f.client_dir.to_str().unwrap(),
+            "-p",
+            &f.port.to_string(),
+            "--accept-new",
+            "-q",
+            "-t",
+            "127.0.0.1",
+            "cat",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"hello\n").unwrap();
+    drop(stdin);
+
+    let out = wait_with_deadline(child, Duration::from_secs(15))
+        .expect("`qsh -t host cat < file` never saw end of file");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("hello"),
+        "output was {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// Wait for a child, killing it and returning `None` if it overruns.
+fn wait_with_deadline(mut child: Child, limit: Duration) -> Option<std::process::Output> {
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+#[test]
+fn a_session_runs_as_the_authorized_account() {
+    // Only meaningful as root, where the server actually switches user.
+    if !nix::unistd::Uid::effective().is_root() {
+        eprintln!("skipping: not running as root, no privilege drop to exercise");
+        return;
+    }
+    let Some(target) = ["nobody", "daemon", "bin"]
+        .into_iter()
+        .find(|u| nix::unistd::User::from_name(u).ok().flatten().is_some())
+    else {
+        eprintln!("skipping: no unprivileged account to switch to");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let server_dir = tmp.path().join("server");
+    let client_dir = tmp.path().join("client");
+    run(
+        SERVER_BIN,
+        &["--dir", server_dir.to_str().unwrap(), "keygen"],
+    );
+    run(
+        CLIENT_BIN,
+        &["keygen", "--identity", client_dir.to_str().unwrap()],
+    );
+    run(
+        SERVER_BIN,
+        &[
+            "--dir",
+            server_dir.to_str().unwrap(),
+            "authorize",
+            client_dir.join("id.crt").to_str().unwrap(),
+            "--user",
+            target,
+            "--name",
+            "dropped",
+        ],
+    );
+
+    let log = tmp.path().join("server.log");
+    let mut server = Command::new(SERVER_BIN)
+        .args([
+            "--dir",
+            server_dir.to_str().unwrap(),
+            "serve",
+            "--listen",
+            "127.0.0.1:0",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
+        .spawn()
+        .unwrap();
+    let port = wait_for_port(&log);
+
+    let out = Command::new(CLIENT_BIN)
+        .args([
+            "-i",
+            client_dir.to_str().unwrap(),
+            "-p",
+            &port.to_string(),
+            "--accept-new",
+            "-q",
+            "127.0.0.1",
+            "id",
+            "-un",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let _ = server.kill();
+    let _ = server.wait();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        target,
+        "the session did not run as the authorized account"
+    );
+}
+
+#[test]
+fn an_expired_authorization_stops_working() {
+    let f = Fixture::start(&["--expires-in-days", "30"]);
+    assert_eq!(f.exec(&["true"]).0, 0, "should work before the deadline");
+
+    // Move the recorded deadline into the past. This is the administrator's
+    // deadline, so it must bite regardless of the certificate the client holds.
+    let meta_path = f.server_dir.join("authorized/tester.toml");
+    let meta = std::fs::read_to_string(&meta_path).unwrap();
+    assert!(
+        meta.contains("expires_at_unix"),
+        "no deadline recorded: {meta}"
+    );
+    let rewritten: String = meta
+        .lines()
+        .map(|l| {
+            if l.starts_with("expires_at_unix") {
+                "expires_at_unix = 1".to_owned()
+            } else {
+                l.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&meta_path, rewritten).unwrap();
+    std::thread::sleep(Duration::from_millis(1_200));
+
+    let (code, _, err) = f.exec(&["true"]);
+    assert_ne!(code, 0, "an expired authorization still worked");
+    assert!(err.contains("expired"), "stderr: {err}");
+}
+
+#[test]
+fn revoke_cannot_escape_the_authorized_directory() {
+    let f = Fixture::start(&[]);
+    let host_key = f.server_dir.join("server.crt");
+    assert!(host_key.exists());
+
+    let out = Command::new(SERVER_BIN)
+        .args([
+            "--dir",
+            f.server_dir.to_str().unwrap(),
+            "revoke",
+            "../server",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a traversing name was accepted");
+    assert!(host_key.exists(), "revoke deleted the host key");
 }
 
 #[test]

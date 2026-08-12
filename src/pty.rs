@@ -200,6 +200,19 @@ impl AsyncWrite for PtyMaster {
     }
 }
 
+/// Restore previously saved terminal settings on `fd`.
+///
+/// Safe to call from a signal-driven path: it only issues one `tcsetattr`.
+#[allow(
+    unsafe_code,
+    reason = "borrows a terminal fd the caller guarantees is still open"
+)]
+pub fn restore_termios(fd: RawFd, saved: &nix::sys::termios::Termios) {
+    // SAFETY: the borrow lives only for this call.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let _ = nix::sys::termios::tcsetattr(borrowed, nix::sys::termios::SetArg::TCSANOW, saved);
+}
+
 /// Put a terminal into raw mode, restoring the previous settings on drop.
 ///
 /// This is what keeps the remote side in charge of echo, line editing and
@@ -212,6 +225,16 @@ pub struct RawMode {
 }
 
 impl RawMode {
+    /// A copy of the settings to restore, for use outside the guard.
+    ///
+    /// A fatal signal terminates the process without unwinding, so `Drop`
+    /// never runs and the user's terminal would be left raw. Handing the saved
+    /// settings to a signal handler is the only way to put them back.
+    #[must_use]
+    pub fn saved(&self) -> nix::sys::termios::Termios {
+        self.saved.clone()
+    }
+
     /// Switch `fd` to raw mode.
     ///
     /// # Errors

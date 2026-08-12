@@ -19,6 +19,8 @@ use crate::net::transport_config;
 use crate::proto::{
     read_frame, write_frame, ExitStatus, Frame, PtyRequest, Request, CHUNK, PROTOCOL_VERSION,
 };
+use std::os::fd::RawFd;
+
 use crate::pty::{self, RawMode};
 
 /// What to do when the host is not in `known_hosts` yet.
@@ -31,6 +33,43 @@ pub enum HostKeyPolicy {
     /// Never pin automatically.
     Refuse,
 }
+
+/// Which IP families the client may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AddressFamily {
+    #[default]
+    Any,
+    V4,
+    V6,
+}
+
+impl AddressFamily {
+    fn accepts(self, addr: &SocketAddr) -> bool {
+        match self {
+            Self::Any => true,
+            Self::V4 => addr.is_ipv4(),
+            Self::V6 => addr.is_ipv6(),
+        }
+    }
+}
+
+impl std::fmt::Display for AddressFamily {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Any => "usable",
+            Self::V4 => "IPv4",
+            Self::V6 => "IPv6",
+        })
+    }
+}
+
+/// Idle timeout for an established session. QUIC uses the lower of the two
+/// peers' values, so this only matters if the server's is higher.
+const IDLE_TIMEOUT_SECS: u64 = 60;
+/// Keep-alive interval for an established session.
+const KEEPALIVE_SECS: u64 = 15;
+/// Default deadline for reaching one address.
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 /// Whether the session should get a terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +92,8 @@ pub struct Options {
     pub host_key_policy: HostKeyPolicy,
     pub paths_dir: Option<std::path::PathBuf>,
     pub quiet: bool,
+    pub family: AddressFamily,
+    pub connect_timeout_secs: u64,
 }
 
 impl Options {
@@ -84,8 +125,12 @@ impl ServerCertVerifier for CaptureVerifier {
         _intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp: &[u8],
-        _now: UnixTime,
+        now: UnixTime,
     ) -> std::result::Result<ServerCertVerified, TlsError> {
+        // Trust-on-first-use decides *which* key to trust; it does not excuse
+        // an expired or not-yet-valid certificate. Skipping this would mean
+        // expiry never applied to exactly the clients that have no pin yet.
+        crypto::check_validity(end_entity, now)?;
         let fp = Fingerprint::of_cert(end_entity)
             .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
         *crate::sync::mutex(&self.seen) = Some(fp);
@@ -162,31 +207,19 @@ pub async fn run(opts: Options) -> Result<i32> {
         .context("installing your client certificate")?;
     tls.alpn_protocols = vec![crate::proto::ALPN.to_vec()];
 
-    let addr = resolve(&opts.host, opts.port)?;
-    // Bind the wildcard address of the same family the server resolved to.
-    let bind = SocketAddr::new(
-        if addr.is_ipv6() {
-            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
-        } else {
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-        },
-        0,
-    );
-    let mut endpoint = quinn::Endpoint::client(bind).context("opening a local UDP socket")?;
-    let mut client_config = quinn::ClientConfig::new(Arc::new(
-        QuicClientConfig::try_from(tls).context("building the QUIC crypto configuration")?,
-    ));
-    client_config.transport_config(Arc::new(transport_config(
-        Duration::from_secs(600),
-        Duration::from_secs(15),
-    )?));
-    endpoint.set_default_client_config(client_config);
+    let addrs = resolve(&opts.host, opts.port, opts.family)?;
+    let client_config = {
+        let mut cfg = quinn::ClientConfig::new(Arc::new(
+            QuicClientConfig::try_from(tls).context("building the QUIC crypto configuration")?,
+        ));
+        cfg.transport_config(Arc::new(transport_config(
+            Duration::from_secs(IDLE_TIMEOUT_SECS),
+            Duration::from_secs(KEEPALIVE_SECS),
+        )?));
+        cfg
+    };
 
-    let conn = endpoint
-        .connect(addr, sni_name(&opts.host))
-        .context("starting the QUIC handshake")?
-        .await
-        .map_err(|e| connect_error(&e, &opts, addr))?;
+    let (endpoint, conn) = connect_any(&addrs, &client_config, &opts).await?;
 
     // Trust on first use: the handshake is complete but nothing has been sent.
     if pinned.is_none() {
@@ -206,6 +239,69 @@ pub async fn run(opts: Options) -> Result<i32> {
     conn.close(0u32.into(), b"bye");
     endpoint.wait_idle().await;
     status
+}
+
+/// Try each resolved address in turn, with its own deadline.
+///
+/// The QUIC idle timeout governs an established session and is far too long to
+/// use for reaching a host that is simply filtered, so each attempt gets a
+/// short connect timeout of its own.
+async fn connect_any(
+    addrs: &[SocketAddr],
+    client_config: &quinn::ClientConfig,
+    opts: &Options,
+) -> Result<(quinn::Endpoint, quinn::Connection)> {
+    let mut last: Option<anyhow::Error> = None;
+    for &addr in addrs {
+        // The local socket must be of the same family as the destination.
+        let bind = SocketAddr::new(
+            if addr.is_ipv6() {
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+            } else {
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            },
+            0,
+        );
+        let mut endpoint = match quinn::Endpoint::client(bind) {
+            Ok(e) => e,
+            Err(e) => {
+                last = Some(anyhow::Error::new(e).context("opening a local UDP socket"));
+                continue;
+            }
+        };
+        endpoint.set_default_client_config(client_config.clone());
+
+        let connecting = match endpoint.connect(addr, sni_name(&opts.host)) {
+            Ok(c) => c,
+            Err(e) => {
+                last = Some(anyhow::Error::new(e).context("starting the QUIC handshake"));
+                continue;
+            }
+        };
+        match tokio::time::timeout(Duration::from_secs(opts.connect_timeout_secs), connecting).await
+        {
+            Ok(Ok(conn)) => return Ok((endpoint, conn)),
+            Ok(Err(e)) => {
+                // A host key mismatch is about identity, not reachability;
+                // trying the next address would only repeat it.
+                let fatal = matches!(&e, quinn::ConnectionError::TransportError(te)
+                    if te.to_string().contains("host key mismatch"));
+                let err = connect_error(&e, opts, addr);
+                if fatal {
+                    return Err(err);
+                }
+                last = Some(err);
+            }
+            Err(_) => {
+                last = Some(anyhow!(
+                    "connecting to {} ({addr}) timed out after {}s",
+                    opts.host,
+                    opts.connect_timeout_secs
+                ));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("`{}` did not resolve to any address", opts.host)))
 }
 
 /// Turn a connection failure into a message that says what to do next.
@@ -243,13 +339,24 @@ fn sni_name(host: &str) -> &str {
     }
 }
 
-fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
+/// Every address the host resolves to, filtered by the requested family.
+///
+/// Returning only the first result would make a perfectly reachable host fail
+/// on resolver order alone — `localhost` yielding `::1` first while the server
+/// listens on `0.0.0.0` is the everyday case.
+fn resolve(host: &str, port: u16, family: AddressFamily) -> Result<Vec<SocketAddr>> {
     let trimmed = host.trim_start_matches('[').trim_end_matches(']');
-    (trimmed, port)
+    let mut addrs: Vec<SocketAddr> = (trimmed, port)
         .to_socket_addrs()
         .with_context(|| format!("resolving `{host}`"))?
-        .next()
-        .ok_or_else(|| anyhow!("`{host}` did not resolve to any address"))
+        .filter(|a| family.accepts(a))
+        .collect();
+    // Try IPv6 first when both are on offer, then fall back.
+    addrs.sort_by_key(|a| u8::from(a.is_ipv4()));
+    if addrs.is_empty() {
+        bail!("`{host}` did not resolve to any {family} address");
+    }
+    Ok(addrs)
 }
 
 /// Trust-on-first-use decision for an unknown host.
@@ -351,7 +458,12 @@ async fn session(conn: &quinn::Connection, opts: &Options) -> Result<i32> {
     }
 
     let raw = if use_pty && std::io::stdin().is_terminal() {
-        Some(RawMode::enable(stdin_fd).context("switching the terminal to raw mode")?)
+        let guard = RawMode::enable(stdin_fd).context("switching the terminal to raw mode")?;
+        // `Drop` covers the ordinary paths, but a fatal signal does not unwind,
+        // so without this the user would be left with a terminal that no longer
+        // echoes and no obvious way back.
+        tokio::spawn(restore_terminal_on_fatal_signal(stdin_fd, guard.saved()));
+        Some(guard)
     } else {
         None
     };
@@ -514,6 +626,30 @@ impl EscapeState {
     }
 }
 
+/// Put the terminal back and exit when a fatal signal arrives.
+///
+/// `SIGINT` is deliberately absent: in a PTY session Ctrl-C is just a byte for
+/// the remote terminal, and the local process should not act on it.
+async fn restore_terminal_on_fatal_signal(fd: RawFd, saved: nix::sys::termios::Termios) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let (Ok(mut term), Ok(mut hup), Ok(mut quit)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::hangup()),
+        signal(SignalKind::quit()),
+    ) else {
+        return;
+    };
+    let sig = tokio::select! {
+        _ = term.recv() => libc::SIGTERM,
+        _ = hup.recv() => libc::SIGHUP,
+        _ = quit.recv() => libc::SIGQUIT,
+    };
+    pty::restore_termios(fd, &saved);
+    let mut stdout = tokio::io::stdout();
+    let _ = stdout.flush().await;
+    std::process::exit(128 + sig);
+}
+
 /// Forward terminal resizes.
 async fn forward_winch(tx: Outbound) {
     let Ok(mut winch) =
@@ -606,6 +742,58 @@ mod tests {
         assert!(!disconnect);
     }
 
+    fn verify(pem: &str) -> std::result::Result<ServerCertVerified, TlsError> {
+        let der = crypto::cert_from_pem(pem).unwrap();
+        let now = UnixTime::since_unix_epoch(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap(),
+        );
+        CaptureVerifier::new().verify_server_cert(
+            &der,
+            &[],
+            &ServerName::try_from("qsh").unwrap(),
+            &[],
+            now,
+        )
+    }
+
+    #[test]
+    fn first_contact_still_rejects_a_certificate_outside_its_validity() {
+        // Trust on first use picks which key to trust; it is not a licence to
+        // accept an expired one. Getting this wrong would mean expiry never
+        // applied to precisely the clients that have no pin yet.
+        let (expired, _) = crypto::generate_identity_outside_validity(true).unwrap();
+        assert!(
+            verify(&expired).is_err(),
+            "an expired host key was accepted"
+        );
+
+        let (future, _) = crypto::generate_identity_outside_validity(false).unwrap();
+        assert!(
+            verify(&future).is_err(),
+            "a not-yet-valid host key was accepted"
+        );
+
+        let (good, _) = crypto::generate_identity("host", &["localhost".into()], 30).unwrap();
+        assert!(verify(&good).is_ok(), "a valid host key was rejected");
+    }
+
+    #[test]
+    fn resolution_honours_the_requested_family() {
+        let v4 = resolve("127.0.0.1", 2222, AddressFamily::Any).unwrap();
+        assert!(v4.iter().all(SocketAddr::is_ipv4));
+        assert!(resolve("127.0.0.1", 2222, AddressFamily::V6).is_err());
+
+        // A dual-stack name must offer every address, not just the first.
+        if let Ok(all) = resolve("localhost", 2222, AddressFamily::Any) {
+            assert!(!all.is_empty());
+            for addr in &all {
+                assert_eq!(addr.port(), 2222);
+            }
+        }
+    }
+
     #[test]
     fn sni_falls_back_for_addresses() {
         assert_eq!(sni_name("192.0.2.1"), "qsh");
@@ -624,6 +812,8 @@ mod tests {
             host_key_policy: HostKeyPolicy::Ask,
             paths_dir: None,
             quiet: false,
+            family: AddressFamily::Any,
+            connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
         };
         assert!(!want_pty(&base));
         assert!(want_pty(&Options {

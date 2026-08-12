@@ -140,7 +140,10 @@ fn default_listen() -> String {
     format!("0.0.0.0:{DEFAULT_PORT}")
 }
 fn default_idle() -> u64 {
-    600
+    // Four missed keep-alives. This is also the backstop that reclaims a
+    // session whose client was killed outright: a dead peer sends no close
+    // frame, so nothing else tells the server the client is gone.
+    60
 }
 fn default_keepalive() -> u64 {
     15
@@ -194,10 +197,19 @@ pub struct AuthMeta {
     /// May this certificate run non-interactive commands?
     #[serde(default = "yes")]
     pub allow_exec: bool,
-    /// If non-empty, only these program names (argv[0], basename compared)
-    /// may be executed. `allow_shell` is governed separately.
+    /// If non-empty, only these exact `argv[0]` values may be executed.
+    /// `allow_shell` is governed separately.
     #[serde(default)]
     pub allowed_commands: Vec<String>,
+    /// Unix timestamp after which this authorization stops being accepted.
+    ///
+    /// This is the administrator's deadline, recorded when the key was
+    /// authorized. It is deliberately independent of the certificate the
+    /// client presents: whoever holds the private key can always mint a fresh
+    /// certificate for the same public key with a later expiry, so the
+    /// presented certificate's own validity window cannot bound access.
+    #[serde(default)]
+    pub expires_at_unix: Option<i64>,
 }
 
 fn yes() -> bool {
@@ -211,12 +223,23 @@ impl Default for AuthMeta {
             allow_shell: true,
             allow_exec: true,
             allowed_commands: Vec::new(),
+            expires_at_unix: None,
         }
     }
 }
 
 impl AuthMeta {
     /// Is `argv` permitted by `allowed_commands`?
+    ///
+    /// The comparison is against the whole of `argv[0]`, never its basename.
+    /// Matching a basename would be a hole rather than a convenience: the
+    /// authorized account can write an executable to a path it controls — with
+    /// this very rsync-only key, no less — and then ask for `/tmp/rsync`, so a
+    /// key restricted to `rsync` could run anything.
+    ///
+    /// A bare name such as `rsync` therefore permits exactly `rsync`, which
+    /// the server resolves through its own fixed `PATH`. To allow a program
+    /// somewhere else, authorize its absolute path.
     #[must_use]
     pub fn command_allowed(&self, argv: &[String]) -> bool {
         if self.allowed_commands.is_empty() {
@@ -225,13 +248,15 @@ impl AuthMeta {
         let Some(program) = argv.first() else {
             return false;
         };
-        let base = Path::new(program)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(program);
         self.allowed_commands
             .iter()
-            .any(|allowed| allowed == program || allowed == base)
+            .any(|allowed| allowed == program)
+    }
+
+    /// Has the administrator's deadline for this authorization passed?
+    #[must_use]
+    pub fn is_expired(&self, now_unix: i64) -> bool {
+        self.expires_at_unix.is_some_and(|limit| now_unix > limit)
     }
 }
 
@@ -446,17 +471,64 @@ mod tests {
     }
 
     #[test]
-    fn allowed_commands_match_by_name_or_path() {
+    fn allowed_commands_match_argv0_exactly() {
         let meta = AuthMeta {
             user: "alice".into(),
             allowed_commands: vec!["rsync".into()],
             ..Default::default()
         };
         assert!(meta.command_allowed(&["rsync".into(), "--server".into()]));
-        assert!(meta.command_allowed(&["/usr/bin/rsync".into()]));
         assert!(!meta.command_allowed(&["rm".into(), "-rf".into(), "/".into()]));
         assert!(!meta.command_allowed(&["rsyncevil".into()]));
         assert!(!meta.command_allowed(&[]));
+    }
+
+    #[test]
+    fn a_basename_match_cannot_smuggle_in_another_executable() {
+        // The whole point of an rsync-only key: the account can write files,
+        // so anything matched by basename alone would be arbitrary code.
+        let meta = AuthMeta {
+            user: "alice".into(),
+            allowed_commands: vec!["rsync".into()],
+            ..Default::default()
+        };
+        for evil in [
+            "/tmp/rsync",
+            "./rsync",
+            "../rsync",
+            "/home/alice/bin/rsync",
+            "/usr/bin/rsync",
+        ] {
+            assert!(
+                !meta.command_allowed(&[evil.into()]),
+                "`{evil}` must not satisfy an allow-list entry of `rsync`"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absolute_path_can_be_authorized_explicitly() {
+        let meta = AuthMeta {
+            user: "alice".into(),
+            allowed_commands: vec!["/usr/bin/rsync".into()],
+            ..Default::default()
+        };
+        assert!(meta.command_allowed(&["/usr/bin/rsync".into()]));
+        assert!(!meta.command_allowed(&["rsync".into()]));
+        assert!(!meta.command_allowed(&["/tmp/rsync".into()]));
+    }
+
+    #[test]
+    fn authorization_expiry_is_independent_of_any_certificate() {
+        let mut meta = AuthMeta {
+            user: "alice".into(),
+            ..Default::default()
+        };
+        assert!(!meta.is_expired(i64::MAX), "no deadline means no expiry");
+        meta.expires_at_unix = Some(1_000);
+        assert!(!meta.is_expired(999));
+        assert!(!meta.is_expired(1_000));
+        assert!(meta.is_expired(1_001));
     }
 
     #[test]

@@ -47,7 +47,9 @@ indirection rather than rustls directly.
 cargo install --path .          # installs qsh and qsh-server
 ```
 
-Requires a Unix-like system (Linux is what it is tested on) and Rust 1.82+.
+Requires a Unix-like system (Linux is what it is tested on) and Rust 1.88+,
+which is what the pinned dependency graph in `Cargo.lock` needs. CI builds
+both that version and current stable with `--locked`.
 
 ## Setup
 
@@ -84,8 +86,8 @@ Copy `id.crt` to the server, then:
 sudo qsh-server authorize alice-laptop.crt --user alice
 ```
 
-That maps this key to the local account `alice`. It takes effect on the next
-connection — no restart. Useful variations:
+That maps this key to the local account `alice`. It takes effect within a
+second — no restart. Useful variations:
 
 ```
 # rsync-only key: no interactive shell, no other programs
@@ -147,13 +149,36 @@ long-lived self-signed **Ed25519** certificate.
 
 * Fingerprints are `sha256:` over the certificate's SubjectPublicKeyInfo, so
   renewing a certificate for the same key does not invalidate a pin.
-* Certificates expire on their own (`--days`, default 3650). An expired one
-  stops being accepted with no further action.
+* A certificate outside its validity window is refused in both directions,
+  including on a client's very first connection to an unknown host.
+* **Certificate expiry is not what bounds an authorization.** Because the
+  server pins a public key, anyone holding the matching private key can
+  self-issue a fresh certificate with a later `notAfter` and the fingerprint
+  still matches. If you want an authorization to lapse, give it a deadline the
+  server owns:
+
+  ```
+  sudo qsh-server authorize alice-laptop.crt --user alice --expires-in-days 90
+  ```
+
+  That deadline is recorded in `authorized/<name>.toml` and enforced
+  independently of whatever certificate the client presents. `qsh-server list`
+  shows the remaining time.
 * Deleting `authorized/<name>.crt` (or `qsh-server revoke <name>`) takes
-  effect on the next connection.
+  effect within a second, without a restart.
 * Private keys are written 0600 and refused at load time if they are group- or
   world-readable.
-* Client authentication is mandatory; TLS 1.3 only.
+* Client authentication is mandatory; TLS 1.3 only. Unvalidated peer addresses
+  are made to complete a QUIC retry before the server does any work for them.
+* A key restricted with `--command` is matched against the whole of `argv[0]`,
+  never its basename: the authorized account can write files, so permitting
+  `/tmp/rsync` because it ends in `rsync` would make an rsync-only key a
+  general-purpose one. A bare name is resolved through the server's own fixed
+  `PATH`; to allow a program elsewhere, authorize its absolute path.
+* A session is torn down with its connection. If the client is killed, the
+  server notices when the QUIC idle timeout expires (60s by default, with
+  15-second keep-alives) and signals the remote process group `SIGHUP`, then
+  `SIGTERM`, then `SIGKILL` — nothing is left running.
 * The client cannot set arbitrary environment variables. Only `TERM`, `LANG`,
   `COLORTERM`, `LC_*` and `QSH_*` survive; `PATH` is fixed by the server. The
   remote process gets a fresh session (`setsid`) and, when root, a full
@@ -169,7 +194,7 @@ helpers, or Windows support.
 
 ```toml
 listen = "0.0.0.0:2222"     # QUIC is UDP; this does not collide with sshd
-idle_timeout_secs = 600
+idle_timeout_secs = 60      # also how quickly a killed client is cleaned up
 keepalive_secs = 15
 ```
 
@@ -179,7 +204,8 @@ keepalive_secs = 15
 user = "alice"
 allow_shell = true
 allow_exec = true
-allowed_commands = []       # empty means "any program"
+allowed_commands = []       # empty means "any program"; entries match argv[0] exactly
+# expires_at_unix = 1793491200   # optional; set by --expires-in-days
 ```
 
 Environment overrides for both binaries: `QSH_HOME` (client directory) and
@@ -201,10 +227,16 @@ qsh [options] [user@]host [command [args...]]
 | `-E, --setenv K=V` | Send one environment variable |
 | `--accept-new` | Pin an unknown host key without asking |
 | `--refuse-new` | Never pin automatically |
+| `-4` / `-6` | Restrict to IPv4 / IPv6 |
+| `--connect-timeout SECS` | Deadline per address, default 10 |
 | `-o OPTION` | Ignored, for ssh compatibility; `StrictHostKeyChecking=accept-new\|yes` is honoured |
-| `-q`, `-v`, `-C`, `-4`, `-6` | Accepted for ssh compatibility |
+| `-q`, `-v`, `-C` | Accepted for ssh compatibility |
 
 Subcommands: `qsh keygen`, `qsh fingerprint`, `qsh known-hosts list|add|remove`.
+
+A host name that resolves to several addresses is tried in turn, IPv6 first,
+each with its own connect timeout — so a dual-stack name still works when only
+one family is reachable.
 
 In an interactive session, `~.` at the start of a line hangs up (the remote
 session gets `SIGHUP`, so it exits `129` rather than being orphaned), and `~~`

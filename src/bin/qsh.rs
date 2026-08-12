@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
-use qsh::client::{HostKeyPolicy, Options, PtyPolicy};
+use qsh::client::{AddressFamily, HostKeyPolicy, Options, PtyPolicy, DEFAULT_CONNECT_TIMEOUT_SECS};
 use qsh::config::{ClientPaths, KnownHosts, DEFAULT_PORT};
 use qsh::crypto::{self, Fingerprint};
 
@@ -41,6 +41,9 @@ Options:
       --refuse-new       Never pin automatically
   -o OPTION              Accepted for ssh compatibility; only
                          StrictHostKeyChecking=accept-new|yes has an effect
+  -4 / -6                Use IPv4 / IPv6 only
+      --connect-timeout SECS
+                         Deadline per address when connecting (default 10)
   -q, --quiet            Suppress qsh's own messages
   -v, --verbose          Accepted for ssh compatibility (no extra output)
   -h, --help             Show this help
@@ -216,14 +219,55 @@ fn connect(args: Vec<String>) -> Result<i32> {
     result
 }
 
+/// The options as they accumulate while the command line is walked.
+struct Parsed {
+    port: u16,
+    user: Option<String>,
+    identity: Option<PathBuf>,
+    pty: PtyPolicy,
+    env: Vec<(String, String)>,
+    policy: HostKeyPolicy,
+    quiet: bool,
+    family: AddressFamily,
+    connect_timeout: u64,
+}
+
+impl Default for Parsed {
+    fn default() -> Self {
+        Self {
+            port: DEFAULT_PORT,
+            user: None,
+            identity: None,
+            pty: PtyPolicy::Auto,
+            env: Vec::new(),
+            policy: HostKeyPolicy::Ask,
+            quiet: false,
+            family: AddressFamily::Any,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT_SECS,
+        }
+    }
+}
+
+impl Parsed {
+    fn into_options(self, host: String, command: Vec<String>) -> Options {
+        Options {
+            host,
+            port: self.port,
+            user: self.user,
+            command: (!command.is_empty()).then_some(command),
+            pty: self.pty,
+            env: self.env,
+            host_key_policy: self.policy,
+            paths_dir: self.identity,
+            quiet: self.quiet,
+            family: self.family,
+            connect_timeout_secs: self.connect_timeout,
+        }
+    }
+}
+
 fn parse_connect(args: Vec<String>) -> Result<Cli> {
-    let mut port = DEFAULT_PORT;
-    let mut user: Option<String> = None;
-    let mut identity: Option<PathBuf> = None;
-    let mut pty = PtyPolicy::Auto;
-    let mut env: Vec<(String, String)> = Vec::new();
-    let mut policy = HostKeyPolicy::Ask;
-    let mut quiet = false;
+    let mut p = Parsed::default();
     let mut host: Option<String> = None;
     let mut command: Vec<String> = Vec::new();
 
@@ -248,36 +292,45 @@ fn parse_connect(args: Vec<String>) -> Result<Cli> {
                 }
             }
             "-p" | "--port" => {
-                port = it
+                p.port = it
                     .next()
                     .context("-p needs a port number")?
                     .parse()
                     .context("-p must be a port number")?;
             }
             a if split(a, "-p").is_some() => {
-                port = split(a, "-p")
+                p.port = split(a, "-p")
                     .unwrap_or_default()
                     .parse()
                     .context("-p must be a port number")?;
             }
-            "-l" | "--login-name" => user = Some(it.next().context("-l needs a user name")?),
-            a if split(a, "-l").is_some() => user = split(a, "-l"),
+            "-l" | "--login-name" => p.user = Some(it.next().context("-l needs a user name")?),
+            a if split(a, "-l").is_some() => p.user = split(a, "-l"),
             "-i" | "--identity" => {
-                identity = Some(PathBuf::from(it.next().context("-i needs a directory")?));
+                p.identity = Some(PathBuf::from(it.next().context("-i needs a directory")?));
             }
-            "-t" => pty = PtyPolicy::Force,
-            "-T" => pty = PtyPolicy::Never,
-            "-q" | "--quiet" => quiet = true,
-            "-v" | "--verbose" | "-C" | "-4" | "-6" | "-n" | "-a" | "-x" => {}
+            "-t" => p.pty = PtyPolicy::Force,
+            "-T" => p.pty = PtyPolicy::Never,
+            "-q" | "--quiet" => p.quiet = true,
+            "-4" => p.family = AddressFamily::V4,
+            "-6" => p.family = AddressFamily::V6,
+            "--connect-timeout" => {
+                p.connect_timeout = it
+                    .next()
+                    .context("--connect-timeout needs a number of seconds")?
+                    .parse()
+                    .context("--connect-timeout must be a number of seconds")?;
+            }
+            "-v" | "--verbose" | "-C" | "-n" | "-a" | "-x" => {}
             "-E" | "--setenv" => {
                 let kv = it.next().context("-E needs KEY=VALUE")?;
-                env.push(split_kv(&kv)?);
+                p.env.push(split_kv(&kv)?);
             }
-            "--accept-new" => policy = HostKeyPolicy::AcceptNew,
-            "--refuse-new" => policy = HostKeyPolicy::Refuse,
+            "--accept-new" => p.policy = HostKeyPolicy::AcceptNew,
+            "--refuse-new" => p.policy = HostKeyPolicy::Refuse,
             "-o" | "--option" => {
                 let opt = it.next().context("-o needs an option")?;
-                apply_ssh_option(&opt, &mut policy);
+                apply_ssh_option(&opt, &mut p.policy);
             }
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -295,24 +348,14 @@ fn parse_connect(args: Vec<String>) -> Result<Cli> {
     };
     let (target_user, host) = split_target(&target);
     if let Some(u) = target_user {
-        user = Some(u);
+        p.user = Some(u);
     }
     if host.is_empty() {
         bail!("empty host name");
     }
 
     Ok(Cli {
-        opts: Options {
-            host,
-            port,
-            user,
-            command: (!command.is_empty()).then_some(command),
-            pty,
-            env,
-            host_key_policy: policy,
-            paths_dir: identity,
-            quiet,
-        },
+        opts: p.into_options(host, command),
     })
 }
 
@@ -438,10 +481,29 @@ mod tests {
 
     #[test]
     fn ssh_compatibility_options_are_tolerated() {
-        let o = parse(&["-C", "-4", "-v", "-o", "Compression=yes", "h", "true"]);
+        let o = parse(&["-C", "-v", "-o", "Compression=yes", "h", "true"]);
         assert_eq!(o.host, "h");
         assert_eq!(o.command.unwrap(), vec!["true"]);
         assert_eq!(o.host_key_policy, HostKeyPolicy::Ask);
+    }
+
+    #[test]
+    fn address_family_flags_are_honoured_not_ignored() {
+        assert_eq!(parse(&["h"]).family, AddressFamily::Any);
+        assert_eq!(parse(&["-4", "h"]).family, AddressFamily::V4);
+        assert_eq!(parse(&["-6", "h"]).family, AddressFamily::V6);
+    }
+
+    #[test]
+    fn connect_timeout_is_configurable() {
+        assert_eq!(
+            parse(&["h"]).connect_timeout_secs,
+            DEFAULT_CONNECT_TIMEOUT_SECS
+        );
+        assert_eq!(
+            parse(&["--connect-timeout", "3", "h"]).connect_timeout_secs,
+            3
+        );
     }
 
     #[test]

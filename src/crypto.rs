@@ -48,14 +48,28 @@ impl Fingerprint {
     pub fn parse(s: &str) -> Result<Self> {
         let hex = s
             .strip_prefix("sha256:")
-            .ok_or_else(|| anyhow!("fingerprint must start with `sha256:`"))?;
+            .ok_or_else(|| anyhow!("fingerprint must start with `sha256:`"))?
+            .as_bytes();
+        // Work on bytes, not chars: `hex.len() == 64` counts bytes, so slicing
+        // the `str` at byte offsets could land inside a multi-byte character
+        // and panic before the digits are ever validated.
         if hex.len() != 64 {
             bail!("fingerprint must be 64 hex characters");
         }
+        let digit = |b: u8| -> Result<u8> {
+            match b {
+                b'0'..=b'9' => Ok(b - b'0'),
+                b'a'..=b'f' => Ok(b - b'a' + 10),
+                b'A'..=b'F' => Ok(b - b'A' + 10),
+                _ => bail!("fingerprint contains non-hex characters"),
+            }
+        };
         let mut out = [0u8; 32];
         for (i, byte) in out.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-                .map_err(|_| anyhow!("fingerprint contains non-hex characters"))?;
+            let (Some(&hi), Some(&lo)) = (hex.get(i * 2), hex.get(i * 2 + 1)) else {
+                bail!("fingerprint must be 64 hex characters");
+            };
+            *byte = digit(hi)? << 4 | digit(lo)?;
         }
         Ok(Self(out))
     }
@@ -119,14 +133,45 @@ pub fn generate_identity(
 
     let now = std::time::SystemTime::now();
     // A little backdating absorbs modest clock skew between the two hosts.
-    params.not_before = system_time_to_offset(now - std::time::Duration::from_secs(3600));
-    params.not_after =
-        system_time_to_offset(now + std::time::Duration::from_secs(u64::from(days) * 86_400));
+    generate_within(
+        params,
+        &key,
+        now - std::time::Duration::from_secs(3600),
+        now + std::time::Duration::from_secs(u64::from(days) * 86_400),
+    )
+}
 
+/// Self-sign `params` with an explicit validity window.
+fn generate_within(
+    mut params: rcgen::CertificateParams,
+    key: &rcgen::KeyPair,
+    not_before: std::time::SystemTime,
+    not_after: std::time::SystemTime,
+) -> Result<(String, String)> {
+    params.not_before = system_time_to_offset(not_before);
+    params.not_after = system_time_to_offset(not_after);
     let cert = params
-        .self_signed(&key)
+        .self_signed(key)
         .context("self-signing the certificate")?;
     Ok((cert.pem(), key.serialize_pem()))
+}
+
+/// Build an identity whose validity window is entirely in the past or the
+/// future, so the checks that reject it can be tested.
+///
+/// # Errors
+/// Fails if key generation or self-signing fails.
+#[cfg(test)]
+pub(crate) fn generate_identity_outside_validity(expired: bool) -> Result<(String, String)> {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)?;
+    let params = rcgen::CertificateParams::new(vec!["qsh-test".to_owned()])?;
+    let now = std::time::SystemTime::now();
+    let day = std::time::Duration::from_secs(86_400);
+    if expired {
+        generate_within(params, &key, now - day * 3, now - day)
+    } else {
+        generate_within(params, &key, now + day, now + day * 3)
+    }
 }
 
 fn system_time_to_offset(t: std::time::SystemTime) -> ::time::OffsetDateTime {
@@ -201,21 +246,7 @@ pub fn load_identity(cert_path: &Path, key_path: &Path) -> Result<Identity> {
 /// # Errors
 /// Fails if the parent directory or the file itself cannot be created.
 pub fn write_private(path: &Path, contents: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("creating {}", path.display()))?;
-    f.write_all(contents.as_bytes())
-        .with_context(|| format!("writing {}", path.display()))?;
-    // create(true) does not change the mode of a pre-existing file.
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
+    write_atomically(path, contents, 0o600)
 }
 
 /// Write a world-readable file (certificates, configuration).
@@ -223,16 +254,70 @@ pub fn write_private(path: &Path, contents: &str) -> Result<()> {
 /// # Errors
 /// Fails if the parent directory or the file itself cannot be created.
 pub fn write_public(path: &Path, contents: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    write_atomically(path, contents, 0o644)
+}
+
+/// Write `contents` to `path` without ever leaving it half-written.
+///
+/// Truncating the destination in place would let a crash or a short write
+/// destroy the only copy of a host key, and would follow a symlink an attacker
+/// planted. Instead a fresh temporary file is created in the same directory
+/// (`create_new`, so it cannot be an existing symlink), given its final mode
+/// before any data reaches it, flushed to disk, and then renamed over the
+/// destination — an atomic replacement. The directory is fsynced afterwards so
+/// the rename itself survives a power cut.
+fn write_atomically(path: &Path, contents: &str, mode: u32) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("{} is not a file path", path.display()))?;
+    let tmp = parent.join(format!(
+        ".{}.tmp.{}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    // A leftover temporary from a previous crash must not block the write.
+    let _ = fs::remove_file(&tmp);
+
+    let write = || -> Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        f.write_all(contents.as_bytes())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("flushing {}", tmp.display()))?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o644))?;
+
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("replacing {}", path.display()));
+    }
+    // Persist the rename itself; failure here is not worth aborting over.
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
 /// Reject certificates that are not currently within their validity window.
-fn check_validity(der: &[u8], now: UnixTime) -> std::result::Result<(), TlsError> {
+///
+/// # Errors
+/// Fails if the certificate cannot be parsed, has expired, or is not yet valid.
+pub fn check_validity(der: &[u8], now: UnixTime) -> std::result::Result<(), TlsError> {
     let (_, cert) = X509Certificate::from_der(der)
         .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
     let seconds = i64::try_from(now.as_secs())
