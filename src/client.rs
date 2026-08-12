@@ -1,7 +1,7 @@
 //! The qsh client: connect, verify the host key, run one session.
 
 use std::io::{IsTerminal, Write as _};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,8 +17,7 @@ use crate::config::{ClientPaths, KnownHosts};
 use crate::crypto::{self, Fingerprint, PinnedServerVerifier};
 use crate::net::transport_config;
 use crate::proto::{
-    read_frame, write_frame, ExitStatus, Frame, PtyRequest, Request, CHUNK,
-    PROTOCOL_VERSION,
+    read_frame, write_frame, ExitStatus, Frame, PtyRequest, Request, CHUNK, PROTOCOL_VERSION,
 };
 use crate::pty::{self, RawMode};
 
@@ -89,7 +88,7 @@ impl ServerCertVerifier for CaptureVerifier {
     ) -> std::result::Result<ServerCertVerified, TlsError> {
         let fp = Fingerprint::of_cert(end_entity)
             .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
-        *self.seen.lock().unwrap() = Some(fp);
+        *crate::sync::mutex(&self.seen) = Some(fp);
         Ok(ServerCertVerified::assertion())
     }
 
@@ -126,6 +125,11 @@ impl ServerCertVerifier for CaptureVerifier {
 }
 
 /// Run a session and return the status the local shell should report.
+///
+/// # Errors
+/// Fails if the identity is missing, the host key is unknown and not
+/// accepted, the connection cannot be established, or the session ends
+/// without an exit status.
 pub async fn run(opts: Options) -> Result<i32> {
     let paths = match &opts.paths_dir {
         Some(dir) => ClientPaths::new(dir.clone()),
@@ -159,11 +163,15 @@ pub async fn run(opts: Options) -> Result<i32> {
     tls.alpn_protocols = vec![crate::proto::ALPN.to_vec()];
 
     let addr = resolve(&opts.host, opts.port)?;
-    let bind: SocketAddr = if addr.is_ipv6() {
-        "[::]:0".parse().unwrap()
-    } else {
-        "0.0.0.0:0".parse().unwrap()
-    };
+    // Bind the wildcard address of the same family the server resolved to.
+    let bind = SocketAddr::new(
+        if addr.is_ipv6() {
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        },
+        0,
+    );
     let mut endpoint = quinn::Endpoint::client(bind).context("opening a local UDP socket")?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(tls).context("building the QUIC crypto configuration")?,
@@ -178,14 +186,11 @@ pub async fn run(opts: Options) -> Result<i32> {
         .connect(addr, sni_name(&opts.host))
         .context("starting the QUIC handshake")?
         .await
-        .map_err(|e| connect_error(e, &opts, addr))?;
+        .map_err(|e| connect_error(&e, &opts, addr))?;
 
     // Trust on first use: the handshake is complete but nothing has been sent.
     if pinned.is_none() {
-        let fp = capture
-            .seen
-            .lock()
-            .unwrap()
+        let fp = crate::sync::mutex(&capture.seen)
             .ok_or_else(|| anyhow!("server presented no certificate"))?;
         if !accept_new_host(&host_key, fp, opts.host_key_policy)? {
             conn.close(1u32.into(), b"host key rejected");
@@ -204,9 +209,9 @@ pub async fn run(opts: Options) -> Result<i32> {
 }
 
 /// Turn a connection failure into a message that says what to do next.
-fn connect_error(e: quinn::ConnectionError, opts: &Options, addr: SocketAddr) -> anyhow::Error {
+fn connect_error(e: &quinn::ConnectionError, opts: &Options, addr: SocketAddr) -> anyhow::Error {
     let base = anyhow!("cannot connect to {} ({addr}): {e}", opts.host);
-    match &e {
+    match e {
         quinn::ConnectionError::TransportError(te)
             if te.to_string().contains("host key mismatch") =>
         {
@@ -446,7 +451,8 @@ async fn forward_stdin(tx: Outbound, use_pty: bool) {
         match stdin.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                let (data, disconnect) = escape.filter(&buf[..n]);
+                let Some(chunk) = buf.get(..n) else { break };
+                let (data, disconnect) = escape.filter(chunk);
                 if !data.is_empty() && tx.send(Frame::Stdin(data)).await.is_err() {
                     break;
                 }
@@ -529,13 +535,13 @@ async fn forward_winch(tx: Outbound) {
 
 /// Without a terminal, local Ctrl-C must be relayed as a signal.
 async fn forward_signals(tx: Outbound) {
-    let mut int = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
-        Ok(s) => s,
-        Err(_) => return,
+    let Ok(mut int) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+    else {
+        return;
     };
-    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(_) => return,
+    let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    else {
+        return;
     };
     loop {
         let name = tokio::select! {
@@ -549,6 +555,13 @@ async fn forward_signals(tx: Outbound) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "a failing assertion should panic loudly; that is the point of a test"
+)]
 mod tests {
     use super::*;
 

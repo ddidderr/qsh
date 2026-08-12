@@ -22,6 +22,10 @@ fn winsize(size: PtySize) -> libc::winsize {
 }
 
 /// Apply a new window size to a terminal file descriptor.
+#[allow(unsafe_code, reason = "TIOCSWINSZ is an ioctl with no safe wrapper")]
+///
+/// # Errors
+/// Fails if the descriptor is not a terminal.
 pub fn set_size(fd: RawFd, size: PtySize) -> io::Result<()> {
     let ws = winsize(size);
     // SAFETY: `fd` is a valid descriptor and `ws` is the struct TIOCSWINSZ expects.
@@ -32,6 +36,10 @@ pub fn set_size(fd: RawFd, size: PtySize) -> io::Result<()> {
 }
 
 /// Read the window size of a terminal file descriptor.
+#[allow(unsafe_code, reason = "TIOCGWINSZ is an ioctl with no safe wrapper")]
+///
+/// # Errors
+/// Fails if the descriptor is not a terminal.
 pub fn get_size(fd: RawFd) -> io::Result<PtySize> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     // SAFETY: `fd` is a valid descriptor and `ws` is the struct TIOCGWINSZ fills in.
@@ -51,6 +59,14 @@ pub struct PtyMaster {
 }
 
 /// Allocate a PTY pair. Returns `(master, slave)`.
+///
+/// # Errors
+/// Fails if no PTY can be allocated or the master cannot be registered with
+/// the async reactor.
+#[allow(
+    unsafe_code,
+    reason = "reads the winsize struct through a raw pointer for openpty"
+)]
 pub fn open(size: PtySize) -> Result<(PtyMaster, OwnedFd)> {
     let ws = winsize(size);
     let pair = nix::pty::openpty(Some(&ws), None).context("allocating a pseudo terminal")?;
@@ -63,6 +79,7 @@ pub fn open(size: PtySize) -> Result<(PtyMaster, OwnedFd)> {
     ))
 }
 
+#[allow(unsafe_code, reason = "fcntl has no safe wrapper for this flag dance")]
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     // SAFETY: `fd` is valid for the duration of the calls.
     unsafe {
@@ -75,17 +92,25 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 }
 
 impl PtyMaster {
+    #[must_use]
     pub fn as_raw_fd(&self) -> RawFd {
         self.inner.get_ref().as_raw_fd()
     }
 
     /// Resize the terminal.
+    ///
+    /// # Errors
+    /// Fails if the `TIOCSWINSZ` ioctl is rejected.
     pub fn set_size(&self, size: PtySize) -> io::Result<()> {
         set_size(self.as_raw_fd(), size)
     }
 }
 
 impl AsyncRead for PtyMaster {
+    #[allow(
+        unsafe_code,
+        reason = "read(2) on the PTY master fd; tokio has no safe wrapper for a raw fd"
+    )]
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -111,7 +136,7 @@ impl AsyncRead for PtyMaster {
                 if n < 0 {
                     Err(io::Error::last_os_error())
                 } else {
-                    Ok(n as usize)
+                    Ok(usize::try_from(n).unwrap_or(0))
                 }
             });
             match result {
@@ -125,13 +150,17 @@ impl AsyncRead for PtyMaster {
                     return Poll::Ready(Ok(()));
                 }
                 Ok(Err(e)) => return Poll::Ready(Err(e)),
-                Err(_would_block) => continue,
+                Err(_would_block) => (),
             }
         }
     }
 }
 
 impl AsyncWrite for PtyMaster {
+    #[allow(
+        unsafe_code,
+        reason = "write(2) on the PTY master fd; tokio has no safe wrapper for a raw fd"
+    )]
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -152,12 +181,12 @@ impl AsyncWrite for PtyMaster {
                 if n < 0 {
                     Err(io::Error::last_os_error())
                 } else {
-                    Ok(n as usize)
+                    Ok(usize::try_from(n).unwrap_or(0))
                 }
             });
             match result {
                 Ok(res) => return Poll::Ready(res),
-                Err(_would_block) => continue,
+                Err(_would_block) => (),
             }
         }
     }
@@ -175,6 +204,7 @@ impl AsyncWrite for PtyMaster {
 ///
 /// This is what keeps the remote side in charge of echo, line editing and
 /// `Ctrl-C`: the local terminal must not interfere.
+#[derive(Debug)]
 pub struct RawMode {
     fd: RawFd,
     saved: nix::sys::termios::Termios,
@@ -182,6 +212,14 @@ pub struct RawMode {
 }
 
 impl RawMode {
+    /// Switch `fd` to raw mode.
+    ///
+    /// # Errors
+    /// Fails if the descriptor is not a terminal or the settings are rejected.
+    #[allow(
+        unsafe_code,
+        reason = "borrows the caller's terminal fd, which must outlive this guard"
+    )]
     pub fn enable(fd: RawFd) -> Result<Self> {
         // SAFETY: the borrow lives only for this call; `fd` is an open terminal.
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
@@ -198,6 +236,10 @@ impl RawMode {
     }
 
     /// Restore the saved settings. Idempotent.
+    #[allow(
+        unsafe_code,
+        reason = "borrows the same terminal fd the settings were captured from"
+    )]
     pub fn restore(&mut self) {
         if self.restored {
             return;
@@ -217,6 +259,13 @@ impl Drop for RawMode {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "a failing assertion should panic loudly; that is the point of a test"
+)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

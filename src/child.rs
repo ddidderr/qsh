@@ -17,6 +17,7 @@ use crate::pty::{self, PtyMaster};
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin";
 
 /// How the remote process is wired up.
+#[derive(Debug)]
 pub enum ChildIo {
     /// Interactive session: one bidirectional terminal.
     Pty(PtyMaster),
@@ -29,38 +30,53 @@ pub enum ChildIo {
 }
 
 /// A running remote process.
+#[derive(Debug)]
 pub struct Spawned {
     pub child: tokio::process::Child,
     pub io: ChildIo,
 }
 
+/// Deliver a signal to a remote process and, preferably, its whole job.
+///
+/// The child called `setsid`, so it leads its own process group and the
+/// negative pid reaches every process in it — the same reach a terminal has
+/// when you press Ctrl-C. If the group is already gone, fall back to the
+/// process itself.
+///
+/// This is the only place in the crate that signals anything.
+#[allow(
+    unsafe_code,
+    reason = "kill(2) has no safe wrapper; pid comes from our own child"
+)]
+pub fn signal_process_group(pid: u32, sig: i32) {
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    // SAFETY: `kill` only reads the two scalar arguments. A stale pid can at
+    // worst return ESRCH, which we ignore.
+    unsafe {
+        if libc::kill(-pid, sig) < 0 {
+            libc::kill(pid, sig);
+        }
+    }
+}
+
 impl Spawned {
     /// Send a signal to the process group of the remote process.
-    pub fn signal(&self, sig: i32) -> Result<()> {
-        let Some(pid) = self.child.id() else {
-            return Ok(());
-        };
-        // The child called setsid(), so it leads its own process group; the
-        // negative pid reaches the whole job, like a terminal would.
-        // SAFETY: plain libc call with a validated pid.
-        unsafe {
-            if libc::kill(-(pid as i32), sig) < 0 && libc::kill(pid as i32, sig) < 0 {
-                bail!("kill: {}", std::io::Error::last_os_error());
-            }
+    pub fn signal(&self, sig: i32) {
+        if let Some(pid) = self.child.id() {
+            signal_process_group(pid, sig);
         }
-        Ok(())
     }
 
     /// Resize the terminal, if this session has one.
+    ///
+    /// # Errors
+    /// Fails if the `TIOCSWINSZ` ioctl on the PTY master is rejected.
     pub fn resize(&self, size: PtySize) -> Result<()> {
         if let ChildIo::Pty(master) = &self.io {
             master.set_size(size)?;
-            if let Some(pid) = self.child.id() {
-                // SAFETY: plain libc call with a validated pid.
-                unsafe {
-                    libc::kill(-(pid as i32), libc::SIGWINCH);
-                }
-            }
+            self.signal(libc::SIGWINCH);
         }
         Ok(())
     }
@@ -86,6 +102,14 @@ fn shell_of(user: &User) -> PathBuf {
 ///
 /// When the server does not run as root, `user` must be the account the
 /// server itself runs as; there is no way to change identity otherwise.
+///
+/// # Errors
+/// Fails if the target user cannot be assumed, a PTY cannot be allocated, or
+/// the program cannot be executed.
+#[allow(
+    unsafe_code,
+    reason = "pre_exec is inherently unsafe: its closure runs between fork and exec"
+)]
 pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
     let running_as_root = Uid::effective().is_root();
     let must_switch = user.uid != Uid::current() || user.gid != Gid::current();
@@ -99,24 +123,19 @@ pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
     let home = home_of(user);
     let shell = shell_of(user);
 
-    let mut cmd = match &req.command {
-        Some(argv) if !argv.is_empty() => {
-            let mut cmd = Command::new(&argv[0]);
-            cmd.args(&argv[1..]);
+    let mut cmd =
+        if let Some((program, args)) = req.command.as_deref().and_then(<[String]>::split_first) {
+            let mut cmd = Command::new(program);
+            cmd.args(args);
             cmd
-        }
-        // No command: an interactive login shell, exactly like `ssh host`.
-        _ => {
+        } else {
+            // No command: an interactive login shell, exactly like `ssh host`.
+            // The leading `-` in argv[0] is how a shell learns it is a login shell.
             let mut cmd = Command::new(&shell);
-            let base = shell
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("sh")
-                .to_string();
+            let base = shell.file_name().and_then(|s| s.to_str()).unwrap_or("sh");
             cmd.as_std_mut().arg0(format!("-{base}"));
             cmd
-        }
-    };
+        };
 
     cmd.env_clear()
         .env("PATH", DEFAULT_PATH)
@@ -141,8 +160,8 @@ pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
     let gid = user.gid.as_raw();
     let switch = must_switch;
 
-    let (io, spawned) = match &req.pty {
-        Some(p) => {
+    let (io, spawned) = if let Some(p) = &req.pty {
+        {
             let (master, slave) = pty::open(p.size)?;
             let slave_in = slave.try_clone().context("duplicating the PTY slave")?;
             let slave_out = slave.try_clone().context("duplicating the PTY slave")?;
@@ -165,10 +184,11 @@ pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
             }
             let child = cmd
                 .spawn()
-                .with_context(|| describe(&req.command, &shell))?;
+                .with_context(|| describe(req.command.as_ref(), &shell))?;
             (ChildIo::Pty(master), child)
         }
-        None => {
+    } else {
+        {
             cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -183,11 +203,12 @@ pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
             }
             let mut child = cmd
                 .spawn()
-                .with_context(|| describe(&req.command, &shell))?;
+                .with_context(|| describe(req.command.as_ref(), &shell))?;
+            let missing = || anyhow::anyhow!("a piped standard stream was not created");
             let io = ChildIo::Pipes {
-                stdin: child.stdin.take().expect("stdin was piped"),
-                stdout: child.stdout.take().expect("stdout was piped"),
-                stderr: child.stderr.take().expect("stderr was piped"),
+                stdin: child.stdin.take().ok_or_else(missing)?,
+                stdout: child.stdout.take().ok_or_else(missing)?,
+                stderr: child.stderr.take().ok_or_else(missing)?,
             };
             (io, child)
         }
@@ -196,14 +217,18 @@ pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
     Ok(Spawned { child: spawned, io })
 }
 
-fn describe(command: &Option<Vec<String>>, shell: &Path) -> String {
-    match command {
-        Some(argv) if !argv.is_empty() => format!("executing `{}`", argv[0]),
-        _ => format!("starting login shell `{}`", shell.display()),
+fn describe(command: Option<&Vec<String>>, shell: &Path) -> String {
+    match command.and_then(|argv| argv.first()) {
+        Some(program) => format!("executing `{program}`"),
+        None => format!("starting login shell `{}`", shell.display()),
     }
 }
 
 /// Runs between `fork` and `exec`; must stay async-signal-safe.
+#[allow(
+    unsafe_code,
+    reason = "setuid/setgid/initgroups have no safe wrappers and must run here"
+)]
 fn drop_privileges(
     switch: bool,
     username: *const libc::c_char,
@@ -241,13 +266,16 @@ fn sanitize_term(term: &str) -> String {
         .take(64)
         .collect();
     if cleaned.is_empty() {
-        "dumb".to_string()
+        "dumb".to_owned()
     } else {
         cleaned
     }
 }
 
 /// Look up a local account by name.
+///
+/// # Errors
+/// Fails if the lookup errors or no such account exists.
 pub fn resolve_user(name: &str) -> Result<User> {
     User::from_name(name)
         .with_context(|| format!("looking up user `{name}`"))?
@@ -255,6 +283,9 @@ pub fn resolve_user(name: &str) -> Result<User> {
 }
 
 /// The account the current process runs as.
+///
+/// # Errors
+/// Fails if the current uid has no passwd entry.
 pub fn current_user() -> Result<User> {
     User::from_uid(Uid::current())
         .context("looking up the current user")?
@@ -262,6 +293,7 @@ pub fn current_user() -> Result<User> {
 }
 
 /// Terminal file descriptor of the child's PTY, if any (used by tests).
+#[must_use]
 pub fn pty_fd(io: &ChildIo) -> Option<i32> {
     match io {
         ChildIo::Pty(m) => Some(m.as_raw_fd()),
@@ -270,6 +302,13 @@ pub fn pty_fd(io: &ChildIo) -> Option<i32> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "a failing assertion should panic loudly; that is the point of a test"
+)]
 mod tests {
     use super::*;
     use crate::proto::{PtyRequest, PROTOCOL_VERSION};
@@ -279,7 +318,7 @@ mod tests {
         Request {
             version: PROTOCOL_VERSION,
             user: None,
-            command: Some(argv.iter().map(|s| s.to_string()).collect()),
+            command: Some(argv.iter().map(|s| (*s).to_owned()).collect()),
             pty: pty.then(|| PtyRequest {
                 term: "xterm".into(),
                 size: PtySize { cols: 80, rows: 24 },
@@ -380,7 +419,7 @@ mod tests {
     async fn signals_reach_the_child() {
         let user = current_user().unwrap();
         let mut sp = spawn(&user, &request(&["sleep", "60"], false)).unwrap();
-        sp.signal(libc::SIGTERM).unwrap();
+        sp.signal(libc::SIGTERM);
         let status = sp.child.wait().await.unwrap();
         assert!(status.code().is_none(), "expected death by signal");
     }
@@ -391,9 +430,8 @@ mod tests {
             return; // meaningless as root
         }
         let other = User::from_uid(Uid::from_raw(0)).unwrap().unwrap();
-        let err = match spawn(&other, &request(&["true"], false)) {
-            Ok(_) => panic!("expected the spawn to be refused"),
-            Err(e) => e,
+        let Err(err) = spawn(&other, &request(&["true"], false)) else {
+            panic!("expected the spawn to be refused")
         };
         assert!(err.to_string().contains("not running as root"), "{err}");
     }

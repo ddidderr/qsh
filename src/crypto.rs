@@ -26,12 +26,15 @@ use sha2::{Digest, Sha256};
 use x509_parser::prelude::*;
 
 /// A public key fingerprint: SHA-256 over the certificate's
-/// SubjectPublicKeyInfo. Stable across certificate renewals of the same key.
+/// `SubjectPublicKeyInfo`. Stable across certificate renewals of the same key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Fingerprint([u8; 32]);
 
 impl Fingerprint {
     /// Compute the fingerprint of a DER-encoded certificate.
+    ///
+    /// # Errors
+    /// Fails if the bytes are not a parseable X.509 certificate.
     pub fn of_cert(der: &[u8]) -> Result<Self> {
         let (_, cert) =
             X509Certificate::from_der(der).map_err(|e| anyhow!("malformed certificate: {e}"))?;
@@ -39,6 +42,9 @@ impl Fingerprint {
     }
 
     /// Parse the `sha256:<hex>` textual form.
+    ///
+    /// # Errors
+    /// Fails if the prefix is missing or the digest is not 64 hex characters.
     pub fn parse(s: &str) -> Result<Self> {
         let hex = s
             .strip_prefix("sha256:")
@@ -73,6 +79,10 @@ pub struct Identity {
 }
 
 impl Identity {
+    /// This identity's public key fingerprint.
+    ///
+    /// # Errors
+    /// Fails if the stored certificate cannot be parsed.
     pub fn fingerprint(&self) -> Result<Fingerprint> {
         Fingerprint::of_cert(&self.cert)
     }
@@ -81,6 +91,9 @@ impl Identity {
 /// Generate a fresh self-signed Ed25519 identity valid for `days` days.
 ///
 /// Returns `(certificate_pem, private_key_pem)`.
+///
+/// # Errors
+/// Fails if key generation or self-signing fails.
 pub fn generate_identity(
     common_name: &str,
     sans: &[String],
@@ -106,9 +119,9 @@ pub fn generate_identity(
 
     let now = std::time::SystemTime::now();
     // A little backdating absorbs modest clock skew between the two hosts.
-    params.not_before = system_time_to_offset(now - std::time::Duration::from_secs(3600))?;
+    params.not_before = system_time_to_offset(now - std::time::Duration::from_secs(3600));
     params.not_after =
-        system_time_to_offset(now + std::time::Duration::from_secs(u64::from(days) * 86_400))?;
+        system_time_to_offset(now + std::time::Duration::from_secs(u64::from(days) * 86_400));
 
     let cert = params
         .self_signed(&key)
@@ -116,11 +129,14 @@ pub fn generate_identity(
     Ok((cert.pem(), key.serialize_pem()))
 }
 
-fn system_time_to_offset(t: std::time::SystemTime) -> Result<::time::OffsetDateTime> {
-    Ok(::time::OffsetDateTime::from(t))
+fn system_time_to_offset(t: std::time::SystemTime) -> ::time::OffsetDateTime {
+    ::time::OffsetDateTime::from(t)
 }
 
 /// Parse the first certificate out of a PEM string.
+///
+/// # Errors
+/// Fails if the PEM is malformed or holds no certificate.
 pub fn cert_from_pem(pem: &str) -> Result<CertificateDer<'static>> {
     let mut reader = std::io::BufReader::new(pem.as_bytes());
     let first = rustls_pemfile::certs(&mut reader)
@@ -131,6 +147,9 @@ pub fn cert_from_pem(pem: &str) -> Result<CertificateDer<'static>> {
 }
 
 /// Read a PEM certificate file and return the first certificate in it.
+///
+/// # Errors
+/// Fails if the file cannot be read or holds no certificate.
 pub fn load_cert(path: &Path) -> Result<CertificateDer<'static>> {
     let pem = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let mut reader = std::io::BufReader::new(&pem[..]);
@@ -144,6 +163,10 @@ pub fn load_cert(path: &Path) -> Result<CertificateDer<'static>> {
 }
 
 /// Read a PEM private key file, insisting on owner-only permissions.
+///
+/// # Errors
+/// Fails if the file is group- or world-accessible, cannot be read, or holds
+/// no private key.
 pub fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     let meta = fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
     let mode = meta.permissions().mode() & 0o777;
@@ -163,6 +186,9 @@ pub fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 }
 
 /// Load a certificate/key pair from disk.
+///
+/// # Errors
+/// Fails if either file is missing, unreadable, or badly permissioned.
 pub fn load_identity(cert_path: &Path, key_path: &Path) -> Result<Identity> {
     Ok(Identity {
         cert: load_cert(cert_path)?,
@@ -171,6 +197,9 @@ pub fn load_identity(cert_path: &Path, key_path: &Path) -> Result<Identity> {
 }
 
 /// Write a file that only its owner may read.
+///
+/// # Errors
+/// Fails if the parent directory or the file itself cannot be created.
 pub fn write_private(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -190,6 +219,9 @@ pub fn write_private(path: &Path, contents: &str) -> Result<()> {
 }
 
 /// Write a world-readable file (certificates, configuration).
+///
+/// # Errors
+/// Fails if the parent directory or the file itself cannot be created.
 pub fn write_public(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -203,7 +235,9 @@ pub fn write_public(path: &Path, contents: &str) -> Result<()> {
 fn check_validity(der: &[u8], now: UnixTime) -> std::result::Result<(), TlsError> {
     let (_, cert) = X509Certificate::from_der(der)
         .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
-    let now = ASN1Time::from_timestamp(now.as_secs() as i64)
+    let seconds = i64::try_from(now.as_secs())
+        .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
+    let now = ASN1Time::from_timestamp(seconds)
         .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
     if now < cert.validity().not_before {
         return Err(TlsError::InvalidCertificate(
@@ -244,6 +278,7 @@ pub struct PinnedServerVerifier {
 }
 
 impl PinnedServerVerifier {
+    #[must_use]
     pub fn new(expected: Fingerprint) -> Arc<Self> {
         Arc::new(Self { expected })
     }
@@ -395,6 +430,13 @@ impl ClientCertVerifier for AuthorizedClientVerifier {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "a failing assertion should panic loudly; that is the point of a test"
+)]
 mod tests {
     use super::*;
 

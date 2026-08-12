@@ -26,16 +26,16 @@ pub const MAX_FRAME: usize = 1024 * 1024;
 pub const CHUNK: usize = 64 * 1024;
 
 mod kind {
-    pub const REQUEST: u8 = 1;
-    pub const STDIN: u8 = 2;
-    pub const STDOUT: u8 = 3;
-    pub const STDERR: u8 = 4;
-    pub const STDIN_EOF: u8 = 5;
-    pub const RESIZE: u8 = 6;
-    pub const SIGNAL: u8 = 7;
-    pub const EXIT: u8 = 8;
-    pub const ERROR: u8 = 9;
-    pub const STARTED: u8 = 10;
+    pub(super) const REQUEST: u8 = 1;
+    pub(super) const STDIN: u8 = 2;
+    pub(super) const STDOUT: u8 = 3;
+    pub(super) const STDERR: u8 = 4;
+    pub(super) const STDIN_EOF: u8 = 5;
+    pub(super) const RESIZE: u8 = 6;
+    pub(super) const SIGNAL: u8 = 7;
+    pub(super) const EXIT: u8 = 8;
+    pub(super) const ERROR: u8 = 9;
+    pub(super) const STARTED: u8 = 10;
 }
 
 /// Terminal geometry, in character cells.
@@ -80,6 +80,7 @@ pub struct ExitStatus {
 
 impl ExitStatus {
     /// The status a shell would report for this termination.
+    #[must_use]
     pub fn wait_status(&self) -> i32 {
         match self.signal {
             Some(sig) => 128 + sig,
@@ -131,8 +132,7 @@ impl Frame {
             Frame::Request(r) => postcard::to_stdvec(r).map_err(|e| invalid(e.to_string()))?,
             Frame::Resize(s) => postcard::to_stdvec(s).map_err(|e| invalid(e.to_string()))?,
             Frame::Exit(s) => postcard::to_stdvec(s).map_err(|e| invalid(e.to_string()))?,
-            Frame::Signal(s) => s.as_bytes().to_vec(),
-            Frame::Error(s) => s.as_bytes().to_vec(),
+            Frame::Signal(s) | Frame::Error(s) => s.as_bytes().to_vec(),
             Frame::Stdin(b) | Frame::Stdout(b) | Frame::Stderr(b) => b.clone(),
             Frame::Started | Frame::StdinEof => Vec::new(),
         };
@@ -169,11 +169,16 @@ impl Frame {
 }
 
 /// Write a single frame.
+///
+/// # Errors
+/// Fails if the frame cannot be encoded or the stream rejects the write.
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> io::Result<()> {
     let payload = frame.payload()?;
+    // `payload()` already rejects anything above MAX_FRAME, so this fits.
+    let len = u32::try_from(payload.len()).map_err(|_| invalid("frame payload too large"))?;
     let mut header = [0u8; 5];
     header[0] = frame.kind();
-    header[1..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    header[1..].copy_from_slice(&len.to_be_bytes());
     w.write_all(&header).await?;
     if !payload.is_empty() {
         w.write_all(&payload).await?;
@@ -182,6 +187,10 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> io:
 }
 
 /// Read a single frame. Returns `Ok(None)` on a clean end of stream.
+///
+/// # Errors
+/// Fails on a malformed header, an over-long or undecodable payload, or an
+/// I/O error on the stream.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Frame>> {
     let mut header = [0u8; 5];
     match r.read_exact(&mut header).await {
@@ -201,6 +210,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Fr
 }
 
 /// Map a signal name (with or without `SIG` prefix) to its number.
+#[must_use]
 pub fn signal_number(name: &str) -> Option<i32> {
     let n = name
         .strip_prefix("SIG")
@@ -226,6 +236,14 @@ pub fn signal_number(name: &str) -> Option<i32> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    reason = "a failing assertion should panic loudly; that is the point of a test"
+)]
 mod tests {
     use super::*;
 

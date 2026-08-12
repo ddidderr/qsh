@@ -18,11 +18,15 @@ pub const DEFAULT_PORT: u16 = 2222;
 pub const ENV_ALLOWLIST: &[&str] = &["TERM", "LANG", "COLORTERM"];
 
 /// Is `name` an environment variable clients are allowed to set?
+#[must_use]
 pub fn env_allowed(name: &str) -> bool {
     ENV_ALLOWLIST.contains(&name) || name.starts_with("LC_") || name.starts_with("QSH_")
 }
 
 /// `~/.config/qsh`, or `$QSH_HOME` when set.
+///
+/// # Errors
+/// Fails if no configuration directory can be determined.
 pub fn client_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("QSH_HOME") {
         return Ok(PathBuf::from(dir));
@@ -34,6 +38,9 @@ pub fn client_dir() -> Result<PathBuf> {
 
 /// `/etc/qsh` when running as root, `~/.config/qsh-server` otherwise, or
 /// `$QSH_SERVER_HOME` when set.
+///
+/// # Errors
+/// Fails if no configuration directory can be determined.
 pub fn server_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("QSH_SERVER_HOME") {
         return Ok(PathBuf::from(dir));
@@ -47,49 +54,68 @@ pub fn server_dir() -> Result<PathBuf> {
 }
 
 /// Paths inside the client's configuration directory.
+#[derive(Debug, Clone)]
 pub struct ClientPaths {
     pub dir: PathBuf,
 }
 
 impl ClientPaths {
+    #[must_use]
     pub fn new(dir: PathBuf) -> Self {
         Self { dir }
     }
+    /// Locate the client directory from the environment.
+    ///
+    /// # Errors
+    /// Fails if no configuration directory can be determined.
     pub fn discover() -> Result<Self> {
         Ok(Self::new(client_dir()?))
     }
+    #[must_use]
     pub fn cert(&self) -> PathBuf {
         self.dir.join("id.crt")
     }
+    #[must_use]
     pub fn key(&self) -> PathBuf {
         self.dir.join("id.key")
     }
+    #[must_use]
     pub fn known_hosts(&self) -> PathBuf {
         self.dir.join("known_hosts")
     }
 }
 
 /// Paths inside the server's configuration directory.
+#[derive(Debug, Clone)]
 pub struct ServerPaths {
     pub dir: PathBuf,
 }
 
 impl ServerPaths {
+    #[must_use]
     pub fn new(dir: PathBuf) -> Self {
         Self { dir }
     }
+    /// Locate the server directory from the environment.
+    ///
+    /// # Errors
+    /// Fails if no configuration directory can be determined.
     pub fn discover() -> Result<Self> {
         Ok(Self::new(server_dir()?))
     }
+    #[must_use]
     pub fn cert(&self) -> PathBuf {
         self.dir.join("server.crt")
     }
+    #[must_use]
     pub fn key(&self) -> PathBuf {
         self.dir.join("server.key")
     }
+    #[must_use]
     pub fn config(&self) -> PathBuf {
         self.dir.join("qsh-server.toml")
     }
+    #[must_use]
     pub fn authorized(&self) -> PathBuf {
         self.dir.join("authorized")
     }
@@ -131,6 +157,10 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    /// Read the configuration, falling back to defaults when absent.
+    ///
+    /// # Errors
+    /// Fails if the file exists but cannot be read or parsed.
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -140,6 +170,10 @@ impl ServerConfig {
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 
+    /// The address to bind.
+    ///
+    /// # Errors
+    /// Fails if `listen` is not a socket address.
     pub fn listen_addr(&self) -> Result<SocketAddr> {
         self.listen
             .parse()
@@ -183,6 +217,7 @@ impl Default for AuthMeta {
 
 impl AuthMeta {
     /// Is `argv` permitted by `allowed_commands`?
+    #[must_use]
     pub fn command_allowed(&self, argv: &[String]) -> bool {
         if self.allowed_commands.is_empty() {
             return true;
@@ -219,6 +254,9 @@ impl AuthStore {
     ///
     /// A certificate without metadata is ignored with a warning rather than
     /// failing the whole server: one broken file must not lock everyone out.
+    ///
+    /// # Errors
+    /// Fails only if the directory itself cannot be listed.
     pub fn load(dir: &Path) -> Result<Self> {
         let mut entries = BTreeMap::new();
         if !dir.exists() {
@@ -266,10 +304,12 @@ impl AuthStore {
         Ok(Self { entries })
     }
 
+    #[must_use]
     pub fn fingerprints(&self) -> Vec<Fingerprint> {
         self.entries.keys().copied().collect()
     }
 
+    #[must_use]
     pub fn lookup(&self, fp: &Fingerprint) -> Option<&AuthEntry> {
         self.entries.get(fp)
     }
@@ -278,6 +318,7 @@ impl AuthStore {
         self.entries.values()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -291,6 +332,10 @@ pub struct KnownHosts {
 }
 
 impl KnownHosts {
+    /// Read a `known_hosts` file, tolerating a missing one.
+    ///
+    /// # Errors
+    /// Fails on a malformed entry or an unparseable fingerprint.
     pub fn load(path: &Path) -> Result<Self> {
         let mut entries = Vec::new();
         if path.exists() {
@@ -316,6 +361,7 @@ impl KnownHosts {
         })
     }
 
+    #[must_use]
     pub fn get(&self, host_key: &str) -> Option<Fingerprint> {
         self.entries
             .iter()
@@ -324,6 +370,9 @@ impl KnownHosts {
     }
 
     /// Add or replace the entry for `host_key` and persist the file.
+    ///
+    /// # Errors
+    /// Fails if the file cannot be written.
     pub fn set(&mut self, host_key: &str, fp: Fingerprint) -> Result<()> {
         self.entries.retain(|(h, _)| h != host_key);
         self.entries.push((host_key.to_string(), fp));
@@ -331,6 +380,9 @@ impl KnownHosts {
     }
 
     /// Remove every entry for `host_key`. Returns how many were removed.
+    ///
+    /// # Errors
+    /// Fails if the file cannot be written.
     pub fn remove(&mut self, host_key: &str) -> Result<usize> {
         let before = self.entries.len();
         self.entries.retain(|(h, _)| h != host_key);
@@ -341,6 +393,7 @@ impl KnownHosts {
         Ok(removed)
     }
 
+    #[must_use]
     pub fn entries(&self) -> &[(String, Fingerprint)] {
         &self.entries
     }
@@ -358,6 +411,13 @@ impl KnownHosts {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "a failing assertion should panic loudly; that is the point of a test"
+)]
 mod tests {
     use super::*;
 

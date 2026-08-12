@@ -18,6 +18,27 @@ pub mod proto;
 pub mod pty;
 pub mod server;
 
+/// Lock helpers that treat poisoning as recoverable.
+///
+/// The crate denies `panic`, so a poisoned lock could only come from a panic
+/// inside a dependency. The protected data would still be intact, and refusing
+/// every subsequent session over it is the worse failure.
+pub(crate) mod sync {
+    use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+    pub(crate) fn read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+        lock.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+        lock.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn mutex<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+        lock.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// Version reported by `qsh --version`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

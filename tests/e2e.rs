@@ -3,6 +3,16 @@
 //! parts users actually touch — exit codes, binary transparency, `rsync -e
 //! qsh`, and the authorisation rules.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "a failing assertion should panic loudly; that is the point of a test"
+)]
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -13,7 +23,7 @@ const CLIENT_BIN: &str = env!("CARGO_BIN_EXE_qsh");
 
 /// A running server plus the client configuration that may talk to it.
 struct Fixture {
-    _tmp: tempfile::TempDir,
+    tmp: tempfile::TempDir,
     server_dir: PathBuf,
     client_dir: PathBuf,
     port: u16,
@@ -80,7 +90,7 @@ impl Fixture {
             "--name".to_string(),
             "tester".to_string(),
         ];
-        args.extend(extra_authorize.iter().map(|s| s.to_string()));
+        args.extend(extra_authorize.iter().map(|s| (*s).to_owned()));
         run(
             SERVER_BIN,
             &args.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -104,7 +114,7 @@ impl Fixture {
 
         let port = wait_for_port(&log);
         Self {
-            _tmp: tmp,
+            tmp,
             server_dir,
             client_dir,
             port,
@@ -269,7 +279,7 @@ fn a_restricted_key_can_only_run_what_it_was_given() {
 #[test]
 fn an_unauthorized_key_is_refused() {
     let f = Fixture::start(&[]);
-    let stranger = f._tmp.path().join("stranger");
+    let stranger = f.tmp.path().join("stranger");
     run(
         CLIENT_BIN,
         &["keygen", "--identity", stranger.to_str().unwrap()],
@@ -346,8 +356,8 @@ fn rsync_can_use_qsh_as_its_transport() {
         return;
     }
     let f = Fixture::start(&[]);
-    let src = f._tmp.path().join("src");
-    let dst = f._tmp.path().join("dst");
+    let src = f.tmp.path().join("src");
+    let dst = f.tmp.path().join("dst");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::create_dir_all(src.join("nested")).unwrap();
     std::fs::write(src.join("small.txt"), "hello rsync\n").unwrap();

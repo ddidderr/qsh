@@ -11,6 +11,9 @@ const STREAM_WINDOW: u32 = 8 * 1024 * 1024;
 const CONNECTION_WINDOW: u32 = 32 * 1024 * 1024;
 
 /// Transport settings shared by both ends.
+///
+/// # Errors
+/// Fails if the idle timeout exceeds what QUIC can encode.
 pub fn transport_config(idle: Duration, keepalive: Duration) -> Result<TransportConfig> {
     let mut tc = TransportConfig::default();
     tc.max_idle_timeout(Some(
@@ -29,6 +32,13 @@ pub fn transport_config(idle: Duration, keepalive: Duration) -> Result<Transport
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "a failing assertion should panic loudly; that is the point of a test"
+)]
 mod tests {
     use super::*;
 

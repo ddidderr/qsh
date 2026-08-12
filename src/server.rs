@@ -27,6 +27,10 @@ use crate::pty;
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Run the server until the process is stopped.
+///
+/// # Errors
+/// Fails if the host identity is missing, the authorisation store cannot be
+/// read, the TLS configuration is invalid, or the socket cannot be bound.
 pub async fn serve(
     paths: &ServerPaths,
     cfg: &ServerConfig,
@@ -40,7 +44,7 @@ pub async fn serve(
     })?;
 
     let store = Arc::new(RwLock::new(AuthStore::load(&paths.authorized())?));
-    if store.read().unwrap().is_empty() {
+    if crate::sync::read(&store).is_empty() {
         eprintln!(
             "qsh-server: warning: no authorized clients in {} — every connection will be refused",
             paths.authorized().display()
@@ -50,7 +54,7 @@ pub async fn serve(
     let verifier = {
         let store = Arc::clone(&store);
         AuthorizedClientVerifier::new(Arc::new(move |fp: &Fingerprint| {
-            store.read().unwrap().lookup(fp).is_some()
+            crate::sync::read(&store).lookup(fp).is_some()
         }))
     };
 
@@ -81,13 +85,13 @@ pub async fn serve(
     eprintln!(
         "qsh-server: listening on {} ({} authorized client(s))",
         endpoint.local_addr()?,
-        store.read().unwrap().entries().count()
+        crate::sync::read(&store).entries().count()
     );
 
     while let Some(incoming) = endpoint.accept().await {
         // Pick up `authorize`/`revoke` changes without a restart.
         match AuthStore::load(&paths.authorized()) {
-            Ok(fresh) => *store.write().unwrap() = fresh,
+            Ok(fresh) => *crate::sync::write(&store) = fresh,
             Err(e) => eprintln!("qsh-server: keeping previous authorizations: {e:#}"),
         }
         let store = Arc::clone(&store);
@@ -112,9 +116,7 @@ fn identify(conn: &quinn::Connection, store: &Arc<RwLock<AuthStore>>) -> Result<
         .first()
         .ok_or_else(|| anyhow!("client presented an empty certificate chain"))?;
     let fp = Fingerprint::of_cert(end_entity)?;
-    store
-        .read()
-        .unwrap()
+    crate::sync::read(store)
         .lookup(&fp)
         .cloned()
         .ok_or_else(|| anyhow!("client key {fp} is not authorized"))
@@ -132,9 +134,11 @@ async fn handle_connection(incoming: quinn::Incoming, store: Arc<RwLock<AuthStor
     loop {
         let stream = match conn.accept_bi().await {
             Ok(s) => s,
-            Err(quinn::ConnectionError::ApplicationClosed(_))
-            | Err(quinn::ConnectionError::ConnectionClosed(_))
-            | Err(quinn::ConnectionError::LocallyClosed) => return Ok(()),
+            Err(
+                quinn::ConnectionError::ApplicationClosed(_)
+                | quinn::ConnectionError::ConnectionClosed(_)
+                | quinn::ConnectionError::LocallyClosed,
+            ) => return Ok(()),
             Err(e) => return Err(e).context("accepting a session stream"),
         };
         let entry = entry.clone();
@@ -182,7 +186,7 @@ fn authorize_request(entry: &AuthEntry, req: &Request) -> Result<()> {
                 bail!(
                     "key `{}` may not execute `{}`; permitted: {}",
                     entry.name,
-                    argv[0],
+                    argv.first().map_or("", String::as_str),
                     entry.meta.allowed_commands.join(", ")
                 );
             }
@@ -320,7 +324,8 @@ async fn pump<R: AsyncRead + Unpin>(
         match src.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if tx.send(wrap(buf[..n].to_vec())).await.is_err() {
+                let Some(chunk) = buf.get(..n) else { break };
+                if tx.send(wrap(chunk.to_vec())).await.is_err() {
                     break;
                 }
             }
@@ -352,12 +357,7 @@ async fn control_loop(
             Ok(Some(Frame::Resize(size))) => resize(pty_fd, pid, size),
             Ok(Some(Frame::Signal(name))) => {
                 if let (Some(pid), Some(sig)) = (pid, signal_number(&name)) {
-                    // SAFETY: plain libc call with a pid we own.
-                    unsafe {
-                        if libc::kill(-(pid as i32), sig) < 0 {
-                            libc::kill(pid as i32, sig);
-                        }
-                    }
+                    child::signal_process_group(pid, sig);
                 }
             }
             Ok(Some(_)) => {}
@@ -370,15 +370,19 @@ fn resize(pty_fd: Option<RawFd>, pid: Option<u32>, size: PtySize) {
     let Some(fd) = pty_fd else { return };
     if pty::set_size(fd, size).is_ok() {
         if let Some(pid) = pid {
-            // SAFETY: plain libc call with a pid we own.
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGWINCH);
-            }
+            child::signal_process_group(pid, libc::SIGWINCH);
         }
     }
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "a failing assertion should panic loudly; that is the point of a test"
+)]
 mod tests {
     use super::*;
     use crate::config::AuthMeta;
@@ -396,7 +400,7 @@ mod tests {
         Request {
             version: PROTOCOL_VERSION,
             user: None,
-            command: command.map(|c| c.iter().map(|s| s.to_string()).collect()),
+            command: command.map(|c| c.iter().map(|s| (*s).to_owned()).collect()),
             pty: None,
             env: Vec::new(),
         }

@@ -104,7 +104,7 @@ fn main() -> ExitCode {
         Some(dir) => Ok(ServerPaths::new(dir)),
         None => ServerPaths::discover(),
     };
-    let result = paths.and_then(|paths| run(paths, cli.command));
+    let result = paths.and_then(|paths| run(&paths, cli.command));
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -114,18 +114,18 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(paths: ServerPaths, command: Command) -> Result<()> {
+fn run(paths: &ServerPaths, command: Command) -> Result<()> {
     match command {
         Command::Serve(args) => serve(paths, args),
-        Command::Keygen(args) => keygen(&paths, args),
-        Command::Authorize(args) => authorize(&paths, args),
-        Command::Revoke(args) => revoke(&paths, args),
-        Command::List => list(&paths),
-        Command::Fingerprint => fingerprint(&paths),
+        Command::Keygen(args) => keygen(paths, args),
+        Command::Authorize(args) => authorize(paths, args),
+        Command::Revoke(args) => revoke(paths, &args),
+        Command::List => list(paths),
+        Command::Fingerprint => fingerprint(paths),
     }
 }
 
-fn serve(paths: ServerPaths, args: Serve) -> Result<()> {
+fn serve(paths: &ServerPaths, args: Serve) -> Result<()> {
     let config_path = args.config.unwrap_or_else(|| paths.config());
     let cfg = ServerConfig::load(&config_path)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -134,8 +134,8 @@ fn serve(paths: ServerPaths, args: Serve) -> Result<()> {
         .context("starting the async runtime")?;
     runtime.block_on(async {
         tokio::select! {
-            result = qsh::server::serve(&paths, &cfg, args.listen) => result,
-            _ = shutdown_signal() => {
+            result = qsh::server::serve(paths, &cfg, args.listen) => result,
+            () = shutdown_signal() => {
                 eprintln!("qsh-server: shutting down");
                 Ok(())
             }
@@ -144,9 +144,9 @@ fn serve(paths: ServerPaths, args: Serve) -> Result<()> {
 }
 
 async fn shutdown_signal() {
-    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(_) => return,
+    let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    else {
+        return;
     };
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
@@ -208,7 +208,7 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
             args.certificate
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .map(str::to_string)
+                .map(str::to_owned)
         })
         .unwrap_or_else(|| "client".into());
     if !name
@@ -271,7 +271,7 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
     Ok(())
 }
 
-fn revoke(paths: &ServerPaths, args: Revoke) -> Result<()> {
+fn revoke(paths: &ServerPaths, args: &Revoke) -> Result<()> {
     let dir = paths.authorized();
     let mut removed = 0;
     for ext in ["crt", "toml"] {

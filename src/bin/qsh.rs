@@ -56,7 +56,9 @@ fn main() -> ExitCode {
     qsh::install_crypto_provider();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match dispatch(args) {
-        Ok(code) => ExitCode::from(code as u8),
+        // Statuses outside a byte cannot be represented; 255 is what ssh
+        // reports for its own failures.
+        Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(255)),
         Err(e) => {
             eprintln!("qsh: {e:#}");
             ExitCode::from(255)
@@ -78,9 +80,9 @@ fn dispatch(args: Vec<String>) -> Result<i32> {
             println!("qsh {}", qsh::VERSION);
             Ok(0)
         }
-        Some("keygen") => keygen(&args[1..]).map(|_| 0),
-        Some("fingerprint") => fingerprint().map(|_| 0),
-        Some("known-hosts") => known_hosts(&args[1..]).map(|_| 0),
+        Some("keygen") => keygen(args.get(1..).unwrap_or_default()).map(|()| 0),
+        Some("fingerprint") => fingerprint().map(|()| 0),
+        Some("known-hosts") => known_hosts(args.get(1..).unwrap_or_default()).map(|()| 0),
         _ => connect(args),
     }
 }
@@ -99,10 +101,10 @@ fn keygen(args: &[String]) -> Result<()> {
                     .next()
                     .context("--days needs a value")?
                     .parse()
-                    .context("--days must be a number")?
+                    .context("--days must be a number")?;
             }
             "--identity" | "-i" | "--dir" => {
-                dir = Some(PathBuf::from(it.next().context("--identity needs a path")?))
+                dir = Some(PathBuf::from(it.next().context("--identity needs a path")?));
             }
             other => bail!("unknown option for keygen: {other}"),
         }
@@ -250,18 +252,18 @@ fn parse_connect(args: Vec<String>) -> Result<Cli> {
                     .next()
                     .context("-p needs a port number")?
                     .parse()
-                    .context("-p must be a port number")?
+                    .context("-p must be a port number")?;
             }
             a if split(a, "-p").is_some() => {
                 port = split(a, "-p")
-                    .unwrap()
+                    .unwrap_or_default()
                     .parse()
-                    .context("-p must be a port number")?
+                    .context("-p must be a port number")?;
             }
             "-l" | "--login-name" => user = Some(it.next().context("-l needs a user name")?),
             a if split(a, "-l").is_some() => user = split(a, "-l"),
             "-i" | "--identity" => {
-                identity = Some(PathBuf::from(it.next().context("-i needs a directory")?))
+                identity = Some(PathBuf::from(it.next().context("-i needs a directory")?));
             }
             "-t" => pty = PtyPolicy::Force,
             "-T" => pty = PtyPolicy::Never,
@@ -358,11 +360,18 @@ fn whoami_tag() -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "a failing assertion should panic loudly; that is the point of a test"
+)]
 mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Options {
-        parse_connect(args.iter().map(|s| s.to_string()).collect())
+        parse_connect(args.iter().map(|s| (*s).to_owned()).collect())
             .unwrap()
             .opts
     }

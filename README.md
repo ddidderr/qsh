@@ -19,13 +19,27 @@ qsh server                     # interactive shell
 qsh server uptime              # remote command
 ```
 
-## Why QUIC
+## Why QUIC, and why quinn
 
 SSH multiplexes its own channels over one TCP stream, so a stalled channel
 stalls everything. QUIC gives us streams, flow control, encryption, and
 0-RTT-style fast reconnects for free, and it survives the client's IP address
 changing. What is left for qsh to implement is only the part that is actually
 about remote execution.
+
+Among the Rust QUIC stacks, [quinn](https://github.com/quinn-rs/quinn) is the
+one that fits this program. qsh's entire authentication model is a pair of
+custom rustls certificate verifiers, and quinn accepts a `rustls::ClientConfig`
+and `rustls::ServerConfig` directly, so they drop straight in. It is
+tokio-native, its streams are `AsyncRead`/`AsyncWrite`, and it is pure Rust —
+no C toolchain to cross-compile around.
+
+[quiche](https://github.com/cloudflare/quiche) is sans-I/O: you drive the
+socket loop, timers and loss recovery yourself, and it builds against
+BoringSSL. Its centre of gravity is HTTP/3, which qsh does not want.
+[s2n-quic](https://github.com/aws/s2n-quic) would work, and has a good mTLS
+story, but custom certificate verification goes through a provider
+indirection rather than rustls directly.
 
 ## Install
 
@@ -242,13 +256,43 @@ kinds carry raw bytes. ALPN is `qsh/1`.
 ## Development
 
 ```
-cargo test          # unit tests plus an end-to-end suite over a real socket
-cargo clippy --all-targets
+just            # list every recipe
+just check      # fmt-check + pedantic clippy + all tests
+just demo-setup # a throwaway server and client under target/sandbox
+just demo-serve # run it; then `just demo-shell` or `just demo-run uname -a`
 ```
 
 The end-to-end tests start a real `qsh-server` on a loopback UDP port and
 drive the real `qsh` binary against it, including a binary round trip and, if
 `rsync` is installed, an actual `rsync -e qsh` transfer.
+
+### Lints
+
+The crate builds clean under `clippy::pedantic` with warnings as errors, and
+`unwrap`, `expect`, `panic!`, `todo!`, slice indexing and integer division are
+**denied** outside of tests — a remote-shell daemon should not carry panic
+paths that a lazy `unwrap` put there. Lock poisoning is handled rather than
+unwrapped (the `sync` helpers in `src/lib.rs`), so a panic inside a dependency
+cannot lock every future session out.
+
+`unsafe_code` is denied crate-wide. It cannot be avoided altogether — PTY
+ioctls, raw-fd reads and writes, `kill(2)`, and the `pre_exec` hook that runs
+`setsid` plus `initgroups`/`setgid`/`setuid` between fork and exec have no safe
+equivalents — so each of the eleven exceptions carries its own
+`#[allow(unsafe_code, reason = ...)]`. They live in exactly two modules, `pty`
+and `child`, and `just audit-unsafe` prints every one of them:
+
+```
+$ just audit-unsafe
+unsafe_code is denied crate-wide; every exception is justified:
+  - TIOCSWINSZ is an ioctl with no safe wrapper
+  - kill(2) has no safe wrapper; pid comes from our own child
+  - pre_exec is inherently unsafe: its closure runs between fork and exec
+  ...
+unsafe blocks per file:
+src/pty.rs:8
+src/child.rs:4
+```
 
 ## License
 
