@@ -23,7 +23,13 @@ use crate::proto::{
 };
 use crate::pty;
 
-/// How long to keep reading a PTY after the remote process has exited.
+/// How long to keep reading a PTY once the leader has exited.
+///
+/// A pipe ends when its last writer closes it, so that case needs no deadline.
+/// A PTY master has no such guarantee: a job backgrounded from an interactive
+/// shell keeps the slave open after the shell exits, and without a bound the
+/// session would never finish — `sleep 300 &` then `exit` would hang the
+/// client forever.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// How long to wait for the job to die before escalating to the next signal.
@@ -37,6 +43,26 @@ const EOT: u8 = 0x04;
 
 /// Shortest gap between two reloads of the authorisation store.
 const RELOAD_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Connections being served at once. Reached only under attack: a legitimate
+/// deployment has a handful.
+const MAX_CONNECTIONS: usize = 256;
+
+/// Handshakes in flight at once.
+///
+/// Deliberately a separate, smaller budget: sharing one pool with established
+/// sessions would let a stream of half-open connections — none of which can
+/// authenticate — hold every slot for the length of the handshake deadline and
+/// lock out the people with keys.
+const MAX_HANDSHAKES: usize = 32;
+
+/// How long an accepted connection may take to finish its handshake. The idle
+/// timeout is far too generous for this — it would let half-open attempts hold
+/// admission slots for a minute each.
+const HANDSHAKE_GRACE: Duration = Duration::from_secs(5);
+
+/// How long an opened session stream may take to say what it wants.
+const FIRST_FRAME_GRACE: Duration = Duration::from_secs(10);
 
 /// Run the server until the process is stopped.
 ///
@@ -100,7 +126,14 @@ pub async fn serve(
         crate::sync::read(&store).entries().count()
     );
 
+    // Everything below runs before any client has authenticated, so all of it
+    // has to be bounded.
+    let unauthenticated = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_HANDSHAKES));
+    let mut rejected: u64 = 0;
     let mut last_reload = tokio::time::Instant::now();
+
     while let Some(incoming) = endpoint.accept().await {
         // Make the peer prove it can receive at its claimed address before we
         // spend anything on it. Without this, a spoofed-source flood would
@@ -109,6 +142,17 @@ pub async fn serve(
             incoming.retry().ok();
             continue;
         }
+
+        // Over either limit: drop it silently. Refusing would send a packet
+        // per attempt, which is a reflection lever of its own.
+        let (Ok(permit), Ok(handshake_permit)) = (
+            Arc::clone(&connections).try_acquire_owned(),
+            Arc::clone(&handshakes).try_acquire_owned(),
+        ) else {
+            rejected = rejected.saturating_add(1);
+            incoming.ignore();
+            continue;
+        };
 
         // Pick up `authorize`/`revoke` changes without a restart, but at most
         // once a second: re-reading and parsing the whole directory for every
@@ -120,12 +164,30 @@ pub async fn serve(
                 Ok(fresh) => *crate::sync::write(&store) = fresh,
                 Err(e) => eprintln!("qsh-server: keeping previous authorizations: {e:#}"),
             }
+            // Report refusals on this already-throttled tick rather than once
+            // per attempt, so a flood cannot also flood the log.
+            if rejected > 0 {
+                eprintln!(
+                    "qsh-server: refused {rejected} connection(s) over the concurrency limit"
+                );
+                rejected = 0;
+            }
         }
 
         let store = Arc::clone(&store);
+        let failures = Arc::clone(&unauthenticated);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(incoming, store).await {
-                eprintln!("qsh-server: connection closed: {e:#}");
+            // The permit lives as long as the connection does.
+            let _permit = permit;
+            match handle_connection(incoming, store, handshake_permit).await {
+                // Only reachable once a client has authenticated; anyone can
+                // provoke the failures before that, so they are counted and
+                // reported in batches instead of logged one per attempt.
+                Err(e) => eprintln!("qsh-server: {e:#}"),
+                Ok(Authenticated::No) => {
+                    failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(Authenticated::Yes) => {}
             }
         });
     }
@@ -141,8 +203,8 @@ fn unix_now() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
-/// Which authorised client is on the other end of this connection?
-fn identify(conn: &quinn::Connection, store: &Arc<RwLock<AuthStore>>) -> Result<AuthEntry> {
+/// The public key the handshake proved possession of.
+fn peer_key(conn: &quinn::Connection) -> Result<Fingerprint> {
     let identity = conn
         .peer_identity()
         .ok_or_else(|| anyhow!("client presented no certificate"))?;
@@ -152,17 +214,39 @@ fn identify(conn: &quinn::Connection, store: &Arc<RwLock<AuthStore>>) -> Result<
     let end_entity = certs
         .first()
         .ok_or_else(|| anyhow!("client presented an empty certificate chain"))?;
-    let fp = Fingerprint::of_cert(end_entity)?;
-    crate::sync::read(store)
-        .lookup(&fp)
-        .cloned()
-        .ok_or_else(|| anyhow!("client key {fp} is not authorized"))
+    Fingerprint::of_cert(end_entity)
 }
 
-async fn handle_connection(incoming: quinn::Incoming, store: Arc<RwLock<AuthStore>>) -> Result<()> {
-    let conn = incoming.await.context("QUIC handshake failed")?;
+/// Did the peer get as far as proving who it was?
+enum Authenticated {
+    Yes,
+    No,
+}
+
+async fn handle_connection(
+    incoming: quinn::Incoming,
+    store: Arc<RwLock<AuthStore>>,
+    handshake_permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<Authenticated> {
+    // An unauthenticated peer must not be able to sit on an admission slot.
+    let Ok(handshake) = tokio::time::timeout(HANDSHAKE_GRACE, incoming).await else {
+        return Ok(Authenticated::No);
+    };
+    // Anything up to here is provokable by anyone who can send a packet, so it
+    // ends quietly rather than writing a log line per attempt.
+    let Ok(conn) = handshake else {
+        return Ok(Authenticated::No);
+    };
+    // The handshake is over; stop occupying that budget.
+    drop(handshake_permit);
+
     let peer = conn.remote_address();
-    let entry = identify(&conn, &store)?;
+    let Ok(fingerprint) = peer_key(&conn) else {
+        return Ok(Authenticated::No);
+    };
+    let Some(entry) = crate::sync::read(&store).lookup(&fingerprint).cloned() else {
+        return Ok(Authenticated::No);
+    };
     eprintln!(
         "qsh-server: {peer} authenticated as `{}` (key `{}`)",
         entry.meta.user, entry.name
@@ -175,10 +259,17 @@ async fn handle_connection(incoming: quinn::Incoming, store: Arc<RwLock<AuthStor
                 quinn::ConnectionError::ApplicationClosed(_)
                 | quinn::ConnectionError::ConnectionClosed(_)
                 | quinn::ConnectionError::LocallyClosed,
-            ) => return Ok(()),
+            ) => return Ok(Authenticated::Yes),
             Err(e) => return Err(e).context("accepting a session stream"),
         };
-        let entry = entry.clone();
+        // Re-resolve the policy for every session rather than reusing the one
+        // captured at handshake time. Otherwise a long-lived connection would
+        // keep the rights it started with, and `revoke` would not reach it.
+        let Some(entry) = crate::sync::read(&store).lookup(&fingerprint).cloned() else {
+            eprintln!("qsh-server: {peer} is no longer authorized; dropping the connection");
+            conn.close(1u32.into(), b"authorization withdrawn");
+            return Ok(Authenticated::Yes);
+        };
         tokio::spawn(async move {
             let (send, recv) = stream;
             if let Err(e) = handle_session(send, recv, entry).await {
@@ -243,7 +334,13 @@ async fn handle_session(
     mut recv: quinn::RecvStream,
     entry: AuthEntry,
 ) -> Result<()> {
-    let req = match read_frame(&mut recv).await? {
+    // A stream that never says what it wants must not hold resources open.
+    // Only the first frame is on a clock; `control_loop` has to stay
+    // deadline-free or an idle interactive shell would be cut off.
+    let first = tokio::time::timeout(FIRST_FRAME_GRACE, read_frame(&mut recv))
+        .await
+        .map_err(|_| anyhow!("client opened a session but sent no request"))?;
+    let req = match first? {
         Some(Frame::Request(r)) => r,
         Some(other) => bail!("expected a request frame first, got {other:?}"),
         None => return Ok(()),
@@ -293,14 +390,26 @@ impl ProcessGroupGuard {
         Self { pid }
     }
 
-    /// The child was reaped normally; nothing left to kill.
+    /// Stop guarding the group.
+    ///
+    /// Only correct once the leader has been reaped *and* its output drained
+    /// to end of file: at that point nothing in the group still holds our
+    /// stdio, so whatever is left has deliberately detached — a `nohup`ed
+    /// daemon — and killing it would be wrong. Every other exit path must go
+    /// through `terminate` instead.
     fn disarm(&mut self) {
         self.pid = None;
     }
 
     /// Ask the job to go away, escalating if it will not.
+    ///
+    /// The pid stays in place across both grace periods. Taking it up front
+    /// would disarm the guard for the several seconds this spends awaiting,
+    /// and a cancellation in that window — daemon shutdown, say — would then
+    /// drop the child handle without killing anything, which is precisely the
+    /// case a job that ignores `SIGHUP` and `SIGTERM` survives.
     async fn terminate(&mut self) {
-        let Some(pid) = self.pid.take() else { return };
+        let Some(pid) = self.pid else { return };
         for sig in [libc::SIGHUP, libc::SIGTERM] {
             child::signal_process_group(pid, sig);
             // Anything that is going to exit on a hangup does so promptly.
@@ -308,10 +417,12 @@ impl ProcessGroupGuard {
                 .await
                 .is_ok()
             {
+                self.pid = None;
                 return;
             }
         }
         child::signal_process_group(pid, libc::SIGKILL);
+        self.pid = None;
     }
 }
 
@@ -326,6 +437,10 @@ impl Drop for ProcessGroupGuard {
 }
 
 /// Poll until the process group has no members left.
+///
+/// The caller must be reaping the leader concurrently: an exited but unreaped
+/// child is a zombie, and a zombie still answers `kill(pid, 0)`, so without a
+/// concurrent `wait` this can never observe the group going away.
 async fn wait_for_exit(pid: u32) {
     loop {
         if !child::process_group_alive(pid) {
@@ -333,14 +448,6 @@ async fn wait_for_exit(pid: u32) {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-}
-
-/// Why the session stopped.
-enum Outcome {
-    /// The remote process exited on its own.
-    Exited(std::process::ExitStatus),
-    /// The client vanished; the remote process is still running.
-    Disconnected,
 }
 
 async fn run_session(
@@ -368,7 +475,9 @@ async fn run_session(
     });
 
     if tx.send(Frame::Started).await.is_err() {
-        guard.terminate().await;
+        // Reap while terminating: the escalation watches for the group to go
+        // away, and a zombie would keep it looking alive.
+        let ((), _) = tokio::join!(guard.terminate(), child.wait());
         bail!("client closed the session before it started");
     }
 
@@ -395,34 +504,46 @@ async fn run_session(
         }
     }
 
+    // `control` is the only thing watching for the client going away, so it
+    // has to stay alive right up to the end of the session — including
+    // through the drain below, which can take arbitrarily long.
     let mut control = tokio::spawn(control_loop(recv, stdin_sink, pid, pty_fd));
 
-    // Race the process against the client going away. Waiting only on the
-    // child would let a killed client strand a `sleep` here forever.
-    let outcome = tokio::select! {
-        status = child.wait() => Outcome::Exited(status.context("waiting for the remote process")?),
-        _ = &mut control => Outcome::Disconnected,
+    // Race the process against the client. Waiting only on the child would
+    // let a killed client strand a `sleep` here forever.
+    let status = tokio::select! {
+        status = child.wait() => Some(status.context("waiting for the remote process")?),
+        _ = &mut control => None,
+    };
+    let Some(status) = status else {
+        return abandon(&mut guard, &mut child, outputs).await;
     };
 
-    if matches!(outcome, Outcome::Disconnected) {
-        guard.terminate().await;
-        let _ = child.wait().await;
-        return Ok(());
-    }
-    guard.disarm();
+    // The leader is gone, but its descendants may still hold the output open.
+    // Drain with the disconnect watch still running, so a client that dies
+    // mid-drain takes the whole job down with it.
+    let drained = tokio::select! {
+        drained = drain(&mut outputs, pty_fd.is_some(), &tx) => drained,
+        _ = &mut control => return abandon(&mut guard, &mut child, outputs).await,
+    };
     control.abort();
 
-    let drained = drain(outputs, pty_fd.is_some()).await;
-
-    let exit = match (&outcome, drained) {
-        (Outcome::Exited(status), Drained::Fully) => ExitStatus {
-            code: status.code().unwrap_or(0),
-            signal: status.signal(),
-        },
+    let exit = match drained {
+        Drained::Fully => {
+            // Everything the session produced has been delivered, so nothing
+            // left in the group is attached to it any more: whatever survives
+            // has deliberately detached, and killing it would be wrong.
+            guard.disarm();
+            ExitStatus {
+                code: status.code().unwrap_or(0),
+                signal: status.signal(),
+            }
+        }
         // Never hand back a successful status over a truncated stream: a
         // caller redirecting our stdout to a file would silently keep a short
-        // copy and believe it.
-        (_, Drained::Incomplete(why)) => {
+        // copy and believe it. The job does not get to survive this either —
+        // it is still wired to a session that is ending badly.
+        Drained::Incomplete(why) => {
             let _ = tx
                 .send(Frame::Error(format!(
                     "the remote output could not be delivered in full: {why}"
@@ -433,17 +554,38 @@ async fn run_session(
                 signal: None,
             }
         }
-        (Outcome::Disconnected, _) => return Ok(()),
     };
 
     let _ = tx.send(Frame::Exit(exit)).await;
     drop(tx);
+    if matches!(drained, Drained::Incomplete(_)) {
+        let ((), _) = tokio::join!(guard.terminate(), child.wait());
+    }
 
     if let Ok(Ok(mut send)) = tokio::time::timeout(SHUTDOWN_GRACE, writer).await {
         // Make sure the peer sees everything before the stream disappears.
         let _ = send.flush().await;
         let _ = tokio::time::timeout(SHUTDOWN_GRACE, send.stopped()).await;
     }
+    Ok(())
+}
+
+/// The client is gone: kill the job, reap it, and stop.
+///
+/// There is nobody left to send an exit status to, so this is not an error.
+async fn abandon(
+    guard: &mut ProcessGroupGuard,
+    child: &mut tokio::process::Child,
+    outputs: Vec<tokio::task::JoinHandle<PumpEnd>>,
+) -> Result<()> {
+    for task in &outputs {
+        task.abort();
+    }
+    // Reaping has to run alongside the escalation, not after it: until the
+    // leader is reaped it lingers as a zombie, which still answers
+    // `kill(pid, 0)`, and the polite signals would look like they had no
+    // effect.
+    let ((), _) = tokio::join!(guard.terminate(), child.wait());
     Ok(())
 }
 
@@ -455,32 +597,48 @@ enum Drained {
 
 /// Collect the output pumps once the remote process has exited.
 ///
-/// Pipes have a definite end: the kernel reports EOF once the last writer
-/// closes them, so they are drained without a deadline and back-pressure from
-/// the frame channel keeps memory bounded. A PTY master has no such guarantee —
-/// a background job holding the terminal open would keep it readable forever —
-/// so those get a grace period instead.
-async fn drain(outputs: Vec<tokio::task::JoinHandle<PumpEnd>>, is_pty: bool) -> Drained {
+/// A pipe is drained without a deadline: the kernel reports EOF when its last
+/// writer closes it, so waiting is exactly as long as there is still output to
+/// deliver, and cutting that short on a timer is what turned a slow reader
+/// into a truncated file with a successful exit status.
+///
+/// A PTY gets a deadline, because it has no last-writer guarantee — a job
+/// backgrounded from an interactive shell holds the slave open indefinitely.
+/// Which of the two things a timeout means is decided by whether frames are
+/// still backed up: an empty channel means everything read has been handed to
+/// the writer and the pump is simply parked on a terminal nobody is using any
+/// more, while a full one means the client is not keeping up and output really
+/// would be lost.
+///
+/// The handles stay borrowed so that a cancelled drain leaves them intact for
+/// the caller to abort.
+async fn drain(
+    tasks: &mut [tokio::task::JoinHandle<PumpEnd>],
+    is_pty: bool,
+    tx: &mpsc::Sender<Frame>,
+) -> Drained {
     let mut result = Drained::Fully;
-    for mut task in outputs {
+    for task in tasks.iter_mut() {
         let end = if is_pty {
-            if let Ok(joined) = tokio::time::timeout(DRAIN_GRACE, &mut task).await {
-                joined.ok()
+            if let Ok(joined) = tokio::time::timeout(DRAIN_GRACE, &mut *task).await {
+                joined.unwrap_or(PumpEnd::Failed)
             } else {
                 task.abort();
-                // Expected for an interactive session that leaves a background
-                // job attached to the terminal.
-                None
+                if tx.capacity() == tx.max_capacity() {
+                    // Nothing queued: the terminal is just still open.
+                    PumpEnd::Eof
+                } else {
+                    PumpEnd::ClientGone
+                }
             }
         } else {
-            task.await.ok()
+            task.await.unwrap_or(PumpEnd::Failed)
         };
         match end {
-            Some(PumpEnd::Eof) | None if is_pty => {}
-            Some(PumpEnd::Eof) => {}
-            Some(PumpEnd::ReadError) => result = Drained::Incomplete("read error"),
-            Some(PumpEnd::ClientGone) => result = Drained::Incomplete("client stopped reading"),
-            None => result = Drained::Incomplete("output task failed"),
+            PumpEnd::Eof => {}
+            PumpEnd::ReadError => result = Drained::Incomplete("read error"),
+            PumpEnd::ClientGone => result = Drained::Incomplete("client stopped reading"),
+            PumpEnd::Failed => result = Drained::Incomplete("output task failed"),
         }
     }
     result
@@ -494,6 +652,8 @@ enum PumpEnd {
     ReadError,
     /// Nobody is left to receive the frames.
     ClientGone,
+    /// The forwarding task itself did not finish.
+    Failed,
 }
 
 /// Forward one output stream of the child into frames.
@@ -542,11 +702,19 @@ async fn control_loop(
                 if pty_fd.is_some() {
                     // A terminal has no "close one end": dropping our write
                     // half would leave the read half owning the same master,
-                    // so the child would never see EOF and `qsh -t host cat
-                    // < file` would hang. Send the line discipline's EOF
-                    // character instead, as ssh does.
+                    // so the child would never see EOF.
+                    //
+                    // Two EOTs, not one. In canonical mode `^D` makes the
+                    // pending input readable, and only yields a zero-length
+                    // read — the actual end of file — when the queue is
+                    // already empty. Input that does not end in a newline
+                    // therefore consumes the first one just to flush the last
+                    // partial line, and `printf hello | qsh -t host cat`
+                    // would hang waiting for a second. Sending both is
+                    // harmless when the queue was already empty: the reader
+                    // has stopped by then.
                     if let Some(sink) = stdin_sink.as_mut() {
-                        let _ = sink.write_all(&[EOT]).await;
+                        let _ = sink.write_all(&[EOT, EOT]).await;
                         let _ = sink.flush().await;
                     }
                 } else {
@@ -588,6 +756,8 @@ mod tests {
     use super::*;
     use crate::config::AuthMeta;
 
+    use std::os::unix::process::CommandExt as _;
+
     fn entry(meta: AuthMeta) -> AuthEntry {
         let (pem, _) = crypto::generate_identity("t", &["t".into()], 30).unwrap();
         AuthEntry {
@@ -614,6 +784,7 @@ mod tests {
             allow_shell: false,
             allow_exec: true,
             allowed_commands: vec!["rsync".into()],
+            key_fingerprint: None,
             expires_at_unix: None,
         });
         assert!(authorize_request(&e, &request(None), 0).is_err());
@@ -628,6 +799,7 @@ mod tests {
             allow_shell: true,
             allow_exec: false,
             allowed_commands: vec![],
+            key_fingerprint: None,
             expires_at_unix: None,
         });
         assert!(authorize_request(&e, &request(None), 0).is_ok());
@@ -652,6 +824,116 @@ mod tests {
             ..Default::default()
         });
         assert!(authorize_request(&e, &request(Some(&[])), 0).is_err());
+    }
+
+    /// Start a job that ignores the polite signals, in its own process group.
+    ///
+    /// It blocks on a shell builtin rather than on `sleep`, so the group has
+    /// exactly one member: a grandchild would be reparented to init on death,
+    /// and whether init reaps it promptly is not something a test can rely on.
+    async fn stubborn_job() -> (tokio::process::Child, u32, tokio::process::ChildStdin) {
+        let mut cmd = tokio::process::Command::new("sh");
+        // It announces itself once the traps are installed, so the test can
+        // wait for that rather than guessing at a sleep that a loaded machine
+        // would outrun.
+        cmd.arg("-c")
+            .arg("trap '' HUP TERM; echo ready; read line")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: setsid is async-signal-safe; mirrors what child::spawn does.
+        #[allow(unsafe_code, reason = "the test needs its own process group")]
+        unsafe {
+            cmd.as_std_mut().pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id().unwrap();
+        // The caller keeps stdin open, which is what keeps the shell blocked.
+        let stdin = child.stdin.take().unwrap();
+
+        let mut stdout = child.stdout.take().unwrap();
+        let mut ready = [0u8; 6];
+        tokio::time::timeout(Duration::from_secs(10), stdout.read_exact(&mut ready))
+            .await
+            .expect("the test job never started")
+            .expect("the test job never reported readiness");
+        (child, pid, stdin)
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_terminate_still_kills_the_group() {
+        let (mut child, pid, _stdin) = stubborn_job().await;
+        assert!(child::process_group_alive(pid));
+        let reaper = tokio::spawn(async move { child.wait().await });
+
+        // Cancel the guard mid-escalation, exactly as a daemon shutdown would.
+        let task = tokio::spawn(async move {
+            ProcessGroupGuard::new(Some(pid)).terminate().await;
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        task.abort();
+        let _ = task.await;
+
+        // `Drop` must have delivered SIGKILL even though the escalation never
+        // finished, because the guard stayed armed across the awaits.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while child::process_group_alive(pid) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a job ignoring HUP and TERM survived a cancelled terminate"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let _ = reaper.await;
+    }
+
+    #[tokio::test]
+    async fn terminate_escalates_to_kill_when_signals_are_ignored() {
+        let (mut child, pid, _stdin) = stubborn_job().await;
+        let mut guard = ProcessGroupGuard::new(Some(pid));
+        let started = tokio::time::Instant::now();
+        let ((), _) = tokio::join!(guard.terminate(), child.wait());
+        assert!(!child::process_group_alive(pid));
+        // It should have taken both grace periods to get there.
+        assert!(started.elapsed() >= TERMINATE_GRACE);
+    }
+
+    #[tokio::test]
+    async fn terminate_returns_promptly_for_a_job_that_takes_the_hint() {
+        // Without a concurrent reap this would sit through both grace periods
+        // even for a job that died instantly, because the unreaped leader is a
+        // zombie and a zombie still answers `kill(pid, 0)`.
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("60");
+        // SAFETY: setsid is async-signal-safe; mirrors what child::spawn does.
+        #[allow(unsafe_code, reason = "the test needs its own process group")]
+        unsafe {
+            cmd.as_std_mut().pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id().unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut guard = ProcessGroupGuard::new(Some(pid));
+        let started = tokio::time::Instant::now();
+        let ((), _) = tokio::join!(guard.terminate(), child.wait());
+        let elapsed = started.elapsed();
+
+        assert!(!child::process_group_alive(pid));
+        assert!(
+            elapsed < TERMINATE_GRACE,
+            "SIGHUP should have been enough, but termination took {elapsed:?}"
+        );
     }
 
     #[test]

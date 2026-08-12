@@ -22,3 +22,7 @@ target
 
 # Local test/scratch state
 /rel
+
+# Python bytecode from ci/ helpers
+__pycache__/
+*.pyc

@@ -47,7 +47,9 @@ clap = { version = "4", features = ["derive"] }
 dirs = "6"
 libc = "0.2"
 nix = { version = "0.31", features = ["term", "process", "fs", "user", "signal", "poll", "hostname"] }
-postcard = { version = "1", features = ["use-std"] }
+# `default-features = false` keeps `heapless` out of the graph: it is only
+# needed for no_std targets and drags in the unmaintained `atomic-polyfill`.
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 quinn = { version = "0.11", default-features = false, features = [
     "log",
     "runtime-tokio",
@@ -56,7 +58,6 @@ quinn = { version = "0.11", default-features = false, features = [
 ] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
-rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 tokio = { version = "1", features = [

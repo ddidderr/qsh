@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, Error as TlsError, SignatureScheme};
@@ -183,12 +184,11 @@ fn system_time_to_offset(t: std::time::SystemTime) -> ::time::OffsetDateTime {
 /// # Errors
 /// Fails if the PEM is malformed or holds no certificate.
 pub fn cert_from_pem(pem: &str) -> Result<CertificateDer<'static>> {
-    let mut reader = std::io::BufReader::new(pem.as_bytes());
-    let first = rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_slice_iter(pem.as_bytes())
         .next()
         .transpose()
-        .context("parsing a PEM certificate")?;
-    first.ok_or_else(|| anyhow!("no certificate found"))
+        .context("parsing a PEM certificate")?
+        .ok_or_else(|| anyhow!("no certificate found"))
 }
 
 /// Read a PEM certificate file and return the first certificate in it.
@@ -197,8 +197,9 @@ pub fn cert_from_pem(pem: &str) -> Result<CertificateDer<'static>> {
 /// Fails if the file cannot be read or holds no certificate.
 pub fn load_cert(path: &Path) -> Result<CertificateDer<'static>> {
     let pem = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut reader = std::io::BufReader::new(&pem[..]);
-    let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+    // Every section is parsed, not just the first, so a malformed one later in
+    // the file is an error rather than something silently ignored.
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(&pem)
         .collect::<std::result::Result<_, _>>()
         .with_context(|| format!("parsing certificates in {}", path.display()))?;
     certs
@@ -224,8 +225,11 @@ pub fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
         );
     }
     let pem = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut reader = std::io::BufReader::new(&pem[..]);
-    rustls_pemfile::private_key(&mut reader)
+    // Reading the bytes here, rather than via `from_pem_file`, keeps the
+    // permission check above on the same file we then parse.
+    PrivateKeyDer::pem_slice_iter(&pem)
+        .next()
+        .transpose()
         .with_context(|| format!("parsing private key in {}", path.display()))?
         .ok_or_else(|| anyhow!("{} contains no private key", path.display()))
 }
@@ -293,6 +297,12 @@ fn write_atomically(path: &Path, contents: &str, mode: u32) -> Result<()> {
             .with_context(|| format!("creating {}", tmp.display()))?;
         f.write_all(contents.as_bytes())
             .with_context(|| format!("writing {}", tmp.display()))?;
+        // `open` applies the umask to the mode above, which for a private key
+        // is the difference between 0600 and whatever the operator's umask
+        // happens to leave. Set it explicitly, before anyone can open it by
+        // its final name.
+        f.set_permissions(fs::Permissions::from_mode(mode))
+            .with_context(|| format!("setting the mode of {}", tmp.display()))?;
         f.sync_all()
             .with_context(|| format!("flushing {}", tmp.display()))?;
         Ok(())

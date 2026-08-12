@@ -181,6 +181,11 @@ fn known_hosts(args: &[String]) -> Result<()> {
             let fp = args
                 .get(2)
                 .context("usage: qsh known-hosts add <host:port> <sha256:...>")?;
+            // The file is whitespace-separated, so a host containing any
+            // would write a line nothing can read back.
+            if host.is_empty() || host.split_whitespace().count() != 1 {
+                bail!("`{host}` is not a usable host name for known_hosts");
+            }
             kh.set(host, Fingerprint::parse(fp)?)?;
             println!("pinned {host}");
         }

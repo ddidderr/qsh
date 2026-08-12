@@ -284,16 +284,20 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
         allow_shell: !args.no_shell,
         allow_exec: !args.no_exec,
         allowed_commands: args.commands.clone(),
+        key_fingerprint: Some(fp.to_string()),
         expires_at_unix: expires,
     };
 
     let pem = std::fs::read_to_string(&args.certificate)
         .with_context(|| format!("reading {}", args.certificate.display()))?;
+    // Certificate first, policy second. Each write is atomic on its own, and
+    // an entry is only usable once both exist — the policy names the key it
+    // belongs to, so a half-finished pair is refused rather than guessed at.
     crypto::write_public(&cert_path, &pem)?;
     crypto::write_public(
         &dir.join(format!("{name}.toml")),
         &format!(
-            "# authorized qsh client `{name}`\n# key {fp}\n{}",
+            "# authorized qsh client `{name}`\n{}",
             toml::to_string_pretty(&meta)?
         ),
     )?;

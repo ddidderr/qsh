@@ -178,7 +178,21 @@ long-lived self-signed **Ed25519** certificate.
 * A session is torn down with its connection. If the client is killed, the
   server notices when the QUIC idle timeout expires (60s by default, with
   15-second keep-alives) and signals the remote process group `SIGHUP`, then
-  `SIGTERM`, then `SIGKILL` — nothing is left running.
+  `SIGTERM`, then `SIGKILL` — nothing is left running. That watch stays up for
+  the whole session, including while the last of the output is still draining,
+  so a backgrounded descendant that outlives the command it was started from is
+  cleaned up too.
+* Work is bounded before anyone has authenticated: peers must complete a QUIC
+  retry to prove their address, a handshake has 5 seconds to finish, and a
+  session stream has 10 seconds to say what it wants. Handshakes in flight
+  (32) are budgeted separately from established connections (256), so a stream
+  of half-open attempts cannot fill the pool and lock out the people who hold
+  keys. Over-limit connections are dropped silently rather than answered, and
+  failures before authentication are counted and reported in batches rather
+  than logged one line per attempt.
+* A key's policy is re-read for every session, not captured when the
+  connection was made, so revoking a key also cuts off the connections it
+  already has.
 * The client cannot set arbitrary environment variables. Only `TERM`, `LANG`,
   `COLORTERM`, `LC_*` and `QSH_*` survive; `PATH` is fixed by the server. The
   remote process gets a fresh session (`setsid`) and, when root, a full
@@ -205,8 +219,14 @@ user = "alice"
 allow_shell = true
 allow_exec = true
 allowed_commands = []       # empty means "any program"; entries match argv[0] exactly
+key_fingerprint = "sha256:…" # the key this policy was written for
 # expires_at_unix = 1793491200   # optional; set by --expires-in-days
 ```
+
+An authorization is two files — `<name>.crt` and `<name>.toml` — and each is
+written atomically. `key_fingerprint` ties them together: if a crash or a
+half-finished edit ever left a certificate paired with a policy written for a
+different key, the entry is refused rather than applied.
 
 Environment overrides for both binaries: `QSH_HOME` (client directory) and
 `QSH_SERVER_HOME` (server directory); `qsh-server --dir` and `qsh -i` do the
@@ -242,6 +262,25 @@ In an interactive session, `~.` at the start of a line hangs up (the remote
 session gets `SIGHUP`, so it exits `129` rather than being orphaned), and `~~`
 sends a literal tilde — as in ssh. The escape is disabled whenever there is no
 terminal, so binary streams are never interpreted.
+
+`qsh -t host cat < file` works: a terminal has no half to close, so end of
+input is delivered as the line discipline's EOF character — twice, because the
+first one only flushes a partial last line. A program that puts the terminal
+into raw mode sees those as data, exactly as it would under ssh.
+
+Like ssh, a command that leaves a background process holding its stdout keeps
+the session open until that process exits — the output still belongs to you.
+Detach it explicitly if you do not want to wait:
+
+```
+qsh server sh -c 'nohup ./daemon >/dev/null 2>&1 &'
+```
+
+An interactive session is different, because a terminal has no equivalent of
+"the last writer closed it": a job you background with `&` keeps the terminal
+open after the shell exits. There the session waits two seconds for the rest of
+the output and then finishes anyway, so `sleep 300 &` followed by `exit` still
+returns you to your prompt.
 
 qsh exits with the remote command's exit status, `128+n` if it died from
 signal `n`, and `255` for its own failures — the same convention as ssh, which
@@ -297,6 +336,20 @@ just demo-serve # run it; then `just demo-shell` or `just demo-run uname -a`
 The end-to-end tests start a real `qsh-server` on a loopback UDP port and
 drive the real `qsh` binary against it, including a binary round trip and, if
 `rsync` is installed, an actual `rsync -e qsh` transfer.
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs rustfmt, pedantic clippy as errors, the tests
+on both stable and the declared MSRV with `--locked`, an end-to-end run with
+rsync installed, a **root** end-to-end run (without it the privilege-drop path
+is never executed, since an unprivileged server never switches account), a
+check that the declared MSRV still matches the lockfile, and `cargo audit
+--deny warnings` so an unmaintained dependency fails the build rather than
+waiting to be noticed.
+
+`actionlint` runs over the workflow itself, because a workflow that does not
+parse runs nothing and reports no failure — which is exactly how an earlier
+version of this file sat there doing nothing.
 
 ### Lints
 

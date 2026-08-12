@@ -394,14 +394,16 @@ fn a_disconnected_client_does_not_strand_the_remote_process() {
     // A killed client sends no close frame, so the server learns of it through
     // the QUIC idle timeout. Shorten it so the test does not sit for a minute.
     let f = Fixture::start_with(&[], Some(3));
-    // A marker file lets us identify this exact process afterwards.
-    let marker = f.tmp.path().join("victim");
+    // `exec` makes the sleep inherit the shell's pid, so the marker names the
+    // exact process to watch. Matching on process names instead would also
+    // match unrelated sleeps and make this test depend on what else is running.
+    let marker = f.tmp.path().join("victim.pid");
     let mut child = f
         .client()
         .args([
             "sh",
             "-c",
-            &format!("touch {}; sleep 300", marker.display()),
+            &format!("echo $$ > {}; exec sleep 300", marker.display()),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -409,14 +411,10 @@ fn a_disconnected_client_does_not_strand_the_remote_process() {
         .spawn()
         .unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !marker.exists() {
-        assert!(Instant::now() < deadline, "remote command never started");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let victim = wait_for_pid(&marker);
     assert!(
-        sleep_processes_exist(),
-        "the remote sleep should be running"
+        process_alive(victim),
+        "the remote process should be running"
     );
 
     // Kill the client the way a crash or a lost network would.
@@ -424,32 +422,32 @@ fn a_disconnected_client_does_not_strand_the_remote_process() {
     child.wait().unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(30);
-    while sleep_processes_exist() {
+    while process_alive(victim) {
         assert!(
             Instant::now() < deadline,
-            "the remote process outlived its session"
+            "remote process {victim} outlived its session"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
 }
 
-/// Is any `sleep 300` (the one this test starts) still running?
-fn sleep_processes_exist() -> bool {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let cmdline = entry.path().join("cmdline");
-        if let Ok(raw) = std::fs::read(&cmdline) {
-            let parts: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
-            if parts.first().is_some_and(|p| p.ends_with(b"sleep"))
-                && parts.get(1).is_some_and(|p| *p == b"300")
-            {
-                return true;
+/// Is this exact process still alive?
+fn process_alive(pid: i32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Wait for a remote command to report its pid through a marker file.
+fn wait_for_pid(marker: &Path) -> i32 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(marker) {
+            if let Ok(pid) = text.trim().parse::<i32>() {
+                return pid;
             }
         }
+        assert!(Instant::now() < deadline, "remote command never started");
+        std::thread::sleep(Duration::from_millis(50));
     }
-    false
 }
 
 #[test]
@@ -516,6 +514,265 @@ fn wait_with_deadline(mut child: Child, limit: Duration) -> Option<std::process:
 }
 
 #[test]
+fn a_forced_terminal_delivers_eof_without_a_trailing_newline() {
+    let f = Fixture::start(&[]);
+    // A terminal in canonical mode needs one EOF character to flush a partial
+    // line and another to signal end of file, so input that does not end in a
+    // newline used to hang here forever.
+    let mut child = Command::new(CLIENT_BIN)
+        .args([
+            "-i",
+            f.client_dir.to_str().unwrap(),
+            "-p",
+            &f.port.to_string(),
+            "--accept-new",
+            "-q",
+            "-t",
+            "127.0.0.1",
+            "cat",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"hello").unwrap();
+    drop(stdin);
+
+    let out = wait_with_deadline(child, Duration::from_secs(15))
+        .expect("`printf hello | qsh -t host cat` never saw end of file");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("hello"),
+        "output was {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn a_background_descendant_does_not_outlive_a_disconnected_client() {
+    // The leader exits immediately while a descendant keeps the session's
+    // stdout open. Reaping the leader is not the end of the session, so the
+    // disconnect watch has to stay up through the drain.
+    let f = Fixture::start_with(&[], Some(3));
+    let marker = f.tmp.path().join("descendant.pid");
+    let mut child = f
+        .client()
+        .args([
+            "sh",
+            "-c",
+            // `$!` is the background job's pid; `$$` inside a subshell would
+            // still be the leader's.
+            &format!("sleep 300 & echo $! > {}; exit 0", marker.display()),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let victim = wait_for_pid(&marker);
+    assert!(process_alive(victim), "the descendant should be running");
+
+    // The session is now parked draining a pipe the descendant holds open.
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while process_alive(victim) {
+        assert!(
+            Instant::now() < deadline,
+            "background descendant {victim} outlived its disconnected session"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Every identity fact the kernel will tell us about a remote session.
+struct RemoteIdentity {
+    account: String,
+    fields: std::collections::HashMap<String, Vec<String>>,
+    root_file_denied: bool,
+}
+
+impl RemoteIdentity {
+    fn field(&self, name: &str) -> &[String] {
+        self.fields
+            .get(name)
+            .unwrap_or_else(|| panic!("no `{name}` line in the remote /proc/self/status"))
+    }
+}
+
+/// Ask a session who it is, in every sense the kernel exposes.
+///
+/// `id -un` alone would pass even if the gid or the supplementary groups had
+/// been left at 0, so this reads /proc/self/status as well.
+fn remote_identity(client_dir: &Path, port: u16) -> RemoteIdentity {
+    let out = Command::new(CLIENT_BIN)
+        .args([
+            "-i",
+            client_dir.to_str().unwrap(),
+            "-p",
+            &port.to_string(),
+            "--accept-new",
+            "-q",
+            "127.0.0.1",
+            "sh",
+            "-c",
+            "id -un; cat /proc/self/status; \
+             cat /proc/1/environ >/dev/null 2>&1 && echo ROOTFILE_READABLE || echo ROOTFILE_DENIED",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut fields = std::collections::HashMap::new();
+    for line in stdout.lines() {
+        if let Some((name, rest)) = line.split_once(':') {
+            fields.insert(
+                format!("{name}:"),
+                rest.split_whitespace().map(str::to_owned).collect(),
+            );
+        }
+    }
+    RemoteIdentity {
+        account: stdout.lines().next().unwrap_or_default().to_owned(),
+        fields,
+        root_file_denied: stdout.contains("ROOTFILE_DENIED"),
+    }
+}
+
+/// Run the client with its stdio on a real terminal, drive it, and return
+/// `(exit status, everything it printed)`.
+///
+/// A pty is the only way to reach the interactive path: the client only asks
+/// for a remote terminal when it has a local one, and the remote shell only
+/// turns on job control when it is interactive.
+#[allow(
+    unsafe_code,
+    reason = "raw read/write on a pty the test itself opened; there is no safe wrapper"
+)]
+fn interactive_session(f: &Fixture, script: &[&str], limit: Duration) -> (Option<i32>, String) {
+    use std::os::fd::AsRawFd;
+
+    let pair = nix::pty::openpty(None, None).expect("allocating a pty");
+    let (master, slave) = (pair.master, pair.slave);
+
+    let mut child = Command::new(CLIENT_BIN)
+        .args([
+            "-i",
+            f.client_dir.to_str().unwrap(),
+            "-p",
+            &f.port.to_string(),
+            "--accept-new",
+            "-q",
+            "127.0.0.1",
+        ])
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .expect("starting qsh on a pty");
+
+    // Read continuously, or the terminal buffer would fill and block the
+    // remote shell before it ever reaches the script.
+    let fd = master.as_raw_fd();
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            // SAFETY: reading into a buffer we own from a pty we opened.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            let Ok(n) = usize::try_from(n) else { break };
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    });
+
+    for line in script {
+        std::thread::sleep(Duration::from_millis(400));
+        let bytes = format!("{line}\n");
+        // SAFETY: writing a local buffer to a pty we opened.
+        let written =
+            unsafe { libc::write(master.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+        assert!(written > 0, "could not write to the pty");
+    }
+
+    let status = wait_with_deadline_status(&mut child, limit);
+    drop(master);
+    let text = reader.join().unwrap_or_default();
+    (status, text)
+}
+
+/// Wait for a child, killing it and returning `None` if it overruns.
+fn wait_with_deadline_status(child: &mut Child, limit: Duration) -> Option<i32> {
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.code(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+#[test]
+fn an_interactive_session_ends_even_with_a_job_left_on_the_terminal() {
+    let f = Fixture::start(&[]);
+
+    // Sanity first: a plain interactive session exits with the shell's status.
+    let (status, text) = interactive_session(&f, &["exit 3"], Duration::from_secs(20));
+    assert_eq!(status, Some(3), "plain interactive session: {text}");
+
+    // Now the real case. An interactive shell has job control, so the
+    // backgrounded job gets its own process group and does not receive the
+    // hangup the kernel sends when the shell exits — it keeps the terminal
+    // open indefinitely. A PTY has no last-writer guarantee, so without a
+    // deadline the session would wait for that terminal forever and the
+    // client would never receive an exit status.
+    let (status, text) =
+        interactive_session(&f, &["sleep 300 &", "exit 4"], Duration::from_secs(25));
+    assert_eq!(
+        status,
+        Some(4),
+        "the client never got an exit status past a job left on the terminal: {text}"
+    );
+}
+
+#[test]
+fn a_revoked_key_loses_an_established_connection() {
+    let f = Fixture::start(&[]);
+    assert_eq!(f.exec(&["true"]).0, 0);
+
+    // Hold a connection open across the revocation. Each session opens its own
+    // stream, and the policy has to be re-read for every one of them.
+    run(
+        SERVER_BIN,
+        &["--dir", f.server_dir.to_str().unwrap(), "revoke", "tester"],
+    );
+    std::thread::sleep(Duration::from_millis(1_200));
+    assert_ne!(
+        f.exec(&["true"]).0,
+        0,
+        "a revoked key still opened a session"
+    );
+}
+
+#[test]
 fn a_session_runs_as_the_authorized_account() {
     // Only meaningful as root, where the server actually switches user.
     if !nix::unistd::Uid::effective().is_root() {
@@ -570,33 +827,55 @@ fn a_session_runs_as_the_authorized_account() {
         .unwrap();
     let port = wait_for_port(&log);
 
-    let out = Command::new(CLIENT_BIN)
-        .args([
-            "-i",
-            client_dir.to_str().unwrap(),
-            "-p",
-            &port.to_string(),
-            "--accept-new",
-            "-q",
-            "127.0.0.1",
-            "id",
-            "-un",
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let who = remote_identity(&client_dir, port);
     let _ = server.kill();
     let _ = server.wait();
 
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let account = nix::unistd::User::from_name(target).unwrap().unwrap();
+    let uid = account.uid.as_raw().to_string();
+    let gid = account.gid.as_raw().to_string();
+
     assert_eq!(
-        String::from_utf8_lossy(&out.stdout).trim(),
-        target,
+        who.account, target,
         "the session did not run as the authorized account"
+    );
+
+    // Real, effective, saved-set and filesystem uid must all be the target's.
+    // A saved-set uid of 0 is the one way `setuid(0)` could still succeed, so
+    // this is the portable proof that root cannot be regained.
+    let uids = who.field("Uid:");
+    assert_eq!(uids.len(), 4, "unexpected Uid line: {uids:?}");
+    assert!(
+        uids.iter().all(|u| *u == uid),
+        "not every uid was dropped to {target} ({uid}): {uids:?}"
+    );
+
+    let gids = who.field("Gid:");
+    assert_eq!(gids.len(), 4, "unexpected Gid line: {gids:?}");
+    assert!(
+        gids.iter().all(|g| *g == gid),
+        "not every gid was dropped to {gid}: {gids:?}"
+    );
+
+    // Compare token-wise: a substring check would accept "1000" as a zero.
+    let groups = who.field("Groups:");
+    assert!(
+        !groups.iter().any(|g| g == "0"),
+        "root's supplementary groups survived: {groups:?}"
+    );
+
+    // Any lingering capability would make the uid change cosmetic.
+    for cap in ["CapPrm:", "CapEff:"] {
+        let bits = who.field(cap);
+        assert!(
+            bits.iter().all(|b| b.chars().all(|c| c == '0')),
+            "{cap} is not empty: {bits:?}"
+        );
+    }
+
+    assert!(
+        who.root_file_denied,
+        "a root-only file was still readable from the session"
     );
 }
 

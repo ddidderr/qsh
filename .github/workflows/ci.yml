@@ -5,11 +5,44 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
 jobs:
+  # Single source of truth for the MSRV, so the matrix below and Cargo.toml
+  # cannot drift apart.
+  msrv:
+    name: resolve MSRV
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        run: |
+          version=$(sed -n 's/^rust-version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          test -n "$version" || { echo "Cargo.toml has no rust-version" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "MSRV is $version"
+
+  # A workflow that does not parse runs nothing at all and reports no failure,
+  # which is exactly how the first version of this file went unnoticed.
+  workflow-lint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint the workflow files
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest -color
+
   format:
     name: rustfmt
     runs-on: ubuntu-latest
@@ -33,13 +66,14 @@ jobs:
 
   test:
     name: test (${{ matrix.rust }})
+    needs: msrv
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         # `stable` catches new lints; the pinned version is the MSRV this
         # crate advertises, and `--locked` is what makes that claim real.
-        rust: [stable, "1.88"]
+        rust: [stable, "${{ needs.msrv.outputs.version }}"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -47,7 +81,7 @@ jobs:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
       # The end-to-end suite drives a real `rsync -e qsh` transfer when rsync
-      # is present, and silently skips that test when it is not.
+      # is present, and skips that test when it is not.
       - name: Install rsync
         run: sudo apt-get update && sudo apt-get install -y rsync
       - run: cargo build --locked --all-targets
@@ -64,7 +98,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y rsync
       - run: cargo build --locked --tests
       # As an unprivileged user the server never switches account, so the
-      # initgroups/setgid/setuid path is simply not reached. Running the suite
+      # setgroups/setgid/setuid path is simply not reached. Running the suite
       # as root is what exercises it.
       - name: Run the end-to-end suite as root
         run: sudo -E env "PATH=$PATH" cargo test --locked --test e2e
@@ -75,43 +109,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rust-src
-      # `cargo +<msrv> build --locked` above proves the graph resolves, but
-      # this catches a dependency bump raising the requirement before it
-      # reaches the build.
+      - uses: Swatinem/rust-cache@v2
+      # Building on the MSRV toolchain proves the graph builds today; this
+      # catches a dependency bump raising the requirement.
       - name: Verify the declared rust-version against the dependency graph
-        run: |
-          set -euo pipefail
-          declared=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
-          echo "declared MSRV: $declared"
-          highest=$(cargo metadata --locked --format-version 1 \
-            | python3 -c '
-import json,sys
-meta = json.load(sys.stdin)
-best = (0, 0, 0)
-name = ""
-# Only dependencies matter here; this crate's own claim is what we check.
-root = {"qsh"}
-for pkg in meta["packages"]:
-    rv = pkg.get("rust_version")
-    if not rv or pkg["name"] in root:
-        continue
-    parts = tuple(int(p) for p in (rv.split(".") + ["0", "0"])[:3])
-    if parts > best:
-        best, name = parts, pkg["name"]
-print("%d.%d.%d %s" % (best + (name,)))')
-          echo "highest dependency requirement: $highest"
-          req=${highest%% *}
-          python3 - "$declared" "$req" <<'PY'
-import sys
-def parse(v):
-    return tuple(int(p) for p in (v.split(".") + ["0", "0"])[:3])
-declared, required = parse(sys.argv[1]), parse(sys.argv[2])
-if declared < required:
-    sys.exit(
-        f"Cargo.toml declares rust-version {sys.argv[1]} but the locked "
-        f"dependency graph needs {sys.argv[2]}"
-    )
-print("MSRV claim is consistent with Cargo.lock")
-PY
+        run: python3 ci/check-msrv.py
+
+  audit:
+    name: dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Vulnerabilities always fail. Informational advisories — unmaintained,
+      # unsound, yanked, notice — only fail because of `--deny warnings`, so a
+      # crate going unmaintained is caught here rather than in a review round.
+      # Every accepted advisory must be listed with a reason.
+      - name: cargo audit
+        run: cargo audit --deny warnings

@@ -68,9 +68,15 @@ audit-unsafe:
     @echo "unsafe blocks per file:"
     @grep -rc 'unsafe ' --include='*.rs' src | grep -v ':0$' || true
 
-# Check dependencies for known advisories (needs `cargo install cargo-audit`).
+# Check dependencies for advisories, including unmaintained crates — the same
+# policy CI enforces (needs `cargo install cargo-audit`).
 audit-deps:
-    cargo audit
+    cargo audit --deny warnings
+
+# Validate the GitHub Actions workflows (needs docker).
+audit-ci:
+    docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest -color
+    python3 ci/check-msrv.py
 
 # Build the API documentation and open it.
 doc:

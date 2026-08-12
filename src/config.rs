@@ -201,6 +201,14 @@ pub struct AuthMeta {
     /// `allow_shell` is governed separately.
     #[serde(default)]
     pub allowed_commands: Vec<String>,
+    /// The public key this policy was written for.
+    ///
+    /// A certificate and its policy live in two files, so a crash or a reload
+    /// landing between the two writes could otherwise pair a new certificate
+    /// with a stale, possibly broader policy. Recording the fingerprint lets
+    /// the loader detect that and fail closed.
+    #[serde(default)]
+    pub key_fingerprint: Option<String>,
     /// Unix timestamp after which this authorization stops being accepted.
     ///
     /// This is the administrator's deadline, recorded when the key was
@@ -223,6 +231,7 @@ impl Default for AuthMeta {
             allow_shell: true,
             allow_exec: true,
             allowed_commands: Vec::new(),
+            key_fingerprint: None,
             expires_at_unix: None,
         }
     }
@@ -313,6 +322,25 @@ impl AuthStore {
                 if meta.user.is_empty() {
                     bail!("{} does not name a user", meta_path.display());
                 }
+                // Refuse a policy that was written for a different key rather
+                // than applying it to this one.
+                match &meta.key_fingerprint {
+                    Some(expected) if expected != &fingerprint.to_string() => bail!(
+                        "{} was written for key {expected}, but {} holds {fingerprint}",
+                        meta_path.display(),
+                        cert_path.display()
+                    ),
+                    Some(_) => {}
+                    // Written before this field existed. Accepted so an
+                    // upgrade does not lock everyone out, but it cannot be
+                    // checked, so say so — rewriting the entry with
+                    // `qsh-server authorize` records the key.
+                    None => eprintln!(
+                        "qsh-server: warning: {} does not record which key it is for; \
+                         re-run `qsh-server authorize` for `{name}` to fix that",
+                        meta_path.display()
+                    ),
+                }
                 Ok(AuthEntry {
                     name: name.clone(),
                     fingerprint,
@@ -399,9 +427,20 @@ impl KnownHosts {
     /// # Errors
     /// Fails if the file cannot be written.
     pub fn set(&mut self, host_key: &str, fp: Fingerprint) -> Result<()> {
+        // Saving rewrites the whole file, so start from what is on disk now:
+        // two clients pinning different hosts at once would otherwise each
+        // write back their own stale snapshot and lose the other's entry.
+        self.refresh();
         self.entries.retain(|(h, _)| h != host_key);
         self.entries.push((host_key.to_string(), fp));
         self.save()
+    }
+
+    /// Re-read the file, keeping the in-memory copy if it cannot be read.
+    fn refresh(&mut self) {
+        if let Ok(fresh) = Self::load(&self.path) {
+            self.entries = fresh.entries;
+        }
     }
 
     /// Remove every entry for `host_key`. Returns how many were removed.
@@ -409,6 +448,7 @@ impl KnownHosts {
     /// # Errors
     /// Fails if the file cannot be written.
     pub fn remove(&mut self, host_key: &str) -> Result<usize> {
+        self.refresh();
         let before = self.entries.len();
         self.entries.retain(|(h, _)| h != host_key);
         let removed = before - self.entries.len();
