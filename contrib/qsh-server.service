@@ -1,0 +1,23 @@
+[Unit]
+Description=qsh server (SSH replacement over QUIC)
+Documentation=https://github.com/ddidderr/qsh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/qsh-server serve
+Restart=on-failure
+RestartSec=2
+# Must start as root so sessions can switch to the authorized account.
+User=root
+
+# The server only needs its own configuration directory and the ability to
+# become other local users; everything else can be locked down.
+ProtectHome=false
+ProtectSystem=full
+NoNewPrivileges=false
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target

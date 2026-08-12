@@ -1,0 +1,59 @@
+[package]
+name = "qsh"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.82"
+description = "A minimal SSH replacement over QUIC: remote shell, remote exec and rsync transport"
+license = "MIT"
+repository = "https://github.com/ddidderr/qsh"
+readme = "README.md"
+keywords = ["quic", "ssh", "remote", "shell", "rsync"]
+categories = ["command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "qsh"
+path = "src/bin/qsh.rs"
+
+[[bin]]
+name = "qsh-server"
+path = "src/bin/qsh-server.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+libc = "0.2"
+nix = { version = "0.31", features = ["term", "process", "fs", "user", "signal", "poll", "hostname"] }
+postcard = { version = "1", features = ["use-std"] }
+quinn = { version = "0.11", default-features = false, features = [
+    "log",
+    "runtime-tokio",
+    "rustls-ring",
+    "bloom",
+] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "io-std",
+    "process",
+    "signal",
+    "sync",
+    "time",
+] }
+time = "0.3"
+toml = "1"
+x509-parser = "0.18"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
