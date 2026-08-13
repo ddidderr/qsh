@@ -193,18 +193,30 @@ long-lived self-signed **Ed25519** certificate.
 * Work is bounded before anyone has authenticated: peers must complete a QUIC
   retry to prove their address, a handshake has 5 seconds to finish, and a
   session stream has 10 seconds to say what it wants. Handshakes in flight
-  (32) are budgeted separately from established connections (256), so a stream
-  of half-open attempts cannot fill the pool and lock out the people who hold
-  keys. Over-limit connections are dropped silently rather than answered, and
+  (32) are budgeted separately from established connections (256), so
+  half-open attempts cannot eat the budget that established sessions run on.
+  Within the handshake budget, no single source address may hold more than 4
+  slots at once, which is what keeps one address from filling the pool and
+  locking out everyone else — separate budgets alone would not do that.
+  Over-limit connections are dropped silently rather than answered, and
   failures before authentication are counted and reported in batches rather
   than logged one line per attempt.
+
+  This is a fairness reservation, not a rate limit: nothing is remembered
+  after an attempt ends, so there is no per-address table to grow or expire.
+  It bounds concurrency, not attempt rate, and it says nothing about a
+  distributed flood from many addresses — for that, put the port behind
+  whatever the host already uses for the rest of its services.
 * A key's policy is re-read for every session, not captured when the
   connection was made, so revoking a key also cuts off the connections it
   already has.
 * The client cannot set arbitrary environment variables. Only `TERM`, `LANG`,
   `COLORTERM`, `LC_*` and `QSH_*` survive; `PATH` is fixed by the server. The
   remote process gets a fresh session (`setsid`) and, when root, a full
-  privilege drop with `initgroups`/`setgid`/`setuid`, verified before `exec`.
+  privilege drop with `setgroups`/`setgid`/`setuid`, verified before `exec`.
+  The supplementary groups are resolved *before* the fork: looking them up
+  afterwards would mean calling NSS in a forked child, which is not
+  async-signal-safe and deadlocks under LDAP or SSSD.
 
 What 1.0 does **not** have, on purpose: port forwarding, agent forwarding, X11
 forwarding, `sftp`, jump hosts, certificate authorities, host key rotation
@@ -370,7 +382,7 @@ cannot lock every future session out.
 
 `unsafe_code` is denied crate-wide. It cannot be avoided altogether — PTY
 ioctls, raw-fd reads and writes, `kill(2)`, and the `pre_exec` hook that runs
-`setsid` plus `initgroups`/`setgid`/`setuid` between fork and exec have no safe
+`setsid` plus `setgroups`/`setgid`/`setuid` between fork and exec have no safe
 equivalents — so each of the eleven exceptions carries its own
 `#[allow(unsafe_code, reason = ...)]`. They live in exactly two modules, `pty`
 and `child`, and `just audit-unsafe` prints every one of them:

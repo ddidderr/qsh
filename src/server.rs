@@ -56,6 +56,15 @@ const MAX_CONNECTIONS: usize = 256;
 /// lock out the people with keys.
 const MAX_HANDSHAKES: usize = 32;
 
+/// Handshakes in flight from any single address.
+///
+/// The global budget alone is not fairness: one reachable source can hold all
+/// of it for the length of the handshake deadline, over and over, and no new
+/// client gets in — even though established sessions are unaffected. Capping
+/// each address leaves room for at least `MAX_HANDSHAKES / MAX_HANDSHAKES_PER_SOURCE`
+/// distinct clients to be starting at once.
+const MAX_HANDSHAKES_PER_SOURCE: usize = 4;
+
 /// How long an accepted connection may take to finish its handshake. The idle
 /// timeout is far too generous for this — it would let half-open attempts hold
 /// admission slots for a minute each.
@@ -133,6 +142,7 @@ pub async fn serve(
     let unauthenticated = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_HANDSHAKES));
+    let per_source = Arc::new(PerSourceHandshakes::default());
     let mut rejected: u64 = 0;
     let mut last_reload = tokio::time::Instant::now();
 
@@ -145,11 +155,13 @@ pub async fn serve(
             continue;
         }
 
-        // Over either limit: drop it silently. Refusing would send a packet
-        // per attempt, which is a reflection lever of its own.
-        let (Ok(permit), Ok(handshake_permit)) = (
+        // Over any of the limits: drop it silently. Refusing would send a
+        // packet per attempt, which is a reflection lever of its own.
+        let source = incoming.remote_address().ip();
+        let (Ok(permit), Ok(handshake_permit), Some(source_slot)) = (
             Arc::clone(&connections).try_acquire_owned(),
             Arc::clone(&handshakes).try_acquire_owned(),
+            per_source.try_acquire(source),
         ) else {
             rejected = rejected.saturating_add(1);
             incoming.ignore();
@@ -180,7 +192,7 @@ pub async fn serve(
         tokio::spawn(async move {
             // The permit lives as long as the connection does.
             let _permit = permit;
-            match handle_connection(incoming, store, handshake_permit).await {
+            match handle_connection(incoming, store, (handshake_permit, source_slot)).await {
                 // Only reachable once a client has authenticated; anyone can
                 // provoke the failures before that, so they are counted and
                 // reported in batches instead of logged one per attempt.
@@ -194,6 +206,49 @@ pub async fn serve(
     }
     refresher.abort();
     Ok(())
+}
+
+/// Counts handshakes in flight per source address.
+///
+/// Deliberately not a rate limiter: nothing is remembered once an attempt
+/// finishes, so there is no table to grow and nothing to expire. It only stops
+/// one address from occupying the whole handshake budget at any instant.
+#[derive(Debug, Default)]
+struct PerSourceHandshakes {
+    in_flight: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>,
+}
+
+/// Releases the slot when the handshake finishes, however it finishes.
+struct SourceSlot {
+    limiter: Arc<PerSourceHandshakes>,
+    source: std::net::IpAddr,
+}
+
+impl PerSourceHandshakes {
+    fn try_acquire(self: &Arc<Self>, source: std::net::IpAddr) -> Option<SourceSlot> {
+        let mut in_flight = crate::sync::mutex(&self.in_flight);
+        let count = in_flight.entry(source).or_insert(0);
+        if *count >= MAX_HANDSHAKES_PER_SOURCE {
+            return None;
+        }
+        *count += 1;
+        Some(SourceSlot {
+            limiter: Arc::clone(self),
+            source,
+        })
+    }
+}
+
+impl Drop for SourceSlot {
+    fn drop(&mut self) {
+        let mut in_flight = crate::sync::mutex(&self.limiter.in_flight);
+        if let Some(count) = in_flight.get_mut(&self.source) {
+            *count -= 1;
+            if *count == 0 {
+                in_flight.remove(&self.source);
+            }
+        }
+    }
 }
 
 /// Re-read `authorized/` on a timer.
@@ -250,7 +305,7 @@ enum Authenticated {
 async fn handle_connection(
     incoming: quinn::Incoming,
     store: Arc<RwLock<AuthStore>>,
-    handshake_permit: tokio::sync::OwnedSemaphorePermit,
+    handshake_permit: (tokio::sync::OwnedSemaphorePermit, SourceSlot),
 ) -> Result<Authenticated> {
     // An unauthenticated peer must not be able to sit on an admission slot.
     let Ok(handshake) = tokio::time::timeout(HANDSHAKE_GRACE, incoming).await else {
@@ -483,7 +538,7 @@ async fn wait_for_exit(pid: u32) {
 }
 
 async fn run_session(
-    mut send: quinn::SendStream,
+    send: quinn::SendStream,
     recv: quinn::RecvStream,
     spawned: Spawned,
 ) -> Result<()> {
@@ -496,14 +551,14 @@ async fn run_session(
 
     // Single writer for the stream: stdout, stderr and the exit status all
     // funnel through here, so frames never interleave.
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
+        let mut stream = SessionStream::new(send);
         while let Some(frame) = rx.recv().await {
-            if write_frame(&mut send, &frame).await.is_err() {
+            if stream.write(&frame).await.is_err() {
                 break;
             }
         }
-        let _ = send.finish();
-        send
+        stream.finish().await;
     });
 
     if tx.send(Frame::Started).await.is_err() {
@@ -597,10 +652,18 @@ async fn run_session(
     let _ = tokio::time::timeout(SHUTDOWN_GRACE, tx.send(Frame::Exit(exit))).await;
     drop(tx);
 
-    if let Ok(Ok(mut send)) = tokio::time::timeout(SHUTDOWN_GRACE, writer).await {
-        // Make sure the peer sees everything before the stream disappears.
-        let _ = send.flush().await;
-        let _ = tokio::time::timeout(SHUTDOWN_GRACE, send.stopped()).await;
+    // The writer finishes the stream itself once the channel closes. If it is
+    // still stuck on a peer that is not reading, cancel it and wait for that
+    // to take effect: dropping the handle would detach a task that still owns
+    // the stream, and quinn treats a dropped `SendStream` as a graceful finish
+    // that goes on retransmitting. `SessionStream` resets it on the way out
+    // instead, which is the honest ending for a session nobody is listening to.
+    if tokio::time::timeout(SHUTDOWN_GRACE, &mut writer)
+        .await
+        .is_err()
+    {
+        writer.abort();
+        let _ = writer.await;
     }
     Ok(())
 }
@@ -654,16 +717,20 @@ async fn drain(tasks: &mut [Pump], is_pty: bool) -> Drained {
             if let Ok(joined) = tokio::time::timeout(DRAIN_GRACE, &mut pump.task).await {
                 joined.unwrap_or(PumpEnd::Failed)
             } else {
-                // Cancellation can only land on an await point, and the pump
-                // has exactly two: reading the terminal and handing a chunk
-                // on. `holding` says which, so this is a fact about the pump
-                // rather than a guess from the outside — an empty queue proves
-                // nothing, because a chunk can be in the pump's own hands.
-                let lost = pump.holding.load(std::sync::atomic::Ordering::Acquire);
+                // Order matters here. `abort` only *requests* cancellation, so
+                // reading the flag first would be sampling a pump that is
+                // still running and can still pick up a chunk — an await that
+                // is immediately ready does not have to yield. Awaiting the
+                // handle is what establishes that the task has stopped; only
+                // then is the flag a settled fact.
                 pump.task.abort();
-                if lost {
+                let _ = (&mut pump.task).await;
+                if pump.holding.load(std::sync::atomic::Ordering::Acquire) {
+                    // It was cancelled mid-handover, so that chunk is gone.
                     PumpEnd::ClientGone
                 } else {
+                    // Parked on the read, owing nothing. Anything it did send
+                    // is already queued ahead of the exit status.
                     PumpEnd::Eof
                 }
             }
@@ -690,6 +757,52 @@ enum PumpEnd {
     ClientGone,
     /// The forwarding task itself did not finish.
     Failed,
+}
+
+/// The session's send stream, which is never simply dropped.
+///
+/// A `SendStream` that goes out of scope is *finished* by quinn, which keeps
+/// retransmitting whatever is buffered. That is the wrong ending for a session
+/// being abandoned because the peer stopped reading: the point is to stop.
+/// This resets it instead, unless it was finished deliberately.
+struct SessionStream {
+    send: Option<quinn::SendStream>,
+}
+
+/// Application error code for a stream torn down without a proper ending.
+const RESET_ABANDONED: u32 = 2;
+
+impl SessionStream {
+    fn new(send: quinn::SendStream) -> Self {
+        Self { send: Some(send) }
+    }
+
+    async fn write(&mut self, frame: &Frame) -> std::io::Result<()> {
+        match self.send.as_mut() {
+            Some(send) => write_frame(send, frame).await,
+            None => Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        }
+    }
+
+    /// End the stream properly and wait for the peer to acknowledge it.
+    async fn finish(mut self) {
+        let Some(mut send) = self.send.take() else {
+            return;
+        };
+        let _ = send.flush().await;
+        let _ = send.finish();
+        // Bounded by the caller's timeout; the reset guard is already disarmed,
+        // so a cancellation here just drops an already-finished stream.
+        let _ = send.stopped().await;
+    }
+}
+
+impl Drop for SessionStream {
+    fn drop(&mut self) {
+        if let Some(mut send) = self.send.take() {
+            let _ = send.reset(RESET_ABANDONED.into());
+        }
+    }
 }
 
 /// One output stream being forwarded, and whether it is mid-handover.
@@ -1015,5 +1128,32 @@ mod tests {
         assert!(err.to_string().contains("expired"), "{err}");
         // A shell is refused for the same reason, not just exec.
         assert!(authorize_request(&e, &request(None), 1_001).is_err());
+    }
+
+    #[test]
+    fn a_source_cannot_take_more_than_its_share_of_handshakes() {
+        let limiter = Arc::new(PerSourceHandshakes::default());
+        let one: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let two: std::net::IpAddr = "203.0.113.8".parse().unwrap();
+
+        let held: Vec<_> = (0..MAX_HANDSHAKES_PER_SOURCE)
+            .map(|_| limiter.try_acquire(one).expect("within the per-source cap"))
+            .collect();
+        assert!(
+            limiter.try_acquire(one).is_none(),
+            "one address got past its cap"
+        );
+        // Which is the whole point: the next address is unaffected.
+        let other = limiter.try_acquire(two).expect("a different source");
+
+        drop(held);
+        assert!(
+            limiter.try_acquire(one).is_some(),
+            "slots were not released when the handshakes ended"
+        );
+        drop(other);
+        // Nothing is remembered once the attempts are over, so there is no
+        // table to grow and nothing to expire.
+        assert!(crate::sync::mutex(&limiter.in_flight).is_empty());
     }
 }

@@ -291,10 +291,20 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
 
     let pem = std::fs::read_to_string(&args.certificate)
         .with_context(|| format!("reading {}", args.certificate.display()))?;
-    // Certificate first, policy second. Each write is atomic on its own, and
-    // an entry is only usable once both exist — the policy names the key it
-    // belongs to, so a half-finished pair is refused rather than guessed at.
-    crypto::write_public(&cert_path, &pem)?;
+
+    // Policy first, certificate second — the order matters for what a reload
+    // landing between the two writes can see.
+    //
+    // The new policy names the new key. So in the window, the directory holds
+    // the *old* certificate against a policy written for a different one: a
+    // mismatch, which the loader refuses. Once the certificate lands the pair
+    // agrees again.
+    //
+    // The other order is not safe, and this used to have it. Replacing an
+    // entry whose old policy predates `key_fingerprint` would put the new
+    // certificate next to a policy with nothing to check it against — and
+    // since those are deliberately still accepted, the new key would be
+    // authorized under the old policy, which may grant more than intended.
     crypto::write_public(
         &dir.join(format!("{name}.toml")),
         &format!(
@@ -302,6 +312,7 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
             toml::to_string_pretty(&meta)?
         ),
     )?;
+    crypto::write_public(&cert_path, &pem)?;
 
     if let Some(old) = &replaced {
         remove_entry(&dir, old)?;

@@ -17,6 +17,7 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const SERVER_BIN: &str = env!("CARGO_BIN_EXE_qsh-server");
@@ -138,10 +139,15 @@ impl Fixture {
     }
 
     fn client(&self) -> Command {
+        self.client_as(&self.client_dir)
+    }
+
+    /// The same, for a client identity other than the fixture's own.
+    fn client_as(&self, identity: &Path) -> Command {
         let mut cmd = Command::new(CLIENT_BIN);
         cmd.args([
             "-i",
-            self.client_dir.to_str().unwrap(),
+            identity.to_str().unwrap(),
             "-p",
             &self.port.to_string(),
             "--accept-new",
@@ -153,8 +159,12 @@ impl Fixture {
 
     /// Run a remote command and return (status, stdout, stderr).
     fn exec(&self, argv: &[&str]) -> (i32, String, String) {
+        self.exec_as(&self.client_dir, argv)
+    }
+
+    fn exec_as(&self, identity: &Path, argv: &[&str]) -> (i32, String, String) {
         let out = self
-            .client()
+            .client_as(identity)
             .args(argv)
             .stdin(Stdio::null())
             .output()
@@ -188,6 +198,311 @@ fn wait_for_port(log: &Path) -> u16 {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+// ---------------------------------------------------------------- raw client
+//
+// Some behaviour can only be reached below the CLI: the `qsh` binary makes one
+// connection and one session per run, so nothing it can be asked to do covers
+// "two sessions on the same QUIC connection". These helpers speak the protocol
+// directly for those cases.
+
+/// Accepts whatever certificate the server offers.
+///
+/// The tests are not verifying host-key pinning here — `a_changed_host_key_is_refused`
+/// does that through the real client — they are verifying server behaviour
+/// after the handshake.
+#[derive(Debug)]
+struct AcceptAnyServer;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyServer {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::PeerIncompatible(
+            rustls::PeerIncompatible::Tls12NotOffered,
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// A verifier that stops the handshake dead just before it would finish.
+///
+/// rustls calls this on the client once the server's flight has arrived, so a
+/// connection parked in here has already had its address validated and is
+/// occupying a handshake slot on the server — which is the state a pre-auth
+/// flood needs to reach, and the only one worth defending against.
+#[derive(Debug)]
+struct StallingVerifier {
+    hold: Duration,
+}
+
+impl rustls::client::danger::ServerCertVerifier for StallingVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // Blocking, deliberately: it also stops this connection's driver from
+        // sending anything further, which is what the server has to survive.
+        std::thread::sleep(self.hold);
+        Err(rustls::Error::General("stalled on purpose".into()))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General("stalled on purpose".into()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General("stalled on purpose".into()))
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Build a client endpoint that authenticates as `client_dir`'s key.
+fn raw_endpoint(
+    client_dir: &Path,
+    bind: &str,
+    verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+) -> quinn::Endpoint {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let identity =
+        qsh::crypto::load_identity(&client_dir.join("id.crt"), &client_dir.join("id.key"))
+            .expect("loading the test identity");
+
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(verifier)
+    .with_client_auth_cert(vec![identity.cert.clone()], identity.key.clone_key())
+    .expect("installing the client certificate");
+    tls.alpn_protocols = vec![qsh::proto::ALPN.to_vec()];
+
+    let mut endpoint = quinn::Endpoint::client(bind.parse().unwrap()).unwrap();
+    let mut cfg = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
+    ));
+    cfg.transport_config(Arc::new(
+        qsh::net::transport_config(Duration::from_secs(60), Duration::from_secs(5)).unwrap(),
+    ));
+    endpoint.set_default_client_config(cfg);
+    endpoint
+}
+
+/// Open one QUIC connection to the fixture's server, as the authorized key.
+async fn raw_connect(client_dir: &Path, port: u16) -> quinn::Connection {
+    let endpoint = raw_endpoint(client_dir, "0.0.0.0:0", Arc::new(AcceptAnyServer));
+    let conn = endpoint
+        .connect(std::net::SocketAddr::from(([127, 0, 0, 1], port)), "qsh")
+        .expect("starting the handshake")
+        .await
+        .expect("connecting");
+    // The endpoint has to outlive the connection.
+    std::mem::forget(endpoint);
+    conn
+}
+
+/// Park `count` handshakes from a single source address, each for `hold`.
+///
+/// Every one gets its own thread: the stall is a blocking one inside rustls,
+/// so a connection that is parked also stops its endpoint's driver, and they
+/// have to be independent of each other to all be in flight at once.
+///
+/// Returns once they are all far enough along to be occupying a slot.
+fn stall_handshakes(client_dir: &Path, source: &str, port: u16, count: usize, hold: Duration) {
+    for _ in 0..count {
+        let dir = client_dir.to_path_buf();
+        let bind = format!("{source}:0");
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let endpoint = raw_endpoint(&dir, &bind, Arc::new(StallingVerifier { hold }));
+                if let Ok(connecting) =
+                    endpoint.connect(std::net::SocketAddr::from(([127, 0, 0, 1], port)), "qsh")
+                {
+                    let _ = connecting.await;
+                }
+            });
+        });
+    }
+    // Long enough for the retry round trip and the server's flight; the stall
+    // itself is much longer, so this only has to be generous, not exact.
+    std::thread::sleep(Duration::from_millis(750));
+}
+
+/// Open a session stream and send its request, without reading anything back.
+async fn raw_request(
+    conn: &quinn::Connection,
+    argv: &[&str],
+    pty: bool,
+) -> Option<(quinn::SendStream, quinn::RecvStream)> {
+    let (mut send, recv) = conn.open_bi().await.ok()?;
+    qsh::proto::write_frame(
+        &mut send,
+        &qsh::proto::Frame::Request(qsh::proto::Request {
+            version: qsh::proto::PROTOCOL_VERSION,
+            user: None,
+            command: Some(argv.iter().map(|a| (*a).to_owned()).collect()),
+            pty: pty.then(|| qsh::proto::PtyRequest {
+                term: "dumb".to_owned(),
+                size: qsh::proto::PtySize::default(),
+            }),
+            env: Vec::new(),
+        }),
+    )
+    .await
+    .ok()?;
+    Some((send, recv))
+}
+
+/// Run one command on an existing connection; `None` if the server refused to
+/// start a session at all.
+async fn raw_session(conn: &quinn::Connection, argv: &[&str]) -> Option<i32> {
+    let (_send, mut recv) = raw_request(conn, argv, false).await?;
+    loop {
+        match qsh::proto::read_frame(&mut recv).await {
+            Ok(Some(qsh::proto::Frame::Exit(status))) => return Some(status.wait_status()),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return None,
+        }
+    }
+}
+
+/// What a peer saw after it stopped reading in the middle of a session.
+#[derive(Debug)]
+struct Stalled {
+    /// How many bytes of output reached this peer in the end.
+    bytes: usize,
+    /// The exit status the server reported, if it managed to report one.
+    exit: Option<i32>,
+    /// The diagnostic that came with it, if any.
+    error: Option<String>,
+    /// Whether the server tore the stream down instead of ending it cleanly.
+    reset: bool,
+}
+
+/// Start a session, read only until the process has started, stop reading for
+/// `stall`, then read whatever is left.
+///
+/// This is the peer the drain logic exists for: one that is authenticated and
+/// keeps the connection alive, but stops consuming output while the remote
+/// process is still producing it.
+async fn stalled_session(conn: &quinn::Connection, argv: &[&str], stall: Duration) -> Stalled {
+    let (_send, mut recv) = raw_request(conn, argv, true)
+        .await
+        .expect("opening a session stream");
+
+    loop {
+        match qsh::proto::read_frame(&mut recv).await {
+            Ok(Some(qsh::proto::Frame::Started)) => break,
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => panic!("the session ended before it started"),
+        }
+    }
+
+    // Nothing is read here. The server's frame channel fills, the writer
+    // blocks on QUIC flow control, and the pump ends up parked holding a chunk
+    // it cannot hand over — which is the state the drain has to classify.
+    tokio::time::sleep(stall).await;
+
+    let mut out = Stalled {
+        bytes: 0,
+        exit: None,
+        error: None,
+        reset: false,
+    };
+    let collect = async {
+        loop {
+            match qsh::proto::read_frame(&mut recv).await {
+                Ok(Some(qsh::proto::Frame::Exit(status))) => {
+                    out.exit = Some(status.wait_status());
+                    return;
+                }
+                Ok(Some(qsh::proto::Frame::Stdout(d))) => out.bytes += d.len(),
+                Ok(Some(qsh::proto::Frame::Error(e))) => out.error = Some(e),
+                Ok(Some(_)) => {}
+                Ok(None) => return,
+                Err(_) => {
+                    out.reset = true;
+                    return;
+                }
+            }
+        }
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_secs(30), collect)
+            .await
+            .is_ok(),
+        "the server neither finished nor reset the session"
+    );
+    out
+}
+
+/// Is `pid` still a live process running the command we started?
+///
+/// Matching the marker matters: a bare `kill(pid, 0)` would be satisfied by an
+/// unrelated process that reused the pid, and by a zombie — whose `cmdline` is
+/// empty, so it correctly reads as gone here.
+fn running_with_marker(pid: i32, marker: &str) -> bool {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .is_ok_and(|c| String::from_utf8_lossy(&c).contains(marker))
 }
 
 #[test]
@@ -647,69 +962,123 @@ fn remote_identity(client_dir: &Path, port: u16) -> RemoteIdentity {
     }
 }
 
-/// Run the client with its stdio on a real terminal, drive it, and return
-/// `(exit status, everything it printed)`.
+/// A `qsh` client whose stdio is a real terminal that this process owns.
 ///
 /// A pty is the only way to reach the interactive path: the client only asks
 /// for a remote terminal when it has a local one, and the remote shell only
-/// turns on job control when it is interactive.
+/// turns on job control when it is interactive. It is also the only way to
+/// observe what the client does to the terminal, which is what
+/// `a_fatal_signal_puts_the_terminal_back` needs.
+struct PtyClient {
+    master: std::os::fd::OwnedFd,
+    /// A spare handle on the same terminal. It is what lets the test read the
+    /// termios the client has installed, and it is deliberately closed before
+    /// the reader is joined: the reader's `read` on the master only returns
+    /// (with `EIO`) once *every* slave descriptor is gone.
+    terminal: Option<std::os::fd::OwnedFd>,
+    child: Child,
+    reader: Option<std::thread::JoinHandle<String>>,
+}
+
 #[allow(
     unsafe_code,
     reason = "raw read/write on a pty the test itself opened; there is no safe wrapper"
 )]
-fn interactive_session(f: &Fixture, script: &[&str], limit: Duration) -> (Option<i32>, String) {
-    use std::os::fd::AsRawFd;
+impl PtyClient {
+    fn start(f: &Fixture) -> Self {
+        use std::os::fd::AsRawFd;
 
-    let pair = nix::pty::openpty(None, None).expect("allocating a pty");
-    let (master, slave) = (pair.master, pair.slave);
+        let pair = nix::pty::openpty(None, None).expect("allocating a pty");
+        let (master, slave) = (pair.master, pair.slave);
 
-    let mut child = Command::new(CLIENT_BIN)
-        .args([
-            "-i",
-            f.client_dir.to_str().unwrap(),
-            "-p",
-            &f.port.to_string(),
-            "--accept-new",
-            "-q",
-            "127.0.0.1",
-        ])
-        .stdin(Stdio::from(slave.try_clone().unwrap()))
-        .stdout(Stdio::from(slave.try_clone().unwrap()))
-        .stderr(Stdio::from(slave))
-        .spawn()
-        .expect("starting qsh on a pty");
+        let child = Command::new(CLIENT_BIN)
+            .args([
+                "-i",
+                f.client_dir.to_str().unwrap(),
+                "-p",
+                &f.port.to_string(),
+                "--accept-new",
+                "-q",
+                "127.0.0.1",
+            ])
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave.try_clone().unwrap()))
+            .spawn()
+            .expect("starting qsh on a pty");
 
-    // Read continuously, or the terminal buffer would fill and block the
-    // remote shell before it ever reaches the script.
-    let fd = master.as_raw_fd();
-    let reader = std::thread::spawn(move || {
-        let mut out = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            // SAFETY: reading into a buffer we own from a pty we opened.
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-            let Ok(n) = usize::try_from(n) else { break };
-            if n == 0 {
-                break;
+        // Read continuously, or the terminal buffer would fill and block the
+        // remote shell before it ever reaches the script.
+        let fd = master.as_raw_fd();
+        let reader = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                // SAFETY: reading into a buffer we own from a pty we opened.
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                let Ok(n) = usize::try_from(n) else { break };
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
             }
-            out.extend_from_slice(&buf[..n]);
-        }
-        String::from_utf8_lossy(&out).into_owned()
-    });
+            String::from_utf8_lossy(&out).into_owned()
+        });
 
-    for line in script {
-        std::thread::sleep(Duration::from_millis(400));
+        Self {
+            master,
+            terminal: Some(slave),
+            child,
+            reader: Some(reader),
+        }
+    }
+
+    fn write_line(&self, line: &str) {
+        use std::os::fd::AsRawFd;
         let bytes = format!("{line}\n");
         // SAFETY: writing a local buffer to a pty we opened.
         let written =
-            unsafe { libc::write(master.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+            unsafe { libc::write(self.master.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
         assert!(written > 0, "could not write to the pty");
     }
 
-    let status = wait_with_deadline_status(&mut child, limit);
-    drop(master);
-    let text = reader.join().unwrap_or_default();
-    (status, text)
+    /// The terminal settings currently in force, as the client left them.
+    fn termios(&self) -> nix::sys::termios::Termios {
+        let fd = self
+            .terminal
+            .as_ref()
+            .expect("the terminal handle is still open");
+        nix::sys::termios::tcgetattr(fd).expect("reading the pty's termios")
+    }
+
+    fn pid(&self) -> nix::unistd::Pid {
+        nix::unistd::Pid::from_raw(self.child.id() as i32)
+    }
+
+    fn wait_status(&mut self, limit: Duration) -> Option<i32> {
+        wait_with_deadline_status(&mut self.child, limit)
+    }
+
+    /// Close the terminal and collect everything the client printed.
+    fn finish(mut self) -> String {
+        drop(self.terminal.take());
+        self.reader
+            .take()
+            .map(|r| r.join().unwrap_or_default())
+            .unwrap_or_default()
+    }
+}
+
+/// Run the client on a real terminal, feed it a script, and return
+/// `(exit status, everything it printed)`.
+fn interactive_session(f: &Fixture, script: &[&str], limit: Duration) -> (Option<i32>, String) {
+    let mut client = PtyClient::start(f);
+    for line in script {
+        std::thread::sleep(Duration::from_millis(400));
+        client.write_line(line);
+    }
+    let status = client.wait_status(limit);
+    (status, client.finish())
 }
 
 /// Wait for a child, killing it and returning `None` if it overruns.
@@ -759,22 +1128,329 @@ fn an_interactive_session_ends_even_with_a_job_left_on_the_terminal() {
 }
 
 #[test]
-fn a_revoked_key_loses_an_established_connection() {
+fn one_source_cannot_monopolize_the_handshake_pool() {
     let f = Fixture::start(&[]);
-    assert_eq!(f.exec(&["true"]).0, 0);
 
-    // Hold a connection open across the revocation. Each session opens its own
-    // stream, and the policy has to be re-read for every one of them.
+    // More stalled handshakes than the whole global budget (32), all from one
+    // address. Address validation has already happened for each — a retry
+    // makes sure of that — so these are the attempts that actually cost the
+    // server something, not spoofable packets.
+    stall_handshakes(
+        &f.client_dir,
+        "127.0.0.2",
+        f.port,
+        40,
+        Duration::from_secs(12),
+    );
+
+    // A key holder arriving from a different address must not have to wait for
+    // that to burn itself out. The server's handshake grace is five seconds,
+    // so without a per-source reservation this is what would be lost: the pool
+    // is fully occupied and a new client is dropped until the flood times out.
+    let started = Instant::now();
+    let (code, _, err) = f.exec(&["true"]);
+    let waited = started.elapsed();
+    assert_eq!(code, 0, "a key holder was locked out by the flood: {err}");
+    assert!(
+        waited < Duration::from_secs(4),
+        "a key holder waited {waited:?} behind another address's half-open attempts"
+    );
+}
+
+#[test]
+fn a_torn_authorize_cannot_pair_a_new_key_with_a_legacy_policy() {
+    let f = Fixture::start(&[]);
+    let authorized = f.server_dir.join("authorized");
+    let policy_path = authorized.join("tester.toml");
+    let cert_path = authorized.join("tester.crt");
+
+    // Age the policy into one written before `key_fingerprint` existed. Those
+    // are deliberately still accepted — failing them closed would lock out
+    // every deployment that upgrades — and that acceptance is exactly what
+    // makes the order of the two writes a security property rather than a
+    // detail.
+    let legacy: String = std::fs::read_to_string(&policy_path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with("key_fingerprint"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !legacy.contains("key_fingerprint"),
+        "the policy still names its key"
+    );
+    std::fs::write(&policy_path, legacy).unwrap();
+    std::thread::sleep(Duration::from_millis(1_200));
+    assert_eq!(
+        f.exec(&["true"]).0,
+        0,
+        "a legacy policy should still be honoured"
+    );
+
+    // Now replace that authorization with a different key under the same name.
+    let second = f.tmp.path().join("second");
+    run(
+        CLIENT_BIN,
+        &["keygen", "--identity", second.to_str().unwrap()],
+    );
     run(
         SERVER_BIN,
-        &["--dir", f.server_dir.to_str().unwrap(), "revoke", "tester"],
+        &[
+            "--dir",
+            f.server_dir.to_str().unwrap(),
+            "authorize",
+            second.join("id.crt").to_str().unwrap(),
+            "--user",
+            &current_user(),
+            "--name",
+            "tester",
+            "--force",
+        ],
     );
+
+    // The policy has to be committed first. That is the whole fix: it fixes
+    // which half-written state is reachable. Writing the certificate first
+    // would leave the new key sitting next to the legacy policy above — a key
+    // running under a policy that was written for a different one, and with
+    // no fingerprint in it to catch that.
+    //
+    // The two writes are separated by two `fsync`s, so the gap is milliseconds
+    // on any filesystem that timestamps finer than a second.
+    let policy_written = std::fs::metadata(&policy_path).unwrap().modified().unwrap();
+    let cert_written = std::fs::metadata(&cert_path).unwrap().modified().unwrap();
+    assert!(
+        policy_written < cert_written,
+        "the certificate was published before the policy that names it \
+         ({policy_written:?} vs {cert_written:?})"
+    );
+
+    // And the state that order does leave reachable fails closed. Rebuild it:
+    // the new policy, still paired with the certificate it replaced.
+    std::fs::copy(f.client_dir.join("id.crt"), &cert_path).unwrap();
     std::thread::sleep(Duration::from_millis(1_200));
     assert_ne!(
         f.exec(&["true"]).0,
         0,
-        "a revoked key still opened a session"
+        "the superseded key still worked against a policy written for another key"
     );
+    assert_ne!(
+        f.exec_as(&second, &["true"]).0,
+        0,
+        "the new key worked without its certificate being published"
+    );
+
+    // Finish the interrupted publication and it works again — the residual is
+    // an authorization that is refused until `authorize` is re-run, not one
+    // that quietly does the wrong thing.
+    std::fs::copy(second.join("id.crt"), &cert_path).unwrap();
+    std::thread::sleep(Duration::from_millis(1_200));
+    assert_eq!(
+        f.exec_as(&second, &["true"]).0,
+        0,
+        "the completed authorization did not work"
+    );
+}
+
+#[test]
+fn a_peer_that_stops_reading_never_gets_a_successful_exit() {
+    let f = Fixture::start(&[]);
+
+    // A leader that exits at once, leaving a descendant writing to the
+    // terminal. That is the shape the PTY drain deadline exists for: a
+    // terminal has no last-writer guarantee, so the pump can never see EOF,
+    // and the deadline has to decide what the silence means.
+    //
+    // `trap "" HUP` is load-bearing. The leader is the session leader with
+    // this pty as its controlling terminal, so the kernel hangs up the
+    // foreground process group when it exits — without the trap the writer
+    // dies immediately, nothing ever backs up, and the session drains cleanly.
+    // The disposition survives `exec`, so `cat` inherits it. It stays in the
+    // leader's process group, which is what teardown is supposed to reach.
+    //
+    // It records its pid and carries a unique path in its argv, so the test
+    // can tell it apart from any other `cat` on the machine.
+    let pidfile = f.tmp.path().join("writer.pid");
+    let marker = f.tmp.path().join("stalled-writer");
+    //
+    // The leader waits for the pid file before exiting. Without that wait the
+    // hangup can arrive while the descendant is still starting up, before its
+    // trap is installed, and the whole setup evaporates.
+    let script = format!(
+        "sh -c 'trap \"\" HUP; echo $$ > {pid}; exec cat /dev/zero {marker}' & \
+         until [ -s {pid} ]; do sleep 0.1; done; exit 0",
+        pid = pidfile.display(),
+        marker = marker.display(),
+    );
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let stalled = rt.block_on(async {
+        let conn = raw_connect(&f.client_dir, f.port).await;
+        // Comfortably longer than the server's two-second drain deadline, so
+        // the decision is already made by the time this peer starts reading
+        // again — and short enough that reading resumes while the server is
+        // still tearing the session down, so its verdict can reach us.
+        stalled_session(&conn, &["sh", "-c", &script], Duration::from_secs(4)).await
+    });
+
+    // The scenario really did produce a backlog. Without this the rest could
+    // pass on a session that never wrote anything at all, which is how the
+    // first version of this test quietly measured nothing.
+    assert!(
+        stalled.bytes > 1024 * 1024,
+        "the session did not produce enough output to back up: {stalled:?}"
+    );
+
+    // The point of the whole drain path: output that could not be delivered
+    // must never be dressed up as a successful run. The leader exited 0, so a
+    // server that forwards its status verbatim reports 0 here — and a caller
+    // redirecting to a file would keep a truncated copy and believe it.
+    assert_ne!(
+        stalled.exit,
+        Some(0),
+        "a truncated -t session reported success: {stalled:?}"
+    );
+    assert!(
+        stalled.exit.is_some() || stalled.reset,
+        "the session neither reported a status nor reset the stream: {stalled:?}"
+    );
+    if let Some(exit) = stalled.exit {
+        assert_eq!(exit, 255, "unexpected failure status: {stalled:?}");
+    }
+    // The diagnostic is best-effort by design: it is queued without blocking,
+    // precisely because the usual way to get here is a queue nobody is
+    // draining. So it is checked when it arrives and not required.
+    if let Some(error) = &stalled.error {
+        assert!(
+            error.contains("could not be delivered in full"),
+            "unexpected diagnostic: {error}"
+        );
+    }
+
+    // And the job does not get to outlive the session that failed. This is the
+    // half that does not depend on whether the exit status made it back: a
+    // server that treated the timeout as a clean drain would disarm the guard
+    // and leave this process writing into a terminal nobody owns.
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .expect("the descendant never recorded its pid")
+        .trim()
+        .parse()
+        .expect("unparseable pid");
+    let marker = marker.to_string_lossy().into_owned();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while running_with_marker(pid, &marker) {
+        assert!(
+            Instant::now() < deadline,
+            "the descendant survived the session it belonged to (pid {pid})"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn a_fatal_signal_puts_the_terminal_back() {
+    use nix::sys::termios::LocalFlags;
+
+    let f = Fixture::start(&[]);
+    let mut client = PtyClient::start(&f);
+
+    let before = client.termios();
+    assert!(
+        before.local_flags.contains(LocalFlags::ECHO),
+        "the test's own pty did not start in cooked mode"
+    );
+
+    // Wait until the client has actually taken the terminal into raw mode.
+    // Without this the rest of the test would pass on a client that never
+    // touched the terminal at all, which is the vacuous version of it.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while client.termios().local_flags.contains(LocalFlags::ECHO) {
+        assert!(
+            Instant::now() < deadline,
+            "the client never put the terminal into raw mode"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // SIGTERM, not SIGKILL: the whole point is that a signal whose default
+    // action would kill the process outright gets handled first. Nothing but
+    // an installed handler can put the terminal back afterwards, because the
+    // process that changed it is the one going away.
+    nix::sys::signal::kill(client.pid(), nix::sys::signal::Signal::SIGTERM)
+        .expect("signalling the client");
+
+    let status = client.wait_status(Duration::from_secs(20));
+    let after = client.termios();
+    let text = client.finish();
+
+    assert_eq!(
+        status,
+        Some(128 + libc::SIGTERM),
+        "the client did not report the signal it died from: {text}"
+    );
+    assert!(
+        after.local_flags.contains(LocalFlags::ECHO),
+        "the terminal was left without echo after SIGTERM: {text}"
+    );
+    assert!(
+        after.local_flags.contains(LocalFlags::ICANON),
+        "the terminal was left in raw mode after SIGTERM: {text}"
+    );
+    // Every flag word, not just the two obvious ones — `cfmakeraw` touches
+    // input, output and control flags as well, and leaving any of them behind
+    // is the same bug.
+    assert_eq!(after.input_flags, before.input_flags, "input flags");
+    assert_eq!(after.output_flags, before.output_flags, "output flags");
+    assert_eq!(after.control_flags, before.control_flags, "control flags");
+    assert_eq!(after.local_flags, before.local_flags, "local flags");
+}
+
+#[test]
+fn a_revoked_key_loses_an_established_connection() {
+    let f = Fixture::start(&[]);
+
+    // This has to be one QUIC connection with two streams on it, not two runs
+    // of the client: the bug being guarded against is the server caching the
+    // policy it resolved at handshake time, and a fresh connection re-resolves
+    // it either way. So the CLI cannot express this test — it makes one
+    // connection per run — and it is driven through the raw helpers above.
+    //
+    // Everything except the revocation happens on the same `quinn::Connection`
+    // value, which is what makes the second session a *second stream* rather
+    // than a second handshake.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let conn = raw_connect(&f.client_dir, f.port).await;
+        assert_eq!(
+            raw_session(&conn, &["true"]).await,
+            Some(0),
+            "the first session on the connection should have run"
+        );
+
+        let dir = f.server_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            run(
+                SERVER_BIN,
+                &["--dir", dir.to_str().unwrap(), "revoke", "tester"],
+            );
+        })
+        .await
+        .unwrap();
+        // The server re-reads the authorized directory on a timer; give it more
+        // than one interval so this is testing the policy, not the clock.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        assert_eq!(
+            raw_session(&conn, &["true"]).await,
+            None,
+            "a second stream on the same connection still ran after revoke"
+        );
+    });
 }
 
 #[test]
