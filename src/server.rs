@@ -19,7 +19,7 @@ use crate::crypto::{self, AuthorizedClientVerifier, Fingerprint};
 use crate::net::transport_config;
 use crate::proto::{
     read_frame, signal_number, write_frame, ExitStatus, Frame, PtySize, Request, CHUNK,
-    PROTOCOL_VERSION,
+    PROTOCOL_VERSION, RESET_ABANDONED,
 };
 use crate::pty;
 
@@ -715,24 +715,20 @@ async fn drain(tasks: &mut [Pump], is_pty: bool) -> Drained {
     for pump in tasks.iter_mut() {
         let end = if is_pty {
             if let Ok(joined) = tokio::time::timeout(DRAIN_GRACE, &mut pump.task).await {
-                joined.unwrap_or(PumpEnd::Failed)
+                joined.map_or(PumpEnd::Failed, |end| end)
             } else {
                 // Order matters here. `abort` only *requests* cancellation, so
                 // reading the flag first would be sampling a pump that is
                 // still running and can still pick up a chunk — an await that
                 // is immediately ready does not have to yield. Awaiting the
                 // handle is what establishes that the task has stopped; only
-                // then is the flag a settled fact.
+                // then is anything about it a settled fact.
                 pump.task.abort();
-                let _ = (&mut pump.task).await;
-                if pump.holding.load(std::sync::atomic::Ordering::Acquire) {
-                    // It was cancelled mid-handover, so that chunk is gone.
-                    PumpEnd::ClientGone
-                } else {
-                    // Parked on the read, owing nothing. Anything it did send
-                    // is already queued ahead of the exit status.
-                    PumpEnd::Eof
-                }
+                let joined = (&mut pump.task).await;
+                cutoff(
+                    joined,
+                    pump.holding.load(std::sync::atomic::Ordering::Acquire),
+                )
             }
         } else {
             (&mut pump.task).await.unwrap_or(PumpEnd::Failed)
@@ -747,7 +743,33 @@ async fn drain(tasks: &mut [Pump], is_pty: bool) -> Drained {
     result
 }
 
+/// Decide what a pump's ending means once the drain deadline has passed.
+///
+/// `abort` is a request, not a result: Tokio is explicit that an aborted task
+/// may have completed anyway, in which case the handle still yields its value.
+/// That value is the truth and has to win. A pump that returned `ReadError` or
+/// `ClientGone` in the gap between the deadline expiring and the abort landing
+/// has already cleared `holding` on its way out, so deciding from the flag
+/// would read a failed transfer as a clean end of file — and forward the
+/// child's successful status over it, which is the whole thing this path
+/// exists to prevent.
+///
+/// The flag only means anything for a task that really was cancelled, because
+/// only then is there no return value to ask.
+fn cutoff(joined: std::result::Result<PumpEnd, tokio::task::JoinError>, holding: bool) -> PumpEnd {
+    match joined {
+        Ok(end) => end,
+        Err(e) if e.is_panic() => PumpEnd::Failed,
+        // Cancelled mid-handover: that chunk is gone.
+        Err(_) if holding => PumpEnd::ClientGone,
+        // Cancelled parked on the read, owing nothing. Whatever it did send is
+        // already queued ahead of the exit status.
+        Err(_) => PumpEnd::Eof,
+    }
+}
+
 /// How an output pump finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PumpEnd {
     /// The stream reached a real end of file; everything was forwarded.
     Eof,
@@ -769,9 +791,6 @@ struct SessionStream {
     send: Option<quinn::SendStream>,
 }
 
-/// Application error code for a stream torn down without a proper ending.
-const RESET_ABANDONED: u32 = 2;
-
 impl SessionStream {
     fn new(send: quinn::SendStream) -> Self {
         Self { send: Some(send) }
@@ -785,15 +804,31 @@ impl SessionStream {
     }
 
     /// End the stream properly and wait for the peer to acknowledge it.
-    async fn finish(mut self) {
-        let Some(mut send) = self.send.take() else {
+    ///
+    /// The stream stays inside the guard across every await here, and the
+    /// guard is disarmed only once the peer has acknowledged the whole thing.
+    /// Taking it out first would mean a cancellation during `flush` or
+    /// `stopped` — the caller bounds both with a timeout — dropped a bare
+    /// `SendStream`, which quinn implicitly *finishes* and goes on
+    /// retransmitting: precisely the ending this type exists to remove. quinn
+    /// allows `reset` after `finish`, abandoning whatever is still buffered,
+    /// so staying armed through all of this costs nothing and an error on any
+    /// step leaves it armed on purpose.
+    async fn finish(&mut self) {
+        let Some(send) = self.send.as_mut() else {
             return;
         };
-        let _ = send.flush().await;
-        let _ = send.finish();
-        // Bounded by the caller's timeout; the reset guard is already disarmed,
-        // so a cancellation here just drops an already-finished stream.
-        let _ = send.stopped().await;
+        if send.flush().await.is_err() {
+            return;
+        }
+        if send.finish().is_err() {
+            return;
+        }
+        if send.stopped().await.is_err() {
+            return;
+        }
+        // Acknowledged in full; there is nothing left to reset.
+        self.send = None;
     }
 }
 
@@ -1128,6 +1163,62 @@ mod tests {
         assert!(err.to_string().contains("expired"), "{err}");
         // A shell is refused for the same reason, not just exec.
         assert!(authorize_request(&e, &request(None), 1_001).is_err());
+    }
+
+    /// A `JoinError` of the cancelled kind, which cannot be constructed
+    /// directly.
+    async fn cancelled_join_error() -> tokio::task::JoinError {
+        let task = tokio::spawn(std::future::pending::<PumpEnd>());
+        task.abort();
+        task.await.unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn a_pump_that_finished_keeps_its_verdict_past_the_cutoff() {
+        // The race this guards: the drain deadline expires, and the pump
+        // finishes — with a failure — before the abort lands. Tokio then hands
+        // back the value rather than a cancellation, and the pump has already
+        // cleared `holding` on its way out. Deciding from the flag would call
+        // that a clean end of file and forward the child's exit status over a
+        // transfer that failed.
+        let mut task = tokio::spawn(async { PumpEnd::ReadError });
+        // Let it run to completion, then abort anyway, exactly as `drain` does.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        let joined = (&mut task).await;
+        assert_eq!(
+            joined.as_ref().ok(),
+            Some(&PumpEnd::ReadError),
+            "aborting a finished task should still yield its value"
+        );
+        assert_eq!(cutoff(joined, false), PumpEnd::ReadError);
+
+        // Same for the other failure a pump can return on its own.
+        let mut task = tokio::spawn(async { PumpEnd::ClientGone });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        assert_eq!(cutoff((&mut task).await, false), PumpEnd::ClientGone);
+    }
+
+    #[tokio::test]
+    async fn the_cutoff_reads_the_flag_only_for_a_real_cancellation() {
+        // Genuinely cancelled: the flag is the only evidence there is.
+        assert_eq!(
+            cutoff(Err(cancelled_join_error().await), true),
+            PumpEnd::ClientGone
+        );
+        assert_eq!(
+            cutoff(Err(cancelled_join_error().await), false),
+            PumpEnd::Eof
+        );
+
+        // A pump that reached the end of its stream is complete even if the
+        // deadline expired first — a PTY nobody is writing to any more.
+        assert_eq!(cutoff(Ok(PumpEnd::Eof), false), PumpEnd::Eof);
+
+        // A panicking pump is never a clean drain, whatever the flag says.
+        let panicked = tokio::spawn(async { panic!("boom") }).await.unwrap_err();
+        assert_eq!(cutoff(Err(panicked), false), PumpEnd::Failed);
     }
 
     #[test]

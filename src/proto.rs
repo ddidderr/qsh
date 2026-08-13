@@ -25,6 +25,15 @@ pub const MAX_FRAME: usize = 1024 * 1024;
 /// Chunk size used when forwarding byte streams.
 pub const CHUNK: usize = 64 * 1024;
 
+/// Application error code for a session stream torn down without an ending.
+///
+/// The server resets a stream with this code when it is giving up on a session
+/// whose output it could not deliver — a peer that stopped reading, say. It is
+/// deliberately distinguishable from a clean end of stream: a peer that sees it
+/// knows it did not receive everything, which a graceful finish would not tell
+/// it.
+pub const RESET_ABANDONED: u32 = 2;
+
 mod kind {
     pub(super) const REQUEST: u8 = 1;
     pub(super) const STDIN: u8 = 2;

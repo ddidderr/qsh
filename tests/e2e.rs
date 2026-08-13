@@ -495,6 +495,58 @@ async fn stalled_session(conn: &quinn::Connection, argv: &[&str], stall: Duratio
     out
 }
 
+/// How the server ended a session stream.
+#[derive(Debug, PartialEq, Eq)]
+enum StreamEnd {
+    /// A clean end of stream, with this much delivered.
+    Finished(usize),
+    /// Torn down with this application error code.
+    Reset(u64),
+}
+
+/// Start a session, read only until it has started, stop reading for `stall`,
+/// then report how the server ended the stream.
+///
+/// The difference from `stalled_session` is what it looks at: not the frames,
+/// but the ending. A peer has to be able to tell "I have everything" from "the
+/// server gave up on me", and those are a clean finish and a reset — which is
+/// why this reads the stream raw rather than through the frame codec.
+async fn stalled_until_teardown(
+    conn: &quinn::Connection,
+    argv: &[&str],
+    stall: Duration,
+) -> StreamEnd {
+    let (_send, mut recv) = raw_request(conn, argv, true)
+        .await
+        .expect("opening a session stream");
+    loop {
+        match qsh::proto::read_frame(&mut recv).await {
+            Ok(Some(qsh::proto::Frame::Started)) => break,
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => panic!("the session ended before it started"),
+        }
+    }
+    // `read_frame` reads exactly the bytes of a frame and no more, so nothing
+    // is stranded in a buffer by switching to raw reads here.
+    tokio::time::sleep(stall).await;
+
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut bytes = 0usize;
+    let collect = async {
+        loop {
+            match recv.read(&mut buf).await {
+                Ok(Some(n)) => bytes += n,
+                Ok(None) => return StreamEnd::Finished(bytes),
+                Err(quinn::ReadError::Reset(code)) => return StreamEnd::Reset(code.into_inner()),
+                Err(e) => panic!("unexpected read error: {e}"),
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), collect)
+        .await
+        .expect("the server neither finished nor reset the session")
+}
+
 /// Is `pid` still a live process running the command we started?
 ///
 /// Matching the marker matters: a bare `kill(pid, 0)` would be satisfied by an
@@ -1248,6 +1300,47 @@ fn a_torn_authorize_cannot_pair_a_new_key_with_a_legacy_policy() {
         f.exec_as(&second, &["true"]).0,
         0,
         "the completed authorization did not work"
+    );
+}
+
+#[test]
+fn a_peer_that_never_reads_gets_the_stream_reset() {
+    let f = Fixture::start(&[]);
+
+    // Same shape as the slow-reader case — a leader that exits leaving a
+    // descendant writing to the terminal — but this peer never comes back at
+    // all. It stops reading and stays gone past the server's *entire*
+    // shutdown budget: the drain deadline, then the exit-status send, then the
+    // writer. By the end of that there is still output the server holds and
+    // cannot deliver, and it has to give up.
+    //
+    // How it gives up is the point. quinn treats a dropped `SendStream` as a
+    // graceful *finish* and goes on retransmitting, so a peer that came back
+    // later would eventually see a clean end of stream and have no way to know
+    // it had been abandoned mid-session. A reset is the honest ending, and
+    // this asserts that is what actually goes on the wire.
+    let pidfile = f.tmp.path().join("writer.pid");
+    let marker = f.tmp.path().join("abandoned-writer");
+    let script = format!(
+        "sh -c 'trap \"\" HUP; echo $$ > {pid}; exec cat /dev/zero {marker}' & \
+         until [ -s {pid} ]; do sleep 0.1; done; exit 0",
+        pid = pidfile.display(),
+        marker = marker.display(),
+    );
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let ended = rt.block_on(async {
+        let conn = raw_connect(&f.client_dir, f.port).await;
+        stalled_until_teardown(&conn, &["sh", "-c", &script], Duration::from_secs(12)).await
+    });
+
+    assert_eq!(
+        ended,
+        StreamEnd::Reset(u64::from(qsh::proto::RESET_ABANDONED)),
+        "the server did not reset a stream it had given up on"
     );
 }
 
