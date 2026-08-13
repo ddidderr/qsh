@@ -377,6 +377,40 @@ impl AuthStore {
     }
 }
 
+/// Whether an existing pin may be replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trust {
+    Replace,
+    OnlyIfAbsentOrEqual,
+}
+
+/// An advisory lock held for a read-modify-write of a shared file.
+///
+/// The lock lives on a sidecar so that the file itself can still be replaced
+/// by an atomic rename underneath it.
+struct FileLock {
+    /// Holding the `Flock` is what holds the lock; it releases on drop.
+    _flock: nix::fcntl::Flock<fs::File>,
+}
+
+impl FileLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let lock_path = path.with_extension("lock");
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening {}", lock_path.display()))?;
+        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+            .map(|flock| Self { _flock: flock })
+            .map_err(|(_, e)| anyhow!("locking {}: {e}", lock_path.display()))
+    }
+}
+
 /// A `known_hosts` file: `host:port sha256:<hex>`, one per line.
 #[derive(Debug, Default)]
 pub struct KnownHosts {
@@ -427,10 +461,40 @@ impl KnownHosts {
     /// # Errors
     /// Fails if the file cannot be written.
     pub fn set(&mut self, host_key: &str, fp: Fingerprint) -> Result<()> {
-        // Saving rewrites the whole file, so start from what is on disk now:
-        // two clients pinning different hosts at once would otherwise each
-        // write back their own stale snapshot and lose the other's entry.
+        self.update(host_key, fp, Trust::Replace)
+    }
+
+    /// Pin `host_key` only if it is unpinned, or already pinned to `fp`.
+    ///
+    /// This is what trust on first use must use. Plain `set` would happily
+    /// overwrite a pin another process wrote a moment earlier, which is the
+    /// one thing a pin exists to prevent — silently replacing a conflicting
+    /// key reopens exactly the question the pin had already answered.
+    ///
+    /// # Errors
+    /// Fails if the host is already pinned to a different key, or if the file
+    /// cannot be written.
+    pub fn set_if_new(&mut self, host_key: &str, fp: Fingerprint) -> Result<()> {
+        self.update(host_key, fp, Trust::OnlyIfAbsentOrEqual)
+    }
+
+    fn update(&mut self, host_key: &str, fp: Fingerprint, trust: Trust) -> Result<()> {
+        // Everything from here to the rename happens under the lock, so a
+        // concurrent client cannot read the old file, decide, and write back a
+        // snapshot that drops what we just added.
+        let _lock = FileLock::acquire(&self.path)?;
         self.refresh();
+        if trust == Trust::OnlyIfAbsentOrEqual {
+            if let Some(existing) = self.get(host_key) {
+                if existing != fp {
+                    bail!(
+                        "{host_key} was pinned to {existing} while we were connecting, \
+                         but the server offered {fp}"
+                    );
+                }
+                return Ok(());
+            }
+        }
         self.entries.retain(|(h, _)| h != host_key);
         self.entries.push((host_key.to_string(), fp));
         self.save()
@@ -448,6 +512,7 @@ impl KnownHosts {
     /// # Errors
     /// Fails if the file cannot be written.
     pub fn remove(&mut self, host_key: &str) -> Result<usize> {
+        let _lock = FileLock::acquire(&self.path)?;
         self.refresh();
         let before = self.entries.len();
         self.entries.retain(|(h, _)| h != host_key);
@@ -595,6 +660,51 @@ mod tests {
         let mut kh = kh;
         assert_eq!(kh.remove("h:2222").unwrap(), 1);
         assert_eq!(KnownHosts::load(&path).unwrap().entries().len(), 0);
+    }
+
+    #[test]
+    fn trust_on_first_use_refuses_to_replace_a_conflicting_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let (a, b) = (fp("a"), fp("b"));
+
+        let mut kh = KnownHosts::load(&path).unwrap();
+        kh.set_if_new("h:2222", a).unwrap();
+
+        // Another process pinned this host in the meantime. Silently replacing
+        // it would undo the answer the pin already recorded.
+        let mut other = KnownHosts::load(&path).unwrap();
+        let err = other.set_if_new("h:2222", b).unwrap_err().to_string();
+        assert!(err.contains("was pinned to"), "{err}");
+        assert_eq!(KnownHosts::load(&path).unwrap().get("h:2222"), Some(a));
+
+        // Re-pinning the same key is not a conflict.
+        other.set_if_new("h:2222", a).unwrap();
+    }
+
+    #[test]
+    fn concurrent_writers_do_not_lose_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let hosts: Vec<String> = (0..8).map(|i| format!("host{i}:2222")).collect();
+
+        std::thread::scope(|scope| {
+            for host in &hosts {
+                let path = path.clone();
+                scope.spawn(move || {
+                    let mut kh = KnownHosts::load(&path).unwrap();
+                    kh.set(host, fp(host)).unwrap();
+                });
+            }
+        });
+
+        let kh = KnownHosts::load(&path).unwrap();
+        for host in &hosts {
+            assert!(
+                kh.get(host).is_some(),
+                "{host} was lost by a concurrent write"
+            );
+        }
     }
 
     #[test]

@@ -744,6 +744,11 @@ fn an_interactive_session_ends_even_with_a_job_left_on_the_terminal() {
     // open indefinitely. A PTY has no last-writer guarantee, so without a
     // deadline the session would wait for that terminal forever and the
     // client would never receive an exit status.
+    //
+    // What is asserted here is only that: the client gets its status back. The
+    // backgrounded job is expected to STILL BE RUNNING afterwards — qsh does
+    // not kill jobs that have left the session's process group, the same as
+    // ssh — so this test deliberately says nothing about it.
     let (status, text) =
         interactive_session(&f, &["sleep 300 &", "exit 4"], Duration::from_secs(25));
     assert_eq!(
@@ -1014,7 +1019,5 @@ fn which(program: &str) -> Option<PathBuf> {
 
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
 }

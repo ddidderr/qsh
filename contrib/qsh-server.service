@@ -26,5 +26,11 @@ ProtectSystem=false
 NoNewPrivileges=false
 PrivateTmp=false
 
+# Every session is a child of this unit, so this is the effective bound on what
+# logged-in users can spawn — including a runaway or a fork bomb, which no
+# per-session limit inside qsh could prevent anyway. Raise it if you expect
+# many concurrent sessions.
+TasksMax=512
+
 [Install]
 WantedBy=multi-user.target

@@ -25,8 +25,10 @@ pub fn transport_config(idle: Duration, keepalive: Duration) -> Result<Transport
     tc.stream_receive_window(VarInt::from_u32(STREAM_WINDOW));
     tc.receive_window(VarInt::from_u32(CONNECTION_WINDOW));
     tc.send_window(u64::from(CONNECTION_WINDOW));
-    // One session per stream; a handful of concurrent sessions is plenty.
-    tc.max_concurrent_bidi_streams(VarInt::from_u32(64));
+    // One session per stream. A client opens one for a shell and one per
+    // rsync, so a small number is generous; it also caps how many processes a
+    // single connection can ask for at once.
+    tc.max_concurrent_bidi_streams(VarInt::from_u32(8));
     tc.max_concurrent_uni_streams(VarInt::from_u32(0));
     Ok(tc)
 }

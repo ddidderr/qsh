@@ -266,11 +266,12 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
                     other.name
                 );
             }
-            // The old files have to go. Two entries for one key would be
+            // The old files have to go — two entries for one key would be
             // resolved by file name order, so the policy that actually applied
-            // would be a coin toss — and revoking the new name would quietly
-            // reinstate the old one.
-            remove_entry(&dir, &other.name)?;
+            // would be a coin toss, and revoking the new name would quietly
+            // reinstate the old one. Removing them only after the new pair is
+            // on disk means a failure in between leaves the old authorization
+            // working rather than leaving the key locked out.
             replaced = Some(other.name.clone());
         }
     }
@@ -301,6 +302,10 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
             toml::to_string_pretty(&meta)?
         ),
     )?;
+
+    if let Some(old) = &replaced {
+        remove_entry(&dir, old)?;
+    }
 
     println!("Authorized `{name}` ({fp}) as user `{}`.", args.user);
     if let Some(old) = replaced {

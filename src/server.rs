@@ -126,6 +126,8 @@ pub async fn serve(
         crate::sync::read(&store).entries().count()
     );
 
+    let refresher = spawn_store_refresher(Arc::clone(&store), paths.authorized());
+
     // Everything below runs before any client has authenticated, so all of it
     // has to be bounded.
     let unauthenticated = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -154,16 +156,11 @@ pub async fn serve(
             continue;
         };
 
-        // Pick up `authorize`/`revoke` changes without a restart, but at most
-        // once a second: re-reading and parsing the whole directory for every
-        // arriving Initial is a denial-of-service lever, since this runs
-        // before the handshake has authenticated anybody.
+        // Report in batches on a timer. Logging one line per attempt would let
+        // anyone who can send a packet flood the log, since this runs before
+        // the handshake has authenticated anybody.
         if last_reload.elapsed() >= RELOAD_INTERVAL {
             last_reload = tokio::time::Instant::now();
-            match AuthStore::load(&paths.authorized()) {
-                Ok(fresh) => *crate::sync::write(&store) = fresh,
-                Err(e) => eprintln!("qsh-server: keeping previous authorizations: {e:#}"),
-            }
             // Report refusals on this already-throttled tick rather than once
             // per attempt, so a flood cannot also flood the log.
             if rejected > 0 {
@@ -171,6 +168,10 @@ pub async fn serve(
                     "qsh-server: refused {rejected} connection(s) over the concurrency limit"
                 );
                 rejected = 0;
+            }
+            let failed = unauthenticated.swap(0, std::sync::atomic::Ordering::Relaxed);
+            if failed > 0 {
+                eprintln!("qsh-server: {failed} connection(s) failed to authenticate");
             }
         }
 
@@ -191,7 +192,30 @@ pub async fn serve(
             }
         });
     }
+    refresher.abort();
     Ok(())
+}
+
+/// Re-read `authorized/` on a timer.
+///
+/// Revocation has to reach connections that are already open, and those do not
+/// necessarily bring new ones with them: reloading only when someone connects
+/// would let a client that keeps one connection, and keeps opening sessions on
+/// it, hold the rights it started with for as long as nobody else arrives.
+fn spawn_store_refresher(
+    store: Arc<RwLock<AuthStore>>,
+    dir: std::path::PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(RELOAD_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if let Ok(fresh) = AuthStore::load(&dir) {
+                *crate::sync::write(&store) = fresh;
+            }
+        }
+    })
 }
 
 /// Seconds since the Unix epoch, saturating rather than failing.
@@ -381,6 +405,14 @@ async fn handle_session(
 /// would leave `sleep 3600` behind forever. The guard fires on every exit path
 /// including task cancellation, which is the one path an `async` cleanup step
 /// could never cover.
+///
+/// Its reach is the session's process group and no further. A job the user
+/// backgrounded with `&` in an interactive shell is in a group of its own —
+/// that is what job control does — and so are `setsid` and `nohup` children;
+/// none of them are signalled here. That matches ssh, and it is the behaviour
+/// people rely on to leave work running after logging out. Killing them anyway
+/// would need the session in its own cgroup, which is a bigger and more
+/// intrusive design than this tool wants.
 struct ProcessGroupGuard {
     pid: Option<u32>,
 }
@@ -490,7 +522,7 @@ async fn run_session(
             pty_fd = Some(master.as_raw_fd());
             let (r, w) = tokio::io::split(master);
             stdin_sink = Box::new(w);
-            outputs.push(tokio::spawn(pump(r, tx.clone(), Frame::Stdout)));
+            outputs.push(spawn_pump(r, tx.clone(), Frame::Stdout));
         }
         ChildIo::Pipes {
             stdin,
@@ -499,8 +531,8 @@ async fn run_session(
         } => {
             pty_fd = None;
             stdin_sink = Box::new(stdin);
-            outputs.push(tokio::spawn(pump(stdout, tx.clone(), Frame::Stdout)));
-            outputs.push(tokio::spawn(pump(stderr, tx.clone(), Frame::Stderr)));
+            outputs.push(spawn_pump(stdout, tx.clone(), Frame::Stdout));
+            outputs.push(spawn_pump(stderr, tx.clone(), Frame::Stderr));
         }
     }
 
@@ -523,7 +555,7 @@ async fn run_session(
     // Drain with the disconnect watch still running, so a client that dies
     // mid-drain takes the whole job down with it.
     let drained = tokio::select! {
-        drained = drain(&mut outputs, pty_fd.is_some(), &tx) => drained,
+        drained = drain(&mut outputs, pty_fd.is_some()) => drained,
         _ = &mut control => return abandon(&mut guard, &mut child, outputs).await,
     };
     control.abort();
@@ -544,11 +576,12 @@ async fn run_session(
         // copy and believe it. The job does not get to survive this either —
         // it is still wired to a session that is ending badly.
         Drained::Incomplete(why) => {
-            let _ = tx
-                .send(Frame::Error(format!(
-                    "the remote output could not be delivered in full: {why}"
-                )))
-                .await;
+            // Deliberately non-blocking. The usual way to get here is a writer
+            // stuck on a peer that has stopped reading, and awaiting this send
+            // would wait for exactly that blockage to clear.
+            let _ = tx.try_send(Frame::Error(format!(
+                "the remote output could not be delivered in full: {why}"
+            )));
             ExitStatus {
                 code: 255,
                 signal: None,
@@ -556,11 +589,13 @@ async fn run_session(
         }
     };
 
-    let _ = tx.send(Frame::Exit(exit)).await;
-    drop(tx);
+    // Kill the job before trying to talk to a peer that may never answer.
     if matches!(drained, Drained::Incomplete(_)) {
         let ((), _) = tokio::join!(guard.terminate(), child.wait());
     }
+
+    let _ = tokio::time::timeout(SHUTDOWN_GRACE, tx.send(Frame::Exit(exit))).await;
+    drop(tx);
 
     if let Ok(Ok(mut send)) = tokio::time::timeout(SHUTDOWN_GRACE, writer).await {
         // Make sure the peer sees everything before the stream disappears.
@@ -576,10 +611,10 @@ async fn run_session(
 async fn abandon(
     guard: &mut ProcessGroupGuard,
     child: &mut tokio::process::Child,
-    outputs: Vec<tokio::task::JoinHandle<PumpEnd>>,
+    outputs: Vec<Pump>,
 ) -> Result<()> {
-    for task in &outputs {
-        task.abort();
+    for pump in &outputs {
+        pump.task.abort();
     }
     // Reaping has to run alongside the escalation, not after it: until the
     // leader is reaped it lingers as a zombie, which still answers
@@ -612,27 +647,28 @@ enum Drained {
 ///
 /// The handles stay borrowed so that a cancelled drain leaves them intact for
 /// the caller to abort.
-async fn drain(
-    tasks: &mut [tokio::task::JoinHandle<PumpEnd>],
-    is_pty: bool,
-    tx: &mpsc::Sender<Frame>,
-) -> Drained {
+async fn drain(tasks: &mut [Pump], is_pty: bool) -> Drained {
     let mut result = Drained::Fully;
-    for task in tasks.iter_mut() {
+    for pump in tasks.iter_mut() {
         let end = if is_pty {
-            if let Ok(joined) = tokio::time::timeout(DRAIN_GRACE, &mut *task).await {
+            if let Ok(joined) = tokio::time::timeout(DRAIN_GRACE, &mut pump.task).await {
                 joined.unwrap_or(PumpEnd::Failed)
             } else {
-                task.abort();
-                if tx.capacity() == tx.max_capacity() {
-                    // Nothing queued: the terminal is just still open.
-                    PumpEnd::Eof
-                } else {
+                // Cancellation can only land on an await point, and the pump
+                // has exactly two: reading the terminal and handing a chunk
+                // on. `holding` says which, so this is a fact about the pump
+                // rather than a guess from the outside — an empty queue proves
+                // nothing, because a chunk can be in the pump's own hands.
+                let lost = pump.holding.load(std::sync::atomic::Ordering::Acquire);
+                pump.task.abort();
+                if lost {
                     PumpEnd::ClientGone
+                } else {
+                    PumpEnd::Eof
                 }
             }
         } else {
-            task.await.unwrap_or(PumpEnd::Failed)
+            (&mut pump.task).await.unwrap_or(PumpEnd::Failed)
         };
         match end {
             PumpEnd::Eof => {}
@@ -656,12 +692,37 @@ enum PumpEnd {
     Failed,
 }
 
-/// Forward one output stream of the child into frames.
+/// One output stream being forwarded, and whether it is mid-handover.
+struct Pump {
+    task: tokio::task::JoinHandle<PumpEnd>,
+    /// True exactly while the pump holds a chunk it has read but not yet
+    /// passed on. Only these two states exist at an await point, so aborting
+    /// while it is false cannot lose data.
+    holding: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Start forwarding one output stream of the child into frames.
+fn spawn_pump<R: AsyncRead + Unpin + Send + 'static>(
+    src: R,
+    tx: mpsc::Sender<Frame>,
+    wrap: fn(Vec<u8>) -> Frame,
+) -> Pump {
+    let holding = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&holding);
+    Pump {
+        task: tokio::spawn(pump(src, tx, wrap, flag)),
+        holding,
+    }
+}
+
 async fn pump<R: AsyncRead + Unpin>(
     mut src: R,
     tx: mpsc::Sender<Frame>,
     wrap: fn(Vec<u8>) -> Frame,
+    holding: Arc<std::sync::atomic::AtomicBool>,
 ) -> PumpEnd {
+    use std::sync::atomic::Ordering;
+
     let mut buf = vec![0u8; CHUNK];
     loop {
         match src.read(&mut buf).await {
@@ -671,9 +732,15 @@ async fn pump<R: AsyncRead + Unpin>(
                 let Some(chunk) = buf.get(..n) else {
                     return PumpEnd::ReadError;
                 };
+                // Set before the next await and cleared after it, with no
+                // await point in between, so an observer that finds it false
+                // knows the pump is parked on the read and owes nothing.
+                holding.store(true, Ordering::Release);
                 // `send` awaits when the channel is full, which is the
                 // back-pressure that stops a slow client ballooning memory.
-                if tx.send(wrap(chunk.to_vec())).await.is_err() {
+                let sent = tx.send(wrap(chunk.to_vec())).await;
+                holding.store(false, Ordering::Release);
+                if sent.is_err() {
                     return PumpEnd::ClientGone;
                 }
             }

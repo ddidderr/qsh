@@ -177,11 +177,19 @@ long-lived self-signed **Ed25519** certificate.
   `PATH`; to allow a program elsewhere, authorize its absolute path.
 * A session is torn down with its connection. If the client is killed, the
   server notices when the QUIC idle timeout expires (60s by default, with
-  15-second keep-alives) and signals the remote process group `SIGHUP`, then
-  `SIGTERM`, then `SIGKILL` — nothing is left running. That watch stays up for
-  the whole session, including while the last of the output is still draining,
-  so a backgrounded descendant that outlives the command it was started from is
-  cleaned up too.
+  15-second keep-alives) and signals the session's process group `SIGHUP`, then
+  `SIGTERM`, then `SIGKILL`. That watch stays up for the whole session,
+  including while the last of the output is still draining, so a descendant
+  that outlives the command it was started from is cleaned up too.
+
+  What this does **not** reach is a process that has left the session's process
+  group — one you backgrounded with `&` in an interactive shell (job control
+  gives it a group of its own), or that called `setsid` itself, or that you
+  started under `nohup`. Those survive the session, exactly as they do under
+  ssh, and deliberately: leaving a long job running after you log out is a
+  thing people do on purpose. If you want the stricter behaviour, that is what
+  a session cgroup is for — `systemd-logind`'s `KillUserProcesses=yes` — and
+  it is off by default there for the same reason it is not qsh's default.
 * Work is bounded before anyone has authenticated: peers must complete a QUIC
   retry to prove their address, a handshake has 5 seconds to finish, and a
   session stream has 10 seconds to say what it wants. Handshakes in flight

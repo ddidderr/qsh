@@ -229,7 +229,7 @@ pub async fn run(opts: Options) -> Result<i32> {
             conn.close(1u32.into(), b"host key rejected");
             bail!("host key for {host_key} was not accepted");
         }
-        known.set(&host_key, fp)?;
+        known.set_if_new(&host_key, fp)?;
         if !opts.quiet {
             eprintln!("qsh: permanently added {host_key} ({fp}) to known hosts");
         }
@@ -458,11 +458,14 @@ async fn session(conn: &quinn::Connection, opts: &Options) -> Result<i32> {
     }
 
     let raw = if use_pty && std::io::stdin().is_terminal() {
+        // Register the handlers *before* touching the terminal. `Drop` covers
+        // the ordinary paths, but a fatal signal does not unwind, and a signal
+        // arriving between changing the termios and the handler being ready
+        // would take the default action and leave the terminal raw — no echo,
+        // no line editing, and no obvious way back.
+        let signals = FatalSignals::install()?;
         let guard = RawMode::enable(stdin_fd).context("switching the terminal to raw mode")?;
-        // `Drop` covers the ordinary paths, but a fatal signal does not unwind,
-        // so without this the user would be left with a terminal that no longer
-        // echoes and no obvious way back.
-        tokio::spawn(restore_terminal_on_fatal_signal(stdin_fd, guard.saved()));
+        tokio::spawn(signals.restore_on_fire(stdin_fd, guard.saved()));
         Some(guard)
     } else {
         None
@@ -626,28 +629,42 @@ impl EscapeState {
     }
 }
 
-/// Put the terminal back and exit when a fatal signal arrives.
+/// The signals that would otherwise kill the client without unwinding.
 ///
 /// `SIGINT` is deliberately absent: in a PTY session Ctrl-C is just a byte for
 /// the remote terminal, and the local process should not act on it.
-async fn restore_terminal_on_fatal_signal(fd: RawFd, saved: nix::sys::termios::Termios) {
-    use tokio::signal::unix::{signal, SignalKind};
-    let (Ok(mut term), Ok(mut hup), Ok(mut quit)) = (
-        signal(SignalKind::terminate()),
-        signal(SignalKind::hangup()),
-        signal(SignalKind::quit()),
-    ) else {
-        return;
-    };
-    let sig = tokio::select! {
-        _ = term.recv() => libc::SIGTERM,
-        _ = hup.recv() => libc::SIGHUP,
-        _ = quit.recv() => libc::SIGQUIT,
-    };
-    pty::restore_termios(fd, &saved);
-    let mut stdout = tokio::io::stdout();
-    let _ = stdout.flush().await;
-    std::process::exit(128 + sig);
+struct FatalSignals {
+    term: tokio::signal::unix::Signal,
+    hup: tokio::signal::unix::Signal,
+    quit: tokio::signal::unix::Signal,
+}
+
+impl FatalSignals {
+    /// Start listening. Registration happens here, synchronously, so that by
+    /// the time this returns the disposition is already installed — waiting
+    /// for a spawned task to be polled would leave a window with the terminal
+    /// already in raw mode and nothing watching.
+    fn install() -> Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self {
+            term: signal(SignalKind::terminate()).context("listening for SIGTERM")?,
+            hup: signal(SignalKind::hangup()).context("listening for SIGHUP")?,
+            quit: signal(SignalKind::quit()).context("listening for SIGQUIT")?,
+        })
+    }
+
+    /// Put the terminal back and exit when one of them arrives.
+    async fn restore_on_fire(mut self, fd: RawFd, saved: nix::sys::termios::Termios) {
+        let sig = tokio::select! {
+            _ = self.term.recv() => libc::SIGTERM,
+            _ = self.hup.recv() => libc::SIGHUP,
+            _ = self.quit.recv() => libc::SIGQUIT,
+        };
+        pty::restore_termios(fd, &saved);
+        let mut stdout = tokio::io::stdout();
+        let _ = stdout.flush().await;
+        std::process::exit(128 + sig);
+    }
 }
 
 /// Forward terminal resizes.
