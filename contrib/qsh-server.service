@@ -1,0 +1,36 @@
+[Unit]
+Description=qsh server (SSH replacement over QUIC)
+Documentation=https://github.com/ddidderr/qsh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/qsh-server serve
+Restart=on-failure
+RestartSec=2
+# Must start as root so sessions can switch to the authorized account.
+User=root
+
+# Deliberately unsandboxed. Every remote session is a child of this unit and
+# inherits its namespaces, so daemon hardening is not private to the daemon:
+# ProtectSystem=full would make /usr and /etc read-only *inside user sessions*,
+# so an authorized root shell could not administer the machine and rsync could
+# not deploy there. Restricting sessions is the job of the per-key policy in
+# authorized/<name>.toml, not of the unit file.
+#
+# If you do want the network daemon confined, split it from session launching
+# rather than adding directives here.
+ProtectHome=false
+ProtectSystem=false
+NoNewPrivileges=false
+PrivateTmp=false
+
+# Every session is a child of this unit, so this is the effective bound on what
+# logged-in users can spawn — including a runaway or a fork bomb, which no
+# per-session limit inside qsh could prevent anyway. Raise it if you expect
+# many concurrent sessions.
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target

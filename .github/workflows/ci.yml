@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Single source of truth for the MSRV, so the matrix below and Cargo.toml
+  # cannot drift apart.
+  msrv:
+    name: resolve MSRV
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        run: |
+          version=$(sed -n 's/^rust-version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          test -n "$version" || { echo "Cargo.toml has no rust-version" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "MSRV is $version"
+
+  # A workflow that does not parse runs nothing at all and reports no failure,
+  # which is exactly how the first version of this file went unnoticed.
+  workflow-lint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint the workflow files
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest -color
+
+  format:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  lint:
+    name: clippy (pedantic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.rust }})
+    needs: msrv
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # `stable` catches new lints; the pinned version is the MSRV this
+        # crate advertises, and `--locked` is what makes that claim real.
+        rust: [stable, "${{ needs.msrv.outputs.version }}"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      # The end-to-end suite drives a real `rsync -e qsh` transfer when rsync
+      # is present, and skips that test when it is not.
+      - name: Install rsync
+        run: sudo apt-get update && sudo apt-get install -y rsync
+      - run: cargo build --locked --all-targets
+      - run: cargo test --locked --all-features
+
+  test-as-root:
+    name: privilege drop (root)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install rsync
+        run: sudo apt-get update && sudo apt-get install -y rsync
+      - run: cargo build --locked --tests
+      # As an unprivileged user the server never switches account, so the
+      # setgroups/setgid/setuid path is simply not reached. Running the suite
+      # as root is what exercises it.
+      - name: Run the end-to-end suite as root
+        run: sudo -E env "PATH=$PATH" cargo test --locked --test e2e
+
+  msrv-matches-lockfile:
+    name: MSRV is honest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Building on the MSRV toolchain proves the graph builds today; this
+      # catches a dependency bump raising the requirement.
+      - name: Verify the declared rust-version against the dependency graph
+        run: python3 ci/check-msrv.py
+
+  audit:
+    name: dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Vulnerabilities always fail. Informational advisories — unmaintained,
+      # unsound, yanked, notice — only fail because of `--deny warnings`, so a
+      # crate going unmaintained is caught here rather than in a review round.
+      # Every accepted advisory must be listed with a reason.
+      - name: cargo audit
+        run: cargo audit --deny warnings
