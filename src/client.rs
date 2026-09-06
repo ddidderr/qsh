@@ -211,7 +211,12 @@ pub async fn run(opts: Options) -> Result<i32> {
     } else {
         // Refusal needs no contact with an unknown server at all.
         if opts.host_key_policy == HostKeyPolicy::Refuse {
-            bail!("host {host_key} is not known and the host-key policy refuses new hosts (--refuse-new)");
+            let command = opts.known_hosts_command();
+            bail!(
+                "host {host_key} is not known and the host-key policy refuses new hosts (--refuse-new)\n\
+                 Obtain the host key fingerprint through a trusted channel, then add it with \
+                 `{command} add {host_key} <verified-fingerprint>`."
+            );
         }
         let fp = probe_host_key(&addrs, &opts).await?;
         if !accept_new_host(&host_key, fp, &opts)? {
@@ -871,6 +876,49 @@ mod tests {
         crypto::write_public(&dir.join("id.crt"), &cert).unwrap();
         crypto::write_private(&dir.join("id.key"), &key).unwrap();
         crypto::load_identity(&dir.join("id.crt"), &dir.join("id.key")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn refusing_unknown_hosts_preserves_identity_guidance_without_network_contact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("client's identity dir");
+        std::fs::create_dir(&dir).unwrap();
+        let _identity = test_identity(&dir);
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let opts = Options {
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+            user: None,
+            command: None,
+            pty: PtyPolicy::Never,
+            env: vec![],
+            host_key_policy: HostKeyPolicy::Refuse,
+            paths_dir: Some(dir.clone()),
+            quiet: true,
+            no_stdin: true,
+            family: AddressFamily::V4,
+            connect_timeout_secs: 2,
+        };
+        let expected_command = opts.known_hosts_command();
+        let error = run(opts).await.unwrap_err().to_string();
+        assert!(
+            error.contains("--refuse-new") && error.contains("trusted channel"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!(
+                "{expected_command} add {addr} <verified-fingerprint>"
+            )),
+            "{error}"
+        );
+        assert!(!dir.join("known_hosts").exists());
+        let mut packet = [0u8; 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.recv_from(&mut packet))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
