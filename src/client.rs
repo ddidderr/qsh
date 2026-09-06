@@ -206,23 +206,22 @@ pub async fn run(opts: Options) -> Result<i32> {
     let host_key = opts.host_key();
     let mut known = KnownHosts::load(&paths.known_hosts())?;
     let addrs = resolve(&opts.host, opts.port, opts.family)?;
-    let pinned = match known.get(&host_key) {
-        Some(fp) => fp,
-        None => {
-            // Refusal needs no contact with an unknown server at all.
-            if opts.host_key_policy == HostKeyPolicy::Refuse {
-                bail!("host {host_key} is not known and the host-key policy refuses new hosts (--refuse-new)");
-            }
-            let fp = probe_host_key(&addrs, &opts).await?;
-            if !accept_new_host(&host_key, fp, &opts)? {
-                bail!("host key for {host_key} was not accepted");
-            }
-            known.set_if_new(&host_key, fp)?;
-            if !opts.quiet {
-                eprintln!("qsh: permanently added {host_key} ({fp}) to known hosts");
-            }
-            fp
+    let pinned = if let Some(fp) = known.get(&host_key) {
+        fp
+    } else {
+        // Refusal needs no contact with an unknown server at all.
+        if opts.host_key_policy == HostKeyPolicy::Refuse {
+            bail!("host {host_key} is not known and the host-key policy refuses new hosts (--refuse-new)");
         }
+        let fp = probe_host_key(&addrs, &opts).await?;
+        if !accept_new_host(&host_key, fp, &opts)? {
+            bail!("host key for {host_key} was not accepted");
+        }
+        known.set_if_new(&host_key, fp)?;
+        if !opts.quiet {
+            eprintln!("qsh: permanently added {host_key} ({fp}) to known hosts");
+        }
+        fp
     };
     let config = client_config(PinnedServerVerifier::new(pinned), Some(&identity))?;
     let (endpoint, conn) = connect_any(&addrs, &config, &opts).await?;
