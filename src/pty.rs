@@ -2,11 +2,12 @@
 //! `ioctl`s for window size.
 
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use anyhow::{Context as _, Result};
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -63,31 +64,54 @@ pub struct PtyMaster {
 /// # Errors
 /// Fails if no PTY can be allocated or the master cannot be registered with
 /// the async reactor.
-#[allow(
-    unsafe_code,
-    reason = "reads the winsize struct through a raw pointer for openpty"
-)]
 pub fn open(size: PtySize) -> Result<(PtyMaster, OwnedFd)> {
-    let ws = winsize(size);
-    let pair = nix::pty::openpty(Some(&ws), None).context("allocating a pseudo terminal")?;
-    set_nonblocking(pair.master.as_raw_fd()).context("making the PTY master non-blocking")?;
+    let (master, slave) = open_pair().context("allocating a pseudo terminal")?;
+    set_size(master.as_raw_fd(), size).context("setting the PTY size")?;
+    set_nonblocking(&master).context("making the PTY master non-blocking")?;
     Ok((
         PtyMaster {
-            inner: AsyncFd::new(pair.master).context("registering the PTY with the reactor")?,
+            inner: AsyncFd::new(master).context("registering the PTY with the reactor")?,
         },
-        pair.slave,
+        slave,
     ))
 }
 
-#[allow(unsafe_code, reason = "fcntl has no safe wrapper for this flag dance")]
-fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-    // SAFETY: `fd` is valid for the duration of the calls.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn open_pair() -> Result<(OwnedFd, OwnedFd)> {
+    // Set CLOEXEC at creation: setting it after openpty races other threads'
+    // fork/exec and can give another user's session access to this terminal.
+    let flags = OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC;
+    let master = nix::pty::posix_openpt(flags)?;
+    nix::pty::grantpt(&master)?;
+    nix::pty::unlockpt(&master)?;
+    let slave_name = nix::pty::ptsname_r(&master)?;
+    let slave = nix::fcntl::open(slave_name.as_str(), flags, nix::sys::stat::Mode::empty())?;
+    Ok((master.into(), slave))
+}
+
+// Other Unix platforms lack nix's thread-safe ptsname_r. Serialize openpty's
+// non-atomic descriptor setup against every remote-process spawn instead.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(crate) fn spawn_lock() -> io::Result<std::sync::MutexGuard<'static, ()>> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .map_err(|_| io::Error::other("PTY spawn lock poisoned"))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn open_pair() -> Result<(OwnedFd, OwnedFd)> {
+    use nix::fcntl::FdFlag;
+
+    let _guard = spawn_lock()?;
+    let pair = nix::pty::openpty(None, None)?;
+    fcntl(&pair.master, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+    fcntl(&pair.slave, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+    Ok((pair.master, pair.slave))
+}
+
+fn set_nonblocking(fd: impl AsFd) -> io::Result<()> {
+    let flags = OFlag::from_bits_truncate(fcntl(&fd, FcntlArg::F_GETFL)?);
+    fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
     Ok(())
 }
 
@@ -107,10 +131,6 @@ impl PtyMaster {
 }
 
 impl AsyncRead for PtyMaster {
-    #[allow(
-        unsafe_code,
-        reason = "read(2) on the PTY master fd; tokio has no safe wrapper for a raw fd"
-    )]
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -125,19 +145,7 @@ impl AsyncRead for PtyMaster {
             };
             let unfilled = buf.initialize_unfilled();
             let result = guard.try_io(|inner| {
-                // SAFETY: writing into a slice we exclusively own.
-                let n = unsafe {
-                    libc::read(
-                        inner.get_ref().as_raw_fd(),
-                        unfilled.as_mut_ptr().cast(),
-                        unfilled.len(),
-                    )
-                };
-                if n < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(usize::try_from(n).unwrap_or(0))
-                }
+                nix::unistd::read(inner.get_ref(), unfilled).map_err(io::Error::from)
             });
             match result {
                 Ok(Ok(n)) => {
@@ -157,10 +165,6 @@ impl AsyncRead for PtyMaster {
 }
 
 impl AsyncWrite for PtyMaster {
-    #[allow(
-        unsafe_code,
-        reason = "write(2) on the PTY master fd; tokio has no safe wrapper for a raw fd"
-    )]
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -173,17 +177,8 @@ impl AsyncWrite for PtyMaster {
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             };
-            let result = guard.try_io(|inner| {
-                // SAFETY: reading from a slice we hold for the duration of the call.
-                let n = unsafe {
-                    libc::write(inner.get_ref().as_raw_fd(), buf.as_ptr().cast(), buf.len())
-                };
-                if n < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(usize::try_from(n).unwrap_or(0))
-                }
-            });
+            let result = guard
+                .try_io(|inner| nix::unistd::write(inner.get_ref(), buf).map_err(io::Error::from));
             match result {
                 Ok(res) => return Poll::Ready(res),
                 Err(_would_block) => (),
@@ -292,6 +287,18 @@ impl Drop for RawMode {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn pty_descriptors_and_slave_duplicates_are_cloexec() {
+        use nix::fcntl::FdFlag;
+
+        let (master, slave) = open(PtySize::default()).unwrap();
+        let duplicate = slave.try_clone().unwrap();
+        for fd in [master.inner.get_ref(), &slave, &duplicate] {
+            let flags = FdFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFD).unwrap());
+            assert!(flags.contains(FdFlag::FD_CLOEXEC));
+        }
+    }
 
     #[tokio::test]
     async fn pty_echoes_and_resizes() {

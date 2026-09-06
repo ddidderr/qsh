@@ -1778,6 +1778,68 @@ fn several_sessions_share_one_server() {
     }
 }
 
+#[test]
+fn root_target_login_with_a_different_server_group() {
+    use std::os::unix::process::CommandExt;
+
+    const CHILD_MARKER: &str = "QSH_TEST_ROOT_DIFFERENT_GROUP";
+    if !nix::unistd::Uid::effective().is_root() {
+        eprintln!("skipping: requires root to change the server group");
+        return;
+    }
+    if std::env::var_os(CHILD_MARKER).is_none() {
+        let root = qsh::child::resolve_user("root").unwrap();
+        let other_gid = if root.gid.as_raw() == 1 { 2 } else { 1 };
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "root_target_login_with_a_different_server_group",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .gid(other_gid)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        use tokio::io::AsyncReadExt;
+
+        let root = qsh::child::resolve_user("root").unwrap();
+        assert_ne!(nix::unistd::Gid::current(), root.gid);
+        for pty in [false, true] {
+            let req = qsh::proto::Request {
+                version: qsh::proto::PROTOCOL_VERSION,
+                user: None,
+                command: Some(vec!["sh".into(), "-c".into(), "id -u; id -g".into()]),
+                pty: pty.then(|| qsh::proto::PtyRequest {
+                    term: "xterm".into(),
+                    size: qsh::proto::PtySize::default(),
+                }),
+                env: Vec::new(),
+            };
+            let mut spawned = qsh::child::spawn(&root, &req).unwrap();
+            let mut output = String::new();
+            match &mut spawned.io {
+                qsh::child::ChildIo::Pty(master) => {
+                    master.read_to_string(&mut output).await.unwrap()
+                }
+                qsh::child::ChildIo::Pipes { stdout, .. } => {
+                    stdout.read_to_string(&mut output).await.unwrap()
+                }
+            };
+            assert!(spawned.child.wait().await.unwrap().success());
+            assert_eq!(
+                output.replace('\r', ""),
+                format!("0\n{}\n", root.gid.as_raw())
+            );
+        }
+    });
+}
+
 fn which(program: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
