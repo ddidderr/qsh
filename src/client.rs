@@ -267,85 +267,139 @@ fn client_config(
 }
 
 async fn probe_host_key(addrs: &[SocketAddr], opts: &Options) -> Result<Fingerprint> {
-    let mut last = None;
-    for addr in addrs {
-        // A failed address must never leave a fingerprint for another attempt.
-        let capture = CaptureVerifier::new();
-        let config = client_config(capture.clone(), None)?;
-        let result = connect_any(&[*addr], &config, opts).await;
-        // The verifier records only after validating CertificateVerify, then
-        // intentionally aborts. A mandatory-client-auth server is supported:
-        // the probe never needs to finish its authenticated handshake.
-        let seen = *crate::sync::mutex(&capture.seen);
-        if let Some(fp) = seen {
-            return Ok(fp);
+    race_addresses(addrs, |addr| {
+        let opts = opts.clone();
+        async move {
+            // Capture state belongs to exactly one address, never the race.
+            let capture = CaptureVerifier::new();
+            let config = client_config(capture.clone(), None)?;
+            let result = connect_one(addr, &config, &opts).await;
+            // Only a verified CertificateVerify populates this state. The
+            // anonymous probe then aborts before client authentication.
+            let seen = *crate::sync::mutex(&capture.seen);
+            seen.ok_or_else(|| {
+                result
+                    .err()
+                    .unwrap_or_else(|| anyhow!("server presented no verified certificate"))
+            })
         }
-        last = result.err();
-    }
-    Err(last.unwrap_or_else(|| anyhow!("server presented no verified certificate")))
+    })
+    .await
 }
 
-/// Try each resolved address in turn, with its own deadline.
-///
-/// The QUIC idle timeout governs an established session and is far too long to
-/// use for reaching a host that is simply filtered, so each attempt gets a
-/// short connect timeout of its own.
+const ADDRESS_STAGGER: Duration = Duration::from_millis(250);
+const MAX_PARALLEL_ATTEMPTS: usize = 2;
+
+/// Start another address after a short delay without cutting the earlier
+/// address's timeout short. At most two endpoints exist concurrently.
+async fn race_addresses<T, F, Fut>(addrs: &[SocketAddr], mut attempt: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+{
+    let mut remaining = addrs.iter().copied().peekable();
+    let mut pending = tokio::task::JoinSet::<Result<T>>::new();
+    let mut next_start = tokio::time::Instant::now();
+    let mut last = anyhow!("host did not resolve to any address");
+    loop {
+        if pending.is_empty() && remaining.peek().is_none() {
+            return Err(last);
+        }
+        tokio::select! {
+            // Process a ready identity failure before launching another attempt.
+            biased;
+            joined = pending.join_next(), if !pending.is_empty() => {
+                match joined {
+                    Some(Ok(Ok(value))) => {
+                        // Cancellation drops each attempt's endpoint. Await
+                        // cancellation so no detached handshake survives us.
+                        pending.shutdown().await;
+                        return Ok(value);
+                    }
+                    Some(Ok(Err(error))) if error.is::<HostKeyRejected>() => {
+                        pending.shutdown().await;
+                        return Err(error);
+                    }
+                    Some(Ok(Err(error))) => last = error,
+                    Some(Err(error)) => last = error.into(),
+                    None => {}
+                }
+                // A failed attempt need not consume the rest of its stagger.
+                next_start = tokio::time::Instant::now();
+            }
+            () = tokio::time::sleep_until(next_start),
+                if pending.len() < MAX_PARALLEL_ATTEMPTS && remaining.peek().is_some() => {
+                if let Some(addr) = remaining.next() {
+                    pending.spawn(attempt(addr));
+                    next_start = tokio::time::Instant::now() + ADDRESS_STAGGER;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct HostKeyRejected;
+
+impl std::fmt::Display for HostKeyRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("host key rejected")
+    }
+}
+
+impl std::error::Error for HostKeyRejected {}
+
+/// Race the resolved addresses with an independent deadline for each one.
 async fn connect_any(
     addrs: &[SocketAddr],
     client_config: &quinn::ClientConfig,
     opts: &Options,
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
-    let mut last: Option<anyhow::Error> = None;
-    for &addr in addrs {
-        // The local socket must be of the same family as the destination.
-        let bind = SocketAddr::new(
-            if addr.is_ipv6() {
-                IpAddr::V6(Ipv6Addr::UNSPECIFIED)
-            } else {
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-            },
-            0,
-        );
-        let mut endpoint = match quinn::Endpoint::client(bind) {
-            Ok(e) => e,
-            Err(e) => {
-                last = Some(anyhow::Error::new(e).context("opening a local UDP socket"));
-                continue;
-            }
-        };
-        endpoint.set_default_client_config(client_config.clone());
+    race_addresses(addrs, |addr| {
+        let config = client_config.clone();
+        let opts = opts.clone();
+        async move { connect_one(addr, &config, &opts).await }
+    })
+    .await
+}
 
-        let connecting = match endpoint.connect(addr, sni_name(&opts.host)) {
-            Ok(c) => c,
-            Err(e) => {
-                last = Some(anyhow::Error::new(e).context("starting the QUIC handshake"));
-                continue;
-            }
-        };
-        match tokio::time::timeout(Duration::from_secs(opts.connect_timeout_secs), connecting).await
-        {
-            Ok(Ok(conn)) => return Ok((endpoint, conn)),
-            Ok(Err(e)) => {
-                // A host key mismatch is about identity, not reachability;
-                // trying the next address would only repeat it.
-                let fatal = matches!(&e, quinn::ConnectionError::TransportError(te)
-                    if te.to_string().contains("HostKeyMismatch"));
-                let err = connect_error(&e, opts, addr);
-                if fatal {
-                    return Err(err);
-                }
-                last = Some(err);
-            }
-            Err(_) => {
-                last = Some(anyhow!(
-                    "connecting to {} ({addr}) timed out after {}s",
-                    opts.host,
-                    opts.connect_timeout_secs
-                ));
+async fn connect_one(
+    addr: SocketAddr,
+    client_config: &quinn::ClientConfig,
+    opts: &Options,
+) -> Result<(quinn::Endpoint, quinn::Connection)> {
+    let bind = SocketAddr::new(
+        if addr.is_ipv6() {
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        },
+        0,
+    );
+    let mut endpoint = quinn::Endpoint::client(bind).context("opening a local UDP socket")?;
+    endpoint.set_default_client_config(client_config.clone());
+    let connecting = endpoint
+        .connect(addr, sni_name(&opts.host))
+        .context("starting the QUIC handshake")?;
+    match tokio::time::timeout(Duration::from_secs(opts.connect_timeout_secs), connecting).await {
+        Ok(Ok(conn)) => Ok((endpoint, conn)),
+        Ok(Err(error)) => {
+            let fatal = matches!(&error, quinn::ConnectionError::TransportError(te)
+                if te.to_string().contains("HostKeyMismatch"));
+            let error = connect_error(&error, opts, addr);
+            if fatal {
+                Err(error.context(HostKeyRejected))
+            } else {
+                Err(error)
             }
         }
+        Err(_) => Err(anyhow!(
+            "connecting to {} ({addr}) timed out after {}s",
+            opts.host,
+            opts.connect_timeout_secs
+        )),
     }
-    Err(last.unwrap_or_else(|| anyhow!("`{}` did not resolve to any address", opts.host)))
 }
 
 /// Turn a connection failure into a message that says what to do next.
@@ -396,8 +450,16 @@ fn resolve(host: &str, port: u16, family: AddressFamily) -> Result<Vec<SocketAdd
         .with_context(|| format!("resolving `{host}`"))?
         .filter(|a| family.accepts(a))
         .collect();
-    // Try IPv6 first when both are on offer, then fall back.
-    addrs.sort_by_key(|a| u8::from(a.is_ipv4()));
+    // Interleave the families so an IPv4 fallback is the second attempt,
+    // even when DNS returns several IPv6 addresses first.
+    addrs.sort_unstable();
+    addrs.dedup();
+    let (v6, v4): (Vec<_>, Vec<_>) = addrs.into_iter().partition(SocketAddr::is_ipv6);
+    let mut addrs = Vec::with_capacity(v6.len() + v4.len());
+    for i in 0..v6.len().max(v4.len()) {
+        addrs.extend(v6.get(i));
+        addrs.extend(v4.get(i));
+    }
     if addrs.is_empty() {
         bail!("`{host}` did not resolve to any {family} address");
     }
@@ -870,6 +932,87 @@ mod tests {
         assert!(verify(&good).is_ok(), "a valid host key was rejected");
     }
 
+    #[tokio::test]
+    async fn address_race_cancels_a_stalled_loser_and_honours_fatal_errors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Active(Arc<AtomicUsize>);
+        impl Drop for Active {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let active = Arc::new(AtomicUsize::new(0));
+        let addrs = [
+            "127.0.0.1:1".parse().unwrap(),
+            "127.0.0.1:2".parse().unwrap(),
+        ];
+        let winner = tokio::time::timeout(
+            Duration::from_secs(2),
+            race_addresses(&addrs, |addr| {
+                let active = Arc::clone(&active);
+                async move {
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _active = Active(active);
+                    if addr.port() == 1 {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(addr.port())
+                }
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(winner, 2);
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            0,
+            "a cancelled attempt remained live"
+        );
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let result = race_addresses(&addrs, |_| {
+            let started = Arc::clone(&started);
+            async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(anyhow!("changed key").context(HostKeyRejected))
+            }
+        })
+        .await;
+        assert!(result.unwrap_err().is::<HostKeyRejected>());
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn address_race_bounds_concurrency_and_keeps_trying_after_failures() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let addrs: Vec<SocketAddr> = (1..=5)
+            .map(|port| SocketAddr::from(([127, 0, 0, 1], port)))
+            .collect();
+        let result = race_addresses(&addrs, |addr| {
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            async move {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                if addr.port() == 5 {
+                    Ok(5)
+                } else {
+                    bail!("address unavailable")
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, 5);
+        assert!(maximum.load(Ordering::SeqCst) <= MAX_PARALLEL_ATTEMPTS);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
     fn test_identity(dir: &std::path::Path) -> crypto::Identity {
         let (cert, key) =
             crypto::generate_identity("user@private-host", &["qsh".into()], 30).unwrap();
@@ -962,11 +1105,24 @@ mod tests {
             family: AddressFamily::V4,
             connect_timeout_secs: 2,
         };
-        let addrs = [addr];
+        // Keep a UDP address bound but silent, ahead of the healthy server.
+        // Both anonymous first contact and pinned reconnect must bypass it
+        // without waiting for the full per-address timeout.
+        let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addrs = [blackhole.local_addr().unwrap(), addr];
+        let opts = Options {
+            connect_timeout_secs: 10,
+            ..opts
+        };
+        let started = std::time::Instant::now();
         let (probe, rejected) = tokio::join!(probe_host_key(&addrs, &opts), async {
             server.accept().await.unwrap().await
         },);
         let pin = probe.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "probe waited for the dead first address"
+        );
         assert_eq!(pin, Fingerprint::of_cert(&server_id.cert).unwrap());
         assert!(rejected.is_err());
         assert_eq!(observed.load(Ordering::SeqCst), 0);
@@ -984,10 +1140,15 @@ mod tests {
 
         // Once the probed key is accepted, ordinary mandatory mutual TLS works.
         let trusted = client_config(PinnedServerVerifier::new(pin), Some(&client_id)).unwrap();
+        let started = std::time::Instant::now();
         let (client, peer) = tokio::join!(connect_any(&addrs, &trusted, &opts), async {
             server.accept().await.unwrap().await
         },);
         let (endpoint, conn) = client.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "connection waited for the dead first address"
+        );
         let peer = peer.unwrap();
         assert_eq!(observed.load(Ordering::SeqCst), 1);
         conn.close(0u32.into(), b"done");
