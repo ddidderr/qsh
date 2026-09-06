@@ -92,14 +92,27 @@ pub struct Options {
     pub host_key_policy: HostKeyPolicy,
     pub paths_dir: Option<std::path::PathBuf>,
     pub quiet: bool,
+    pub no_stdin: bool,
     pub family: AddressFamily,
     pub connect_timeout_secs: u64,
 }
 
 impl Options {
+    fn known_hosts_command(&self) -> String {
+        self.paths_dir.as_ref().map_or_else(
+            || "qsh known-hosts".into(),
+            |dir| format!("qsh known-hosts -i {}", shell_quote(&dir.to_string_lossy())),
+        )
+    }
+
     fn host_key(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
+}
+
+// Commands in diagnostics must preserve spaces and apostrophes in identity paths.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 /// Records the certificate the server presented without judging it, so the
@@ -225,7 +238,7 @@ pub async fn run(opts: Options) -> Result<i32> {
     if pinned.is_none() {
         let fp = crate::sync::mutex(&capture.seen)
             .ok_or_else(|| anyhow!("server presented no certificate"))?;
-        if !accept_new_host(&host_key, fp, opts.host_key_policy)? {
+        if !accept_new_host(&host_key, fp, &opts)? {
             conn.close(1u32.into(), b"host key rejected");
             bail!("host key for {host_key} was not accepted");
         }
@@ -285,7 +298,7 @@ async fn connect_any(
                 // A host key mismatch is about identity, not reachability;
                 // trying the next address would only repeat it.
                 let fatal = matches!(&e, quinn::ConnectionError::TransportError(te)
-                    if te.to_string().contains("host key mismatch"));
+                    if te.to_string().contains("HostKeyMismatch"));
                 let err = connect_error(&e, opts, addr);
                 if fatal {
                     return Err(err);
@@ -309,14 +322,15 @@ fn connect_error(e: &quinn::ConnectionError, opts: &Options, addr: SocketAddr) -
     let base = anyhow!("cannot connect to {} ({addr}): {e}", opts.host);
     match e {
         quinn::ConnectionError::TransportError(te)
-            if te.to_string().contains("host key mismatch") =>
+            if te.to_string().contains("HostKeyMismatch") =>
         {
             anyhow!(
                 "{}\n\nThe host key for {} has changed. If this is expected, remove the old \
-                 entry with `qsh known-hosts remove {}`; otherwise someone may be \
+                 entry with `{} remove {}`; otherwise someone may be \
                  impersonating the server.",
                 te,
                 opts.host_key(),
+                opts.known_hosts_command(),
                 opts.host_key()
             )
         }
@@ -360,13 +374,14 @@ fn resolve(host: &str, port: u16, family: AddressFamily) -> Result<Vec<SocketAdd
 }
 
 /// Trust-on-first-use decision for an unknown host.
-fn accept_new_host(host_key: &str, fp: Fingerprint, policy: HostKeyPolicy) -> Result<bool> {
-    match policy {
+fn accept_new_host(host_key: &str, fp: Fingerprint, opts: &Options) -> Result<bool> {
+    let command = opts.known_hosts_command();
+    match opts.host_key_policy {
         HostKeyPolicy::AcceptNew => return Ok(true),
         HostKeyPolicy::Refuse => {
             bail!(
-                "host {host_key} is not known and --refuse-new-hosts is in effect\n\
-                 Its key is {fp}. Add it with `qsh known-hosts add {host_key} {fp}`."
+                "host {host_key} is not known and the host-key policy refuses new hosts (--refuse-new)\n\
+                 Its key is {fp}. Add it with `{command} add {host_key} {fp}`."
             );
         }
         HostKeyPolicy::Ask => {}
@@ -381,7 +396,7 @@ fn accept_new_host(host_key: &str, fp: Fingerprint, policy: HostKeyPolicy) -> Re
         bail!(
             "host {host_key} is not known and there is no terminal to ask on.\n\
              Its key is {fp}.\n\
-             Connect once interactively, or run: qsh known-hosts add {host_key} {fp}"
+             Connect once interactively, or run: {command} add {host_key} {fp}"
         );
     };
     write!(
@@ -402,7 +417,9 @@ fn want_pty(opts: &Options) -> bool {
         PtyPolicy::Force => true,
         PtyPolicy::Never => false,
         // Same rule as ssh: interactive login gets a terminal, a command does not.
-        PtyPolicy::Auto => opts.command.is_none() && std::io::stdin().is_terminal(),
+        PtyPolicy::Auto => {
+            opts.command.is_none() && !opts.no_stdin && std::io::stdin().is_terminal()
+        }
     }
 }
 
@@ -411,7 +428,7 @@ async fn session(conn: &quinn::Connection, opts: &Options) -> Result<i32> {
     let stdin_fd = libc::STDIN_FILENO;
 
     let pty_req = use_pty.then(|| {
-        let size = pty::get_size(stdin_fd).unwrap_or_default();
+        let size = terminal_size();
         PtyRequest {
             term: std::env::var("TERM").unwrap_or_else(|_| "xterm".into()),
             size,
@@ -457,7 +474,7 @@ async fn session(conn: &quinn::Connection, opts: &Options) -> Result<i32> {
         None => bail!("server closed the session without a reply"),
     }
 
-    let raw = if use_pty && std::io::stdin().is_terminal() {
+    let raw = if use_pty && !opts.no_stdin && std::io::stdin().is_terminal() {
         // Register the handlers *before* touching the terminal. `Drop` covers
         // the ordinary paths, but a fatal signal does not unwind, and a signal
         // arriving between changing the termios and the handler being ready
@@ -471,7 +488,7 @@ async fn session(conn: &quinn::Connection, opts: &Options) -> Result<i32> {
         None
     };
 
-    let result = pump(send, recv, use_pty).await;
+    let result = pump(send, recv, use_pty, opts.no_stdin).await;
     drop(raw);
     result
 }
@@ -488,6 +505,7 @@ async fn pump(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     use_pty: bool,
+    no_stdin: bool,
 ) -> Result<i32> {
     let (tx, mut rx) = mpsc::channel::<Frame>(64);
 
@@ -500,9 +518,15 @@ async fn pump(
         let _ = send.finish();
     });
 
-    let stdin_task = tokio::spawn(forward_stdin(tx.clone(), use_pty));
+    let terminal_input = use_pty && !no_stdin && std::io::stdin().is_terminal();
+    let stdin_task = if no_stdin {
+        let _ = tx.send(Frame::StdinEof).await;
+        None
+    } else {
+        Some(tokio::spawn(forward_stdin(tx.clone(), terminal_input)))
+    };
     let winch_task = use_pty.then(|| tokio::spawn(forward_winch(tx.clone())));
-    let signal_task = (!use_pty).then(|| tokio::spawn(forward_signals(tx.clone())));
+    let signal_task = (!terminal_input).then(|| tokio::spawn(forward_signals(tx.clone())));
     drop(tx);
 
     let mut stdout = tokio::io::stdout();
@@ -516,7 +540,9 @@ async fn pump(
         }
     }
 
-    stdin_task.abort();
+    if let Some(t) = stdin_task {
+        t.abort();
+    }
     if let Some(t) = winch_task {
         t.abort();
     }
@@ -557,10 +583,10 @@ async fn apply(
 }
 
 /// Read local stdin and forward it, honouring the `~.` escape on a terminal.
-async fn forward_stdin(tx: Outbound, use_pty: bool) {
+async fn forward_stdin(tx: Outbound, terminal_input: bool) {
     let mut stdin = tokio::io::stdin();
     let mut buf = vec![0u8; CHUNK];
-    let mut escape = EscapeState::new(use_pty);
+    let mut escape = EscapeState::new(terminal_input);
 
     loop {
         match stdin.read(&mut buf).await {
@@ -615,7 +641,7 @@ impl EscapeState {
                         out.push(other);
                     }
                 }
-                self.at_line_start = false;
+                self.at_line_start = matches!(b, b'\r' | b'\n');
                 continue;
             }
             if self.at_line_start && b == b'~' {
@@ -667,6 +693,14 @@ impl FatalSignals {
     }
 }
 
+/// A forced PTY may receive piped input while output still goes to a terminal.
+fn terminal_size() -> crate::proto::PtySize {
+    [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO]
+        .into_iter()
+        .find_map(|fd| pty::get_size(fd).ok())
+        .unwrap_or_default()
+}
+
 /// Forward terminal resizes.
 async fn forward_winch(tx: Outbound) {
     let Ok(mut winch) =
@@ -674,9 +708,9 @@ async fn forward_winch(tx: Outbound) {
     else {
         return;
     };
-    let mut last = pty::get_size(libc::STDIN_FILENO).unwrap_or_default();
+    let mut last = terminal_size();
     while winch.recv().await.is_some() {
-        let size = pty::get_size(libc::STDIN_FILENO).unwrap_or_default();
+        let size = terminal_size();
         if size != last {
             last = size;
             if tx.send(Frame::Resize(size)).await.is_err() {
@@ -742,6 +776,15 @@ mod tests {
     #[test]
     fn double_tilde_is_a_literal_tilde() {
         assert_eq!(filtered(&[b"~~cd\n"]), (b"~cd\n".to_vec(), false));
+    }
+
+    #[test]
+    fn escaped_newline_still_starts_a_new_line() {
+        assert_eq!(filtered(&[b"~\r~."]), (b"~\r".to_vec(), true));
+        assert_eq!(
+            filtered(&[b"~", b"\n", b"~", b"."]),
+            (b"~\n".to_vec(), true)
+        );
     }
 
     #[test]
@@ -829,6 +872,7 @@ mod tests {
             host_key_policy: HostKeyPolicy::Ask,
             paths_dir: None,
             quiet: false,
+            no_stdin: false,
             family: AddressFamily::Any,
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
         };

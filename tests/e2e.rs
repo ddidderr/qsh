@@ -733,6 +733,15 @@ fn a_changed_host_key_is_refused() {
         !out.status.success(),
         "connection with a wrong pin succeeded"
     );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("host key for") && err.contains("has changed"),
+        "{err}"
+    );
+    assert!(
+        err.contains("known-hosts -i") && err.contains(f.client_dir.to_str().unwrap()),
+        "{err}"
+    );
 }
 
 #[test]
@@ -1789,4 +1798,76 @@ fn which(program: &str) -> Option<PathBuf> {
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+}
+
+#[test]
+fn no_stdin_leaves_the_local_input_unread() {
+    use std::io::Read;
+    let f = Fixture::start(&[]);
+    let input = f.tmp.path().join("hosts.txt");
+    std::fs::write(&input, b"host-one\nhost-two\n").unwrap();
+    let mut file = std::fs::File::open(input).unwrap();
+    let out = Command::new(CLIENT_BIN)
+        .args([
+            "-i",
+            f.client_dir.to_str().unwrap(),
+            "-p",
+            &f.port.to_string(),
+            "--accept-new",
+            "-n",
+            "127.0.0.1",
+            "cat",
+        ])
+        .stdin(Stdio::from(file.try_clone().unwrap()))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty());
+    let mut unread = String::new();
+    file.read_to_string(&mut unread).unwrap();
+    assert_eq!(unread, "host-one\nhost-two\n");
+}
+
+#[test]
+fn forced_pty_does_not_interpret_piped_tildes() {
+    let f = Fixture::start(&[]);
+    let mut child = Command::new(CLIENT_BIN)
+        .args([
+            "-i",
+            f.client_dir.to_str().unwrap(),
+            "-p",
+            &f.port.to_string(),
+            "--accept-new",
+            "-t",
+            "127.0.0.1",
+            "head",
+            "-n",
+            "3",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"~~hello\nx\n~.\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("~~hello") && stdout.contains("~."),
+        "{stdout}"
+    );
 }
