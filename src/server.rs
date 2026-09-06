@@ -90,7 +90,14 @@ pub async fn serve(
         )
     })?;
 
-    let store = Arc::new(RwLock::new(AuthStore::load(&paths.authorized())?));
+    let mut warnings = Vec::new();
+    let store = Arc::new(RwLock::new(AuthStore::load_with_warnings(
+        &paths.authorized(),
+        |warning| warnings.push(warning),
+    )?));
+    for warning in &warnings {
+        eprintln!("{warning}");
+    }
     if crate::sync::read(&store).is_empty() {
         eprintln!(
             "qsh-server: warning: no authorized clients in {} — every connection will be refused",
@@ -135,16 +142,19 @@ pub async fn serve(
         crate::sync::read(&store).entries().count()
     );
 
-    let refresher = spawn_store_refresher(Arc::clone(&store), paths.authorized());
+    let counters = Arc::new(AdmissionCounters::default());
+    let refresher = spawn_store_refresher(
+        Arc::clone(&store),
+        paths.authorized(),
+        warnings,
+        Arc::clone(&counters),
+    );
 
     // Everything below runs before any client has authenticated, so all of it
     // has to be bounded.
-    let unauthenticated = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_HANDSHAKES));
     let per_source = Arc::new(PerSourceHandshakes::default());
-    let mut rejected: u64 = 0;
-    let mut last_reload = tokio::time::Instant::now();
 
     while let Some(incoming) = endpoint.accept().await {
         // Make the peer prove it can receive at its claimed address before we
@@ -163,32 +173,15 @@ pub async fn serve(
             Arc::clone(&handshakes).try_acquire_owned(),
             per_source.try_acquire(source),
         ) else {
-            rejected = rejected.saturating_add(1);
+            counters
+                .rejected
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             incoming.ignore();
             continue;
         };
 
-        // Report in batches on a timer. Logging one line per attempt would let
-        // anyone who can send a packet flood the log, since this runs before
-        // the handshake has authenticated anybody.
-        if last_reload.elapsed() >= RELOAD_INTERVAL {
-            last_reload = tokio::time::Instant::now();
-            // Report refusals on this already-throttled tick rather than once
-            // per attempt, so a flood cannot also flood the log.
-            if rejected > 0 {
-                eprintln!(
-                    "qsh-server: refused {rejected} connection(s) over the concurrency limit"
-                );
-                rejected = 0;
-            }
-            let failed = unauthenticated.swap(0, std::sync::atomic::Ordering::Relaxed);
-            if failed > 0 {
-                eprintln!("qsh-server: {failed} connection(s) failed to authenticate");
-            }
-        }
-
         let store = Arc::clone(&store);
-        let failures = Arc::clone(&unauthenticated);
+        let counters = Arc::clone(&counters);
         tokio::spawn(async move {
             // The permit lives as long as the connection does.
             let _permit = permit;
@@ -198,7 +191,9 @@ pub async fn serve(
                 // reported in batches instead of logged one per attempt.
                 Err(e) => eprintln!("qsh-server: {e:#}"),
                 Ok(Authenticated::No) => {
-                    failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    counters
+                        .unauthenticated
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 Ok(Authenticated::Yes) => {}
             }
@@ -251,7 +246,66 @@ impl Drop for SourceSlot {
     }
 }
 
-/// Re-read `authorized/` on a timer.
+#[derive(Default)]
+struct AdmissionCounters {
+    rejected: std::sync::atomic::AtomicU64,
+    unauthenticated: std::sync::atomic::AtomicU64,
+}
+
+impl AdmissionCounters {
+    /// Batch reports independently of incoming traffic, including after a flood stops.
+    fn report(&self) {
+        use std::sync::atomic::Ordering;
+
+        let rejected = self.rejected.swap(0, Ordering::Relaxed);
+        if rejected > 0 {
+            eprintln!("qsh-server: refused {rejected} connection(s) over the concurrency limit");
+        }
+        let failed = self.unauthenticated.swap(0, Ordering::Relaxed);
+        if failed > 0 {
+            eprintln!("qsh-server: {failed} connection(s) failed to authenticate");
+        }
+    }
+}
+
+struct ReloadDiagnostics {
+    warnings: Vec<String>,
+    failure: Option<String>,
+}
+
+impl ReloadDiagnostics {
+    fn reload(&mut self, store: &RwLock<AuthStore>, dir: &std::path::Path) -> Vec<String> {
+        let mut warnings = Vec::new();
+        match AuthStore::load_with_warnings(dir, |warning| warnings.push(warning)) {
+            Ok(fresh) => {
+                *crate::sync::write(store) = fresh;
+                let mut messages: Vec<_> = warnings
+                    .iter()
+                    .filter(|warning| !self.warnings.contains(warning))
+                    .cloned()
+                    .collect();
+                self.warnings = warnings;
+                if self.failure.take().is_some() {
+                    messages.push("qsh-server: authorization reload recovered".into());
+                }
+                messages
+            }
+            Err(e) => {
+                let failure = format!(
+                    "qsh-server: cannot reload authorizations; keeping previous authorizations: {e:#}"
+                );
+                if self.failure.as_ref() == Some(&failure) {
+                    Vec::new()
+                } else {
+                    self.failure = Some(failure.clone());
+                    vec![failure]
+                }
+            }
+        }
+    }
+}
+
+/// Re-read `authorized/` and report admission counters on a timer.
 ///
 /// Revocation has to reach connections that are already open, and those do not
 /// necessarily bring new ones with them: reloading only when someone connects
@@ -260,14 +314,21 @@ impl Drop for SourceSlot {
 fn spawn_store_refresher(
     store: Arc<RwLock<AuthStore>>,
     dir: std::path::PathBuf,
+    warnings: Vec<String>,
+    counters: Arc<AdmissionCounters>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut diagnostics = ReloadDiagnostics {
+            warnings,
+            failure: None,
+        };
         let mut ticker = tokio::time::interval(RELOAD_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if let Ok(fresh) = AuthStore::load(&dir) {
-                *crate::sync::write(&store) = fresh;
+            counters.report();
+            for message in diagnostics.reload(&store, &dir) {
+                eprintln!("{message}");
             }
         }
     })
@@ -715,7 +776,7 @@ async fn drain(tasks: &mut [Pump], is_pty: bool) -> Drained {
     for pump in tasks.iter_mut() {
         let end = if is_pty {
             if let Ok(joined) = tokio::time::timeout(DRAIN_GRACE, &mut pump.task).await {
-                joined.map_or(PumpEnd::Failed, |end| end)
+                joined.unwrap_or(PumpEnd::Failed)
             } else {
                 // Order matters here. `abort` only *requests* cancellation, so
                 // reading the flag first would be sampling a pump that is
@@ -990,6 +1051,72 @@ mod tests {
             pty: None,
             env: Vec::new(),
         }
+    }
+
+    #[test]
+    fn reload_warnings_follow_entry_changes_and_recover_from_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let authorized = dir.path().join("authorized");
+        std::fs::create_dir(&authorized).unwrap();
+        let cert = authorized.join("client.crt");
+        std::fs::write(&cert, "broken certificate").unwrap();
+        let store = RwLock::new(AuthStore::default());
+        let mut diagnostics = ReloadDiagnostics {
+            warnings: Vec::new(),
+            failure: None,
+        };
+
+        let first = diagnostics.reload(&store, &authorized);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].contains("ignoring authorization"));
+        assert!(diagnostics.reload(&store, &authorized).is_empty());
+        std::fs::remove_file(&cert).unwrap();
+        assert!(diagnostics.reload(&store, &authorized).is_empty());
+        std::fs::write(&cert, "broken certificate").unwrap();
+        assert_eq!(diagnostics.reload(&store, &authorized), first);
+
+        // A file cannot be listed as an authorization directory, even as root.
+        let saved = dir.path().join("saved");
+        std::fs::rename(&authorized, &saved).unwrap();
+        std::fs::write(&authorized, "not a directory").unwrap();
+        let failure = diagnostics.reload(&store, &authorized);
+        assert_eq!(failure.len(), 1);
+        assert!(failure[0].contains("keeping previous authorizations"));
+        assert!(diagnostics.reload(&store, &authorized).is_empty());
+        std::fs::remove_file(&authorized).unwrap();
+        std::fs::rename(saved, &authorized).unwrap();
+        assert_eq!(
+            diagnostics.reload(&store, &authorized),
+            ["qsh-server: authorization reload recovered"]
+        );
+        assert!(diagnostics.reload(&store, &authorized).is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejection_counts_are_reported_without_another_connection() {
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let counters = Arc::new(AdmissionCounters::default());
+        let refresher = spawn_store_refresher(
+            Arc::new(RwLock::new(AuthStore::default())),
+            dir.path().to_owned(),
+            Vec::new(),
+            Arc::clone(&counters),
+        );
+        counters.rejected.store(12, Ordering::Relaxed);
+        counters.unauthenticated.store(3, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while counters.rejected.load(Ordering::Relaxed) != 0
+                || counters.unauthenticated.load(Ordering::Relaxed) != 0
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timer did not report the counters without traffic");
+        refresher.abort();
+        let _ = refresher.await;
     }
 
     #[test]
