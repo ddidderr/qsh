@@ -1795,11 +1795,11 @@ fn is_executable(path: &Path) -> bool {
 fn root_target_login_with_a_different_server_group() {
     use std::os::unix::process::CommandExt;
 
+    const CHILD_MARKER: &str = "QSH_TEST_ROOT_DIFFERENT_GROUP";
     if !nix::unistd::Uid::effective().is_root() {
         eprintln!("skipping: requires root to change the server group");
         return;
     }
-    const CHILD_MARKER: &str = "QSH_TEST_ROOT_DIFFERENT_GROUP";
     if std::env::var_os(CHILD_MARKER).is_none() {
         let root = qsh::child::resolve_user("root").unwrap();
         let other_gid = if root.gid.as_raw() == 1 { 2 } else { 1 };
