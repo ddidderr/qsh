@@ -159,8 +159,10 @@ fn run(paths: &ServerPaths, command: Command) -> Result<()> {
 }
 
 fn serve(paths: &ServerPaths, args: Serve) -> Result<()> {
-    let config_path = args.config.unwrap_or_else(|| paths.config());
-    let cfg = ServerConfig::load(&config_path)?;
+    let cfg = match args.config {
+        Some(path) => ServerConfig::load_required(&path)?,
+        None => ServerConfig::load(&paths.config())?,
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
