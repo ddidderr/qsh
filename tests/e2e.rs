@@ -733,6 +733,15 @@ fn a_changed_host_key_is_refused() {
         !out.status.success(),
         "connection with a wrong pin succeeded"
     );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("host key for") && err.contains("has changed"),
+        "{err}"
+    );
+    assert!(
+        err.contains("known-hosts -i") && err.contains(f.client_dir.to_str().unwrap()),
+        "{err}"
+    );
 }
 
 #[test]
@@ -1789,4 +1798,156 @@ fn which(program: &str) -> Option<PathBuf> {
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+}
+
+#[test]
+fn no_stdin_leaves_the_local_input_unread() {
+    use std::io::Read;
+    let f = Fixture::start(&[]);
+    let input = f.tmp.path().join("hosts.txt");
+    std::fs::write(&input, b"host-one\nhost-two\n").unwrap();
+    let mut file = std::fs::File::open(input).unwrap();
+    let out = Command::new(CLIENT_BIN)
+        .args([
+            "-i",
+            f.client_dir.to_str().unwrap(),
+            "-p",
+            &f.port.to_string(),
+            "--accept-new",
+            "-n",
+            "127.0.0.1",
+            "cat",
+        ])
+        .stdin(Stdio::from(file.try_clone().unwrap()))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty());
+    let mut unread = String::new();
+    file.read_to_string(&mut unread).unwrap();
+    assert_eq!(unread, "host-one\nhost-two\n");
+}
+
+#[test]
+fn forced_pty_does_not_interpret_piped_tildes() {
+    let f = Fixture::start(&[]);
+    let mut child = Command::new(CLIENT_BIN)
+        .args([
+            "-i",
+            f.client_dir.to_str().unwrap(),
+            "-p",
+            &f.port.to_string(),
+            "--accept-new",
+            "-t",
+            "127.0.0.1",
+            "head",
+            "-n",
+            "3",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"~~hello\nx\n~.\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("~~hello") && stdout.contains("~."),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn forced_pty_with_piped_stdin_relays_sigint() {
+    let f = Fixture::start(&[]);
+    let pidfile = f.tmp.path().join("ready.pid");
+    let child = Command::new(CLIENT_BIN)
+        .args([
+            "-i",
+            f.client_dir.to_str().unwrap(),
+            "-p",
+            &f.port.to_string(),
+            "--accept-new",
+            "-t",
+            "127.0.0.1",
+            "sh",
+            "-c",
+            "trap 'exit 42' INT; echo $$ > \"$1\"; while :; do sleep 1; done",
+            "sh",
+            pidfile.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_pid(&pidfile);
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .unwrap();
+    let out = wait_with_deadline(child, Duration::from_secs(10))
+        .expect("client did not forward SIGINT to the forced PTY");
+    assert_eq!(
+        out.status.code(),
+        Some(42),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn forced_pty_with_piped_stdin_uses_the_output_terminal_size() {
+    let f = Fixture::start(&[]);
+    let sizefile = f.tmp.path().join("terminal-size");
+    let size = nix::pty::Winsize {
+        ws_row: 45,
+        ws_col: 123,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let terminal = nix::pty::openpty(Some(&size), None).unwrap();
+    let out = Command::new(CLIENT_BIN)
+        .args([
+            "-i",
+            f.client_dir.to_str().unwrap(),
+            "-p",
+            &f.port.to_string(),
+            "--accept-new",
+            "-t",
+            "127.0.0.1",
+            "sh",
+            "-c",
+            "stty size > \"$1\"",
+            "sh",
+            sizefile.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(terminal.slave))
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(sizefile).unwrap().trim(), "45 123");
+    drop(terminal.master);
 }
