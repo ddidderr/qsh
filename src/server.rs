@@ -776,7 +776,7 @@ async fn drain(tasks: &mut [Pump], is_pty: bool) -> Drained {
     for pump in tasks.iter_mut() {
         let end = if is_pty {
             if let Ok(joined) = tokio::time::timeout(DRAIN_GRACE, &mut pump.task).await {
-                joined.map_or(PumpEnd::Failed, |end| end)
+                joined.unwrap_or(PumpEnd::Failed)
             } else {
                 // Order matters here. `abort` only *requests* cancellation, so
                 // reading the flag first would be sampling a pump that is
