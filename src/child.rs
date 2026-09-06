@@ -212,7 +212,7 @@ pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
                 return Err(std::io::Error::last_os_error());
             }
             // stdin is the PTY slave; make it our controlling terminal.
-            if controlling_terminal && libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+            if controlling_terminal && libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             drop_privileges(switch, &groups, uid, gid)
