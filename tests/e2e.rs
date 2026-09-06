@@ -23,6 +23,23 @@ use std::time::{Duration, Instant};
 const SERVER_BIN: &str = env!("CARGO_BIN_EXE_qsh-server");
 const CLIENT_BIN: &str = env!("CARGO_BIN_EXE_qsh");
 
+#[test]
+fn explicitly_missing_server_config_fails_before_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("missing.toml");
+    let output = Command::new(SERVER_BIN)
+        .arg("--dir")
+        .arg(dir.path())
+        .args(["serve", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("reading"), "{stderr}");
+    assert!(stderr.contains("missing.toml"), "{stderr}");
+}
+
 /// A running server plus the client configuration that may talk to it.
 struct Fixture {
     tmp: tempfile::TempDir,

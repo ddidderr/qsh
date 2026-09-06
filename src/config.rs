@@ -129,6 +129,7 @@ pub struct ServerConfig {
     #[serde(default = "default_listen")]
     pub listen: String,
     /// Drop a connection after this many seconds without traffic.
+    /// QUIC uses the smaller peer timeout; the qsh client currently caps it at 60 seconds.
     #[serde(default = "default_idle")]
     pub idle_timeout_secs: u64,
     /// Interval at which the server sends QUIC keep-alives.
@@ -165,9 +166,22 @@ impl ServerConfig {
     /// # Errors
     /// Fails if the file exists but cannot be read or parsed.
     pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
+        match Self::load_required(path) {
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(Self::default())
+            }
+            result => result,
         }
+    }
+
+    /// Read an explicitly selected configuration file without a default fallback.
+    ///
+    /// # Errors
+    /// Fails if the file is missing, cannot be read, or cannot be parsed.
+    pub fn load_required(path: &Path) -> Result<Self> {
         let text =
             fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
@@ -735,5 +749,40 @@ mod tests {
         let cfg = ServerConfig::load(Path::new("/nonexistent/qsh-server.toml")).unwrap();
         assert_eq!(cfg.listen, format!("0.0.0.0:{DEFAULT_PORT}"));
         assert!(cfg.listen_addr().is_ok());
+    }
+
+    #[test]
+    fn explicit_server_config_must_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.toml");
+        let error = ServerConfig::load_required(&path).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn both_config_loaders_preserve_values_and_report_invalid_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.toml");
+        fs::write(
+            &path,
+            "listen = \"127.0.0.1:3333\"\nidle_timeout_secs = 300\n",
+        )
+        .unwrap();
+        for cfg in [
+            ServerConfig::load(&path),
+            ServerConfig::load_required(&path),
+        ] {
+            let cfg = cfg.unwrap();
+            assert_eq!(cfg.listen, "127.0.0.1:3333");
+            assert_eq!(cfg.idle_timeout_secs, 300);
+        }
+        fs::write(&path, "invalid configuration").unwrap();
+        assert!(ServerConfig::load(&path).is_err());
+        assert!(ServerConfig::load_required(&path).is_err());
+        assert!(ServerConfig::load(dir.path()).is_err());
+        assert!(ServerConfig::load_required(dir.path()).is_err());
     }
 }
