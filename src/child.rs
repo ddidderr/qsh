@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
-use nix::unistd::{Gid, Uid, User};
+use nix::sys::signal::{kill, killpg, Signal};
+use nix::unistd::{Gid, Pid, Uid, User};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 
 use crate::config::env_allowed;
@@ -44,20 +45,16 @@ pub struct Spawned {
 /// process itself.
 ///
 /// This is the only place in the crate that signals anything.
-#[allow(
-    unsafe_code,
-    reason = "kill(2) has no safe wrapper; pid comes from our own child"
-)]
 pub fn signal_process_group(pid: u32, sig: i32) {
-    let Ok(pid) = i32::try_from(pid) else {
+    let (Ok(pid), Ok(sig)) = (i32::try_from(pid), Signal::try_from(sig)) else {
         return;
     };
-    // SAFETY: `kill` only reads the two scalar arguments. A stale pid can at
-    // worst return ESRCH, which we ignore.
-    unsafe {
-        if libc::kill(-pid, sig) < 0 {
-            libc::kill(pid, sig);
-        }
+    if pid <= 0 {
+        return;
+    }
+    let pid = Pid::from_raw(pid);
+    if killpg(pid, sig).is_err() {
+        let _ = kill(pid, sig);
     }
 }
 
@@ -65,17 +62,12 @@ pub fn signal_process_group(pid: u32, sig: i32) {
 ///
 /// Uses signal 0, which performs the permission and existence checks without
 /// delivering anything.
-#[allow(
-    unsafe_code,
-    reason = "kill(2) has no safe wrapper; the pid comes from our own child"
-)]
 #[must_use]
 pub fn process_group_alive(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
     };
-    // SAFETY: `kill` with signal 0 only probes; it reads two scalars.
-    unsafe { libc::kill(-pid, 0) == 0 }
+    pid > 0 && killpg(Pid::from_raw(pid), None).is_ok()
 }
 
 impl Spawned {
@@ -167,7 +159,11 @@ pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
     }
     for (k, v) in &req.env {
         if env_allowed(k) && !v.contains('\0') && !k.contains('\0') {
-            cmd.env(k, v);
+            if k == "TERM" {
+                cmd.env(k, sanitize_term(v));
+            } else {
+                cmd.env(k, v);
+            }
         }
     }
 
@@ -194,61 +190,51 @@ pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
         Vec::new()
     };
 
-    let (io, spawned) = if let Some(p) = &req.pty {
-        {
-            let (master, slave) = pty::open(p.size)?;
-            let slave_in = slave.try_clone().context("duplicating the PTY slave")?;
-            let slave_out = slave.try_clone().context("duplicating the PTY slave")?;
-            cmd.stdin(Stdio::from(slave_in))
-                .stdout(Stdio::from(slave_out))
-                .stderr(Stdio::from(slave));
-
-            // SAFETY: only async-signal-safe libc calls between fork and exec.
-            unsafe {
-                cmd.as_std_mut().pre_exec(move || {
-                    if libc::setsid() < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    // stdin is the PTY slave; make it our controlling terminal.
-                    if libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    drop_privileges(switch, &groups, uid, gid)
-                });
-            }
-            let child = cmd
-                .spawn()
-                .with_context(|| describe(req.command.as_ref(), &shell))?;
-            (ChildIo::Pty(master), child)
-        }
+    let master = if let Some(p) = &req.pty {
+        let (master, slave) = pty::open(p.size)?;
+        let slave_in = slave.try_clone().context("duplicating the PTY slave")?;
+        let slave_out = slave.try_clone().context("duplicating the PTY slave")?;
+        cmd.stdin(Stdio::from(slave_in))
+            .stdout(Stdio::from(slave_out))
+            .stderr(Stdio::from(slave));
+        Some(master)
     } else {
-        {
-            cmd.stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            // SAFETY: only async-signal-safe libc calls between fork and exec.
-            unsafe {
-                cmd.as_std_mut().pre_exec(move || {
-                    if libc::setsid() < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    drop_privileges(switch, &groups, uid, gid)
-                });
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        None
+    };
+    let controlling_terminal = master.is_some();
+    // SAFETY: only async-signal-safe libc calls between fork and exec.
+    unsafe {
+        cmd.as_std_mut().pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
             }
-            let mut child = cmd
-                .spawn()
-                .with_context(|| describe(req.command.as_ref(), &shell))?;
-            let missing = || anyhow::anyhow!("a piped standard stream was not created");
-            let io = ChildIo::Pipes {
-                stdin: child.stdin.take().ok_or_else(missing)?,
-                stdout: child.stdout.take().ok_or_else(missing)?,
-                stderr: child.stderr.take().ok_or_else(missing)?,
-            };
-            (io, child)
+            // stdin is the PTY slave; make it our controlling terminal.
+            if controlling_terminal && libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            drop_privileges(switch, &groups, uid, gid)
+        });
+    }
+    let mut child = {
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let _guard = pty::spawn_lock()?;
+        cmd.spawn()
+            .with_context(|| describe(req.command.as_ref(), &shell))?
+    };
+    let io = if let Some(master) = master {
+        ChildIo::Pty(master)
+    } else {
+        let missing = || anyhow::anyhow!("a piped standard stream was not created");
+        ChildIo::Pipes {
+            stdin: child.stdin.take().ok_or_else(missing)?,
+            stdout: child.stdout.take().ok_or_else(missing)?,
+            stderr: child.stderr.take().ok_or_else(missing)?,
         }
     };
-
-    Ok(Spawned { child: spawned, io })
+    Ok(Spawned { child, io })
 }
 
 fn describe(command: Option<&Vec<String>>, shell: &Path) -> String {
@@ -289,7 +275,7 @@ fn drop_privileges(
         }
         // Refuse to exec if the identity change did not stick, and make sure
         // it cannot be undone.
-        if libc::getuid() != uid || libc::geteuid() != uid || libc::setuid(0) == 0 {
+        if libc::getuid() != uid || libc::geteuid() != uid || (uid != 0 && libc::setuid(0) == 0) {
             return Err(std::io::Error::other("failed to drop privileges"));
         }
     }
@@ -434,6 +420,52 @@ mod tests {
         let mut out = String::new();
         stdout.read_to_string(&mut out).await.unwrap();
         assert_eq!(out.trim(), "//C");
+    }
+
+    #[tokio::test]
+    async fn explicit_term_is_sanitized_in_pty_and_pipe_sessions() {
+        let user = current_user().unwrap();
+        for pty in [false, true] {
+            for (value, expected) in [
+                ("evil term\n../x".to_owned(), "evilterm..x".to_owned()),
+                ("☃\n/".to_owned(), "dumb".to_owned()),
+                ("a".repeat(200), "a".repeat(64)),
+                ("xterm-256color".to_owned(), "xterm-256color".to_owned()),
+            ] {
+                let mut req = request(&["printenv", "TERM"], pty);
+                req.env = vec![
+                    ("TERM".into(), "earlier".into()),
+                    ("TERM".into(), value),
+                    ("TERM".into(), "ignored\0value".into()),
+                ];
+                let mut sp = spawn(&user, &req).unwrap();
+                let mut out = String::new();
+                match &mut sp.io {
+                    ChildIo::Pty(master) => master.read_to_string(&mut out).await.unwrap(),
+                    ChildIo::Pipes { stdout, .. } => stdout.read_to_string(&mut out).await.unwrap(),
+                };
+                assert!(sp.child.wait().await.unwrap().success());
+                assert_eq!(out.trim_end_matches(['\r', '\n']), expected);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn another_session_does_not_inherit_open_pty_descriptors() {
+        use std::os::fd::AsRawFd;
+
+        let user = current_user().unwrap();
+        let (master, slave) = pty::open(PtySize::default()).unwrap();
+        let script = format!(
+            "test ! -e /proc/self/fd/{} && test ! -e /proc/self/fd/{}",
+            master.as_raw_fd(),
+            slave.as_raw_fd()
+        );
+        for use_pty in [false, true] {
+            let mut sp = spawn(&user, &request(&["sh", "-c", &script], use_pty)).unwrap();
+            assert!(sp.child.wait().await.unwrap().success());
+        }
     }
 
     #[tokio::test]
