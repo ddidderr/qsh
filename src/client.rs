@@ -115,9 +115,9 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-/// Records the certificate the server presented without judging it, so the
-/// caller can apply trust-on-first-use afterwards. Nothing is sent over a
-/// connection verified this way until the fingerprint has been accepted.
+/// An anonymous probe verifies the server's validity and proof of possession,
+/// records its fingerprint, then deliberately stops before client authentication.
+/// The caller must reconnect with a pinned verifier after accepting that key.
 #[derive(Debug)]
 struct CaptureVerifier {
     seen: Mutex<Option<Fingerprint>>,
@@ -144,9 +144,6 @@ impl ServerCertVerifier for CaptureVerifier {
         // an expired or not-yet-valid certificate. Skipping this would mean
         // expiry never applied to exactly the clients that have no pin yet.
         crypto::check_validity(end_entity, now)?;
-        let fp = Fingerprint::of_cert(end_entity)
-            .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
-        *crate::sync::mutex(&self.seen) = Some(fp);
         Ok(ServerCertVerified::assertion())
     }
 
@@ -172,7 +169,13 @@ impl ServerCertVerifier for CaptureVerifier {
             cert,
             dss,
             &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
+        )?;
+        let fp = Fingerprint::of_cert(cert)
+            .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
+        *crate::sync::mutex(&self.seen) = Some(fp);
+        Err(TlsError::General(
+            "anonymous host-key probe complete".into(),
+        ))
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -202,56 +205,84 @@ pub async fn run(opts: Options) -> Result<i32> {
 
     let host_key = opts.host_key();
     let mut known = KnownHosts::load(&paths.known_hosts())?;
-    let pinned = known.get(&host_key);
-
-    let capture = CaptureVerifier::new();
-    let verifier: Arc<dyn ServerCertVerifier> = match pinned {
-        Some(fp) => PinnedServerVerifier::new(fp),
-        None => Arc::clone(&capture) as Arc<dyn ServerCertVerifier>,
-    };
-
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .context("configuring TLS 1.3")?
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_client_auth_cert(vec![identity.cert.clone()], identity.key.clone_key())
-        .context("installing your client certificate")?;
-    tls.alpn_protocols = vec![crate::proto::ALPN.to_vec()];
-
     let addrs = resolve(&opts.host, opts.port, opts.family)?;
-    let client_config = {
-        let mut cfg = quinn::ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(tls).context("building the QUIC crypto configuration")?,
-        ));
-        cfg.transport_config(Arc::new(transport_config(
-            Duration::from_secs(IDLE_TIMEOUT_SECS),
-            Duration::from_secs(KEEPALIVE_SECS),
-        )?));
-        cfg
-    };
-
-    let (endpoint, conn) = connect_any(&addrs, &client_config, &opts).await?;
-
-    // Trust on first use: the handshake is complete but nothing has been sent.
-    if pinned.is_none() {
-        let fp = crate::sync::mutex(&capture.seen)
-            .ok_or_else(|| anyhow!("server presented no certificate"))?;
+    let pinned = if let Some(fp) = known.get(&host_key) {
+        fp
+    } else {
+        // Refusal needs no contact with an unknown server at all.
+        if opts.host_key_policy == HostKeyPolicy::Refuse {
+            let command = opts.known_hosts_command();
+            bail!(
+                "host {host_key} is not known and the host-key policy refuses new hosts (--refuse-new)\n\
+                 Obtain the host key fingerprint through a trusted channel, then add it with \
+                 `{command} add {host_key} <verified-fingerprint>`."
+            );
+        }
+        let fp = probe_host_key(&addrs, &opts).await?;
         if !accept_new_host(&host_key, fp, &opts)? {
-            conn.close(1u32.into(), b"host key rejected");
             bail!("host key for {host_key} was not accepted");
         }
         known.set_if_new(&host_key, fp)?;
         if !opts.quiet {
             eprintln!("qsh: permanently added {host_key} ({fp}) to known hosts");
         }
-    }
+        fp
+    };
+    let config = client_config(PinnedServerVerifier::new(pinned), Some(&identity))?;
+    let (endpoint, conn) = connect_any(&addrs, &config, &opts).await?;
 
     let status = session(&conn, &opts).await;
     conn.close(0u32.into(), b"bye");
     endpoint.wait_idle().await;
     status
+}
+
+/// Client credentials are installed only for a host key that has been accepted.
+fn client_config(
+    verifier: Arc<dyn ServerCertVerifier>,
+    identity: Option<&crypto::Identity>,
+) -> Result<quinn::ClientConfig> {
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .context("configuring TLS 1.3")?
+    .dangerous()
+    .with_custom_certificate_verifier(verifier);
+    let mut tls = match identity {
+        Some(identity) => builder
+            .with_client_auth_cert(vec![identity.cert.clone()], identity.key.clone_key())
+            .context("installing your client certificate")?,
+        None => builder.with_no_client_auth(),
+    };
+    tls.alpn_protocols = vec![crate::proto::ALPN.to_vec()];
+    let mut config = quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(tls).context("building the QUIC crypto configuration")?,
+    ));
+    config.transport_config(Arc::new(transport_config(
+        Duration::from_secs(IDLE_TIMEOUT_SECS),
+        Duration::from_secs(KEEPALIVE_SECS),
+    )?));
+    Ok(config)
+}
+
+async fn probe_host_key(addrs: &[SocketAddr], opts: &Options) -> Result<Fingerprint> {
+    let mut last = None;
+    for addr in addrs {
+        // A failed address must never leave a fingerprint for another attempt.
+        let capture = CaptureVerifier::new();
+        let config = client_config(capture.clone(), None)?;
+        let result = connect_any(&[*addr], &config, opts).await;
+        // The verifier records only after validating CertificateVerify, then
+        // intentionally aborts. A mandatory-client-auth server is supported:
+        // the probe never needs to finish its authenticated handshake.
+        let seen = *crate::sync::mutex(&capture.seen);
+        if let Some(fp) = seen {
+            return Ok(fp);
+        }
+        last = result.err();
+    }
+    Err(last.unwrap_or_else(|| anyhow!("server presented no verified certificate")))
 }
 
 /// Try each resolved address in turn, with its own deadline.
@@ -837,6 +868,132 @@ mod tests {
 
         let (good, _) = crypto::generate_identity("host", &["localhost".into()], 30).unwrap();
         assert!(verify(&good).is_ok(), "a valid host key was rejected");
+    }
+
+    fn test_identity(dir: &std::path::Path) -> crypto::Identity {
+        let (cert, key) =
+            crypto::generate_identity("user@private-host", &["qsh".into()], 30).unwrap();
+        crypto::write_public(&dir.join("id.crt"), &cert).unwrap();
+        crypto::write_private(&dir.join("id.key"), &key).unwrap();
+        crypto::load_identity(&dir.join("id.crt"), &dir.join("id.key")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn refusing_unknown_hosts_preserves_identity_guidance_without_network_contact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("client's identity dir");
+        std::fs::create_dir(&dir).unwrap();
+        let _identity = test_identity(&dir);
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let opts = Options {
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+            user: None,
+            command: None,
+            pty: PtyPolicy::Never,
+            env: vec![],
+            host_key_policy: HostKeyPolicy::Refuse,
+            paths_dir: Some(dir.clone()),
+            quiet: true,
+            no_stdin: true,
+            family: AddressFamily::V4,
+            connect_timeout_secs: 2,
+        };
+        let expected_command = opts.known_hosts_command();
+        let error = run(opts).await.unwrap_err().to_string();
+        assert!(
+            error.contains("--refuse-new") && error.contains("trusted channel"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!(
+                "{expected_command} add {addr} <verified-fingerprint>"
+            )),
+            "{error}"
+        );
+        assert!(!dir.join("known_hosts").exists());
+        let mut packet = [0u8; 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.recv_from(&mut packet))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_probe_and_changed_key_never_disclose_the_client_identity() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let server_dir = tempfile::tempdir().unwrap();
+        let client_dir = tempfile::tempdir().unwrap();
+        let server_id = test_identity(server_dir.path());
+        let client_id = test_identity(client_dir.path());
+        let observed = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&observed);
+        let verifier = crypto::AuthorizedClientVerifier::new(Arc::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(vec![server_id.cert.clone()], server_id.key.clone_key())
+        .unwrap();
+        tls.alpn_protocols = vec![crate::proto::ALPN.to_vec()];
+        let config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap(),
+        ));
+        let server = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let opts = Options {
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+            user: None,
+            command: None,
+            pty: PtyPolicy::Never,
+            env: vec![],
+            host_key_policy: HostKeyPolicy::AcceptNew,
+            paths_dir: None,
+            quiet: true,
+            no_stdin: false,
+            family: AddressFamily::V4,
+            connect_timeout_secs: 2,
+        };
+        let addrs = [addr];
+        let (probe, rejected) = tokio::join!(probe_host_key(&addrs, &opts), async {
+            server.accept().await.unwrap().await
+        },);
+        let pin = probe.unwrap();
+        assert_eq!(pin, Fingerprint::of_cert(&server_id.cert).unwrap());
+        assert!(rejected.is_err());
+        assert_eq!(observed.load(Ordering::SeqCst), 0);
+
+        // A key swapped after approval fails at the pinned verifier before
+        // the legitimate client certificate can be sent.
+        let wrong_pin = Fingerprint::of_cert(&client_id.cert).unwrap();
+        let changed =
+            client_config(PinnedServerVerifier::new(wrong_pin), Some(&client_id)).unwrap();
+        let (client, peer) = tokio::join!(connect_any(&addrs, &changed, &opts), async {
+            server.accept().await.unwrap().await
+        },);
+        assert!(client.is_err() && peer.is_err());
+        assert_eq!(observed.load(Ordering::SeqCst), 0);
+
+        // Once the probed key is accepted, ordinary mandatory mutual TLS works.
+        let trusted = client_config(PinnedServerVerifier::new(pin), Some(&client_id)).unwrap();
+        let (client, peer) = tokio::join!(connect_any(&addrs, &trusted, &opts), async {
+            server.accept().await.unwrap().await
+        },);
+        let (endpoint, conn) = client.unwrap();
+        let peer = peer.unwrap();
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+        conn.close(0u32.into(), b"done");
+        peer.close(0u32.into(), b"done");
+        endpoint.close(0u32.into(), b"done");
+        server.close(0u32.into(), b"done");
     }
 
     #[test]
