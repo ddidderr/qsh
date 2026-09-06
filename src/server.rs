@@ -702,11 +702,11 @@ enum Drained {
 ///
 /// A PTY gets a deadline, because it has no last-writer guarantee — a job
 /// backgrounded from an interactive shell holds the slave open indefinitely.
-/// Which of the two things a timeout means is decided by whether frames are
-/// still backed up: an empty channel means everything read has been handed to
-/// the writer and the pump is simply parked on a terminal nobody is using any
-/// more, while a full one means the client is not keeping up and output really
-/// would be lost.
+/// The pump reports whether cutoff discarded a chunk already read from the
+/// PTY. A pending send means output is lost, even when the client is reading
+/// steadily; it does not by itself establish that the client stopped reading.
+/// This preserves the existing bounded drain policy and its incomplete-output
+/// status while making cancellation outcomes explicit.
 ///
 /// The handles stay borrowed so that a cancelled drain leaves them intact for
 /// the caller to abort.
@@ -717,55 +717,25 @@ async fn drain(tasks: &mut [Pump], is_pty: bool) -> Drained {
             if let Ok(joined) = tokio::time::timeout(DRAIN_GRACE, &mut pump.task).await {
                 joined.unwrap_or(PumpEnd::Failed)
             } else {
-                // Order matters here. `abort` only *requests* cancellation, so
-                // reading the flag first would be sampling a pump that is
-                // still running and can still pick up a chunk — an await that
-                // is immediately ready does not have to yield. Awaiting the
-                // handle is what establishes that the task has stopped; only
-                // then is anything about it a settled fact.
-                pump.task.abort();
-                let joined = (&mut pump.task).await;
-                cutoff(
-                    joined,
-                    pump.holding.load(std::sync::atomic::Ordering::Acquire),
-                )
+                if let Some(cancel) = pump.cancel.take() {
+                    let _ = cancel.send(());
+                }
+                (&mut pump.task).await.unwrap_or(PumpEnd::Failed)
             }
         } else {
             (&mut pump.task).await.unwrap_or(PumpEnd::Failed)
         };
         match end {
-            PumpEnd::Eof => {}
+            PumpEnd::Eof | PumpEnd::CutoffIdle => {}
             PumpEnd::ReadError => result = Drained::Incomplete("read error"),
             PumpEnd::ClientGone => result = Drained::Incomplete("client stopped reading"),
+            PumpEnd::CutoffPending => {
+                result = Drained::Incomplete("output remained buffered at the PTY drain deadline");
+            }
             PumpEnd::Failed => result = Drained::Incomplete("output task failed"),
         }
     }
     result
-}
-
-/// Decide what a pump's ending means once the drain deadline has passed.
-///
-/// `abort` is a request, not a result: Tokio is explicit that an aborted task
-/// may have completed anyway, in which case the handle still yields its value.
-/// That value is the truth and has to win. A pump that returned `ReadError` or
-/// `ClientGone` in the gap between the deadline expiring and the abort landing
-/// has already cleared `holding` on its way out, so deciding from the flag
-/// would read a failed transfer as a clean end of file — and forward the
-/// child's successful status over it, which is the whole thing this path
-/// exists to prevent.
-///
-/// The flag only means anything for a task that really was cancelled, because
-/// only then is there no return value to ask.
-fn cutoff(joined: std::result::Result<PumpEnd, tokio::task::JoinError>, holding: bool) -> PumpEnd {
-    match joined {
-        Ok(end) => end,
-        Err(e) if e.is_panic() => PumpEnd::Failed,
-        // Cancelled mid-handover: that chunk is gone.
-        Err(_) if holding => PumpEnd::ClientGone,
-        // Cancelled parked on the read, owing nothing. Whatever it did send is
-        // already queued ahead of the exit status.
-        Err(_) => PumpEnd::Eof,
-    }
 }
 
 /// How an output pump finished.
@@ -777,6 +747,10 @@ enum PumpEnd {
     ReadError,
     /// Nobody is left to receive the frames.
     ClientGone,
+    /// The PTY drain deadline arrived while waiting for more output.
+    CutoffIdle,
+    /// The PTY drain deadline arrived with a chunk still awaiting delivery.
+    CutoffPending,
     /// The forwarding task itself did not finish.
     Failed,
 }
@@ -840,13 +814,10 @@ impl Drop for SessionStream {
     }
 }
 
-/// One output stream being forwarded, and whether it is mid-handover.
+/// One output stream being forwarded, with a cooperative drain cutoff.
 struct Pump {
     task: tokio::task::JoinHandle<PumpEnd>,
-    /// True exactly while the pump holds a chunk it has read but not yet
-    /// passed on. Only these two states exist at an await point, so aborting
-    /// while it is false cannot lose data.
-    holding: Arc<std::sync::atomic::AtomicBool>,
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// Start forwarding one output stream of the child into frames.
@@ -855,11 +826,10 @@ fn spawn_pump<R: AsyncRead + Unpin + Send + 'static>(
     tx: mpsc::Sender<Frame>,
     wrap: fn(Vec<u8>) -> Frame,
 ) -> Pump {
-    let holding = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flag = Arc::clone(&holding);
+    let (cancel, cancelled) = tokio::sync::oneshot::channel();
     Pump {
-        task: tokio::spawn(pump(src, tx, wrap, flag)),
-        holding,
+        task: tokio::spawn(pump(src, tx, wrap, cancelled)),
+        cancel: Some(cancel),
     }
 }
 
@@ -867,27 +837,31 @@ async fn pump<R: AsyncRead + Unpin>(
     mut src: R,
     tx: mpsc::Sender<Frame>,
     wrap: fn(Vec<u8>) -> Frame,
-    holding: Arc<std::sync::atomic::AtomicBool>,
+    mut cancelled: tokio::sync::oneshot::Receiver<()>,
 ) -> PumpEnd {
-    use std::sync::atomic::Ordering;
-
     let mut buf = vec![0u8; CHUNK];
     loop {
-        match src.read(&mut buf).await {
+        // `read` is cancel-safe. Only this branch can stop without owing a chunk.
+        let read = tokio::select! {
+            biased;
+            _ = &mut cancelled => return PumpEnd::CutoffIdle,
+            read = src.read(&mut buf) => read,
+        };
+        match read {
             Ok(0) => return PumpEnd::Eof,
             Err(_) => return PumpEnd::ReadError,
             Ok(n) => {
                 let Some(chunk) = buf.get(..n) else {
                     return PumpEnd::ReadError;
                 };
-                // Set before the next await and cleared after it, with no
-                // await point in between, so an observer that finds it false
-                // knows the pump is parked on the read and owes nothing.
-                holding.store(true, Ordering::Release);
-                // `send` awaits when the channel is full, which is the
-                // back-pressure that stops a slow client ballooning memory.
-                let sent = tx.send(wrap(chunk.to_vec())).await;
-                holding.store(false, Ordering::Release);
+                // Cancelling a pending send discards this chunk, so the pump
+                // itself reports incomplete output. No shared flag or task
+                // cancellation timing is needed to reconstruct that fact.
+                let sent = tokio::select! {
+                    biased;
+                    _ = &mut cancelled => return PumpEnd::CutoffPending,
+                    sent = tx.send(wrap(chunk.to_vec())) => sent,
+                };
                 if sent.is_err() {
                     return PumpEnd::ClientGone;
                 }
@@ -1165,60 +1139,40 @@ mod tests {
         assert!(authorize_request(&e, &request(None), 1_001).is_err());
     }
 
-    /// A `JoinError` of the cancelled kind, which cannot be constructed
-    /// directly.
-    async fn cancelled_join_error() -> tokio::task::JoinError {
-        let task = tokio::spawn(std::future::pending::<PumpEnd>());
-        task.abort();
-        task.await.unwrap_err()
+    #[tokio::test]
+    async fn pump_cutoff_reports_idle_read_without_losing_queued_output() {
+        let (mut source, reader) = tokio::io::duplex(64);
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut pump = spawn_pump(reader, tx, Frame::Stdout);
+        source.write_all(b"hello").await.unwrap();
+        assert!(matches!(rx.recv().await, Some(Frame::Stdout(data)) if data == b"hello"));
+        pump.cancel.take().unwrap().send(()).unwrap();
+        assert_eq!(pump.task.await.unwrap(), PumpEnd::CutoffIdle);
     }
 
     #[tokio::test]
-    async fn a_pump_that_finished_keeps_its_verdict_past_the_cutoff() {
-        // The race this guards: the drain deadline expires, and the pump
-        // finishes — with a failure — before the abort lands. Tokio then hands
-        // back the value rather than a cancellation, and the pump has already
-        // cleared `holding` on its way out. Deciding from the flag would call
-        // that a clean end of file and forward the child's exit status over a
-        // transfer that failed.
-        let mut task = tokio::spawn(async { PumpEnd::ReadError });
-        // Let it run to completion, then abort anyway, exactly as `drain` does.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        task.abort();
-        let joined = (&mut task).await;
-        assert_eq!(
-            joined.as_ref().ok(),
-            Some(&PumpEnd::ReadError),
-            "aborting a finished task should still yield its value"
-        );
-        assert_eq!(cutoff(joined, false), PumpEnd::ReadError);
-
-        // Same for the other failure a pump can return on its own.
-        let mut task = tokio::spawn(async { PumpEnd::ClientGone });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        task.abort();
-        assert_eq!(cutoff((&mut task).await, false), PumpEnd::ClientGone);
+    async fn pump_cutoff_reports_a_chunk_parked_on_a_full_channel() {
+        let (mut source, reader) = tokio::io::duplex(1);
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send(Frame::Started).await.unwrap();
+        let mut pump = spawn_pump(reader, tx, Frame::Stdout);
+        // With a one-byte pipe, writing the second byte proves the pump read
+        // the first and reached its send to the already-full channel.
+        source.write_all(b"ab").await.unwrap();
+        pump.cancel.take().unwrap().send(()).unwrap();
+        assert_eq!(pump.task.await.unwrap(), PumpEnd::CutoffPending);
     }
 
     #[tokio::test]
-    async fn the_cutoff_reads_the_flag_only_for_a_real_cancellation() {
-        // Genuinely cancelled: the flag is the only evidence there is.
-        assert_eq!(
-            cutoff(Err(cancelled_join_error().await), true),
-            PumpEnd::ClientGone
-        );
-        assert_eq!(
-            cutoff(Err(cancelled_join_error().await), false),
-            PumpEnd::Eof
-        );
+    async fn pump_preserves_eof_and_receiver_loss_results() {
+        let (tx, _rx) = mpsc::channel(1);
+        let pump = spawn_pump(tokio::io::empty(), tx, Frame::Stdout);
+        assert_eq!(pump.task.await.unwrap(), PumpEnd::Eof);
 
-        // A pump that reached the end of its stream is complete even if the
-        // deadline expired first — a PTY nobody is writing to any more.
-        assert_eq!(cutoff(Ok(PumpEnd::Eof), false), PumpEnd::Eof);
-
-        // A panicking pump is never a clean drain, whatever the flag says.
-        let panicked = tokio::spawn(async { panic!("boom") }).await.unwrap_err();
-        assert_eq!(cutoff(Err(panicked), false), PumpEnd::Failed);
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let pump = spawn_pump(&b"output"[..], tx, Frame::Stdout);
+        assert_eq!(pump.task.await.unwrap(), PumpEnd::ClientGone);
     }
 
     #[test]
