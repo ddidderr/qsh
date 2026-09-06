@@ -1778,19 +1778,6 @@ fn several_sessions_share_one_server() {
     }
 }
 
-fn which(program: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|dir| dir.join(program))
-            .find(|p| p.is_file() && is_executable(p))
-    })
-}
-
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-}
-
 #[test]
 fn root_target_login_with_a_different_server_group() {
     use std::os::unix::process::CommandExt;
@@ -1851,4 +1838,17 @@ fn root_target_login_with_a_different_server_group() {
             );
         }
     });
+}
+
+fn which(program: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(program))
+            .find(|p| p.is_file() && is_executable(p))
+    })
+}
+
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
 }
