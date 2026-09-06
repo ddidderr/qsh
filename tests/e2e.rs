@@ -1871,3 +1871,83 @@ fn forced_pty_does_not_interpret_piped_tildes() {
         "{stdout}"
     );
 }
+
+#[test]
+fn forced_pty_with_piped_stdin_relays_sigint() {
+    let f = Fixture::start(&[]);
+    let pidfile = f.tmp.path().join("ready.pid");
+    let child = Command::new(CLIENT_BIN)
+        .args([
+            "-i",
+            f.client_dir.to_str().unwrap(),
+            "-p",
+            &f.port.to_string(),
+            "--accept-new",
+            "-t",
+            "127.0.0.1",
+            "sh",
+            "-c",
+            "trap 'exit 42' INT; echo $$ > \"$1\"; while :; do sleep 1; done",
+            "sh",
+            pidfile.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_pid(&pidfile);
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .unwrap();
+    let out = wait_with_deadline(child, Duration::from_secs(10))
+        .expect("client did not forward SIGINT to the forced PTY");
+    assert_eq!(
+        out.status.code(),
+        Some(42),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn forced_pty_with_piped_stdin_uses_the_output_terminal_size() {
+    let f = Fixture::start(&[]);
+    let sizefile = f.tmp.path().join("terminal-size");
+    let size = nix::pty::Winsize {
+        ws_row: 45,
+        ws_col: 123,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let terminal = nix::pty::openpty(Some(&size), None).unwrap();
+    let out = Command::new(CLIENT_BIN)
+        .args([
+            "-i",
+            f.client_dir.to_str().unwrap(),
+            "-p",
+            &f.port.to_string(),
+            "--accept-new",
+            "-t",
+            "127.0.0.1",
+            "sh",
+            "-c",
+            "stty size > \"$1\"",
+            "sh",
+            sizefile.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(terminal.slave))
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(sizefile).unwrap().trim(), "45 123");
+    drop(terminal.master);
+}
