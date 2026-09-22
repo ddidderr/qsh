@@ -25,10 +25,10 @@ qsh — a small SSH replacement over QUIC
 Usage:
   qsh [options] [user@]host [command [args...]]
   qsh keygen [--days N] [--force]
-  qsh fingerprint
-  qsh known-hosts list
-  qsh known-hosts add <host:port> <sha256:...>
-  qsh known-hosts remove <host:port>
+  qsh fingerprint [-i DIR]
+  qsh known-hosts [-i DIR] list
+  qsh known-hosts [-i DIR] add <host:port> <sha256:...>
+  qsh known-hosts [-i DIR] remove <host:port>
 
 Options:
   -p, --port PORT        Server port (default 2222, UDP)
@@ -36,6 +36,7 @@ Options:
   -i, --identity DIR     Directory holding id.crt and id.key
   -t                     Force a remote terminal
   -T                     Never allocate a remote terminal
+  -n                     Send EOF without reading local stdin
   -E, --setenv K=V       Send an environment variable (TERM, LANG, LC_*, QSH_*)
       --accept-new       Pin an unknown host key without asking
       --refuse-new       Never pin automatically
@@ -84,7 +85,7 @@ fn dispatch(args: Vec<String>) -> Result<i32> {
             Ok(0)
         }
         Some("keygen") => keygen(args.get(1..).unwrap_or_default()).map(|()| 0),
-        Some("fingerprint") => fingerprint().map(|()| 0),
+        Some("fingerprint") => fingerprint(args.get(1..).unwrap_or_default()).map(|()| 0),
         Some("known-hosts") => known_hosts(args.get(1..).unwrap_or_default()).map(|()| 0),
         _ => connect(args),
     }
@@ -152,9 +153,25 @@ fn keygen(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Identity options precede the subcommand's positional arguments.
+fn command_paths(args: &[String]) -> Result<(ClientPaths, &[String])> {
+    if matches!(args.first().map(String::as_str), Some("-i" | "--identity")) {
+        let dir = args.get(1).context("-i needs a directory")?;
+        Ok((
+            ClientPaths::new(PathBuf::from(dir)),
+            args.get(2..).unwrap_or_default(),
+        ))
+    } else {
+        Ok((ClientPaths::discover()?, args))
+    }
+}
+
 /// `qsh fingerprint`
-fn fingerprint() -> Result<()> {
-    let paths = ClientPaths::discover()?;
+fn fingerprint(args: &[String]) -> Result<()> {
+    let (paths, rest) = command_paths(args)?;
+    if !rest.is_empty() {
+        bail!("usage: qsh fingerprint [-i DIR]");
+    }
     let cert = crypto::load_cert(&paths.cert())
         .with_context(|| format!("no identity in {} (run `qsh keygen`)", paths.dir.display()))?;
     println!("{}", Fingerprint::of_cert(&cert)?);
@@ -163,7 +180,7 @@ fn fingerprint() -> Result<()> {
 
 /// `qsh known-hosts ...`
 fn known_hosts(args: &[String]) -> Result<()> {
-    let paths = ClientPaths::discover()?;
+    let (paths, args) = command_paths(args)?;
     let mut kh = KnownHosts::load(&paths.known_hosts())?;
     match args.first().map(String::as_str) {
         None | Some("list") => {
@@ -233,6 +250,7 @@ struct Parsed {
     env: Vec<(String, String)>,
     policy: HostKeyPolicy,
     quiet: bool,
+    no_stdin: bool,
     family: AddressFamily,
     connect_timeout: u64,
 }
@@ -247,6 +265,7 @@ impl Default for Parsed {
             env: Vec::new(),
             policy: HostKeyPolicy::Ask,
             quiet: false,
+            no_stdin: false,
             family: AddressFamily::Any,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT_SECS,
         }
@@ -265,6 +284,7 @@ impl Parsed {
             host_key_policy: self.policy,
             paths_dir: self.identity,
             quiet: self.quiet,
+            no_stdin: self.no_stdin,
             family: self.family,
             connect_timeout_secs: self.connect_timeout,
         }
@@ -326,7 +346,16 @@ fn parse_connect(args: Vec<String>) -> Result<Cli> {
                     .parse()
                     .context("--connect-timeout must be a number of seconds")?;
             }
-            "-v" | "--verbose" | "-C" | "-n" | "-a" | "-x" => {}
+            "-n" => p.no_stdin = true,
+            "-v" | "--verbose" | "-C" | "-a" | "-x" => {}
+            a if a.starts_with('-')
+                && a.len() > 2
+                && a.chars().skip(1).all(|c| {
+                    matches!(c, 't' | 'T' | 'v' | 'q' | 'n' | 'C' | 'a' | 'x' | '4' | '6')
+                }) =>
+            {
+                apply_short_flags(a, &mut p);
+            }
             "-E" | "--setenv" => {
                 let kv = it.next().context("-E needs KEY=VALUE")?;
                 p.env.push(split_kv(&kv)?);
@@ -336,6 +365,9 @@ fn parse_connect(args: Vec<String>) -> Result<Cli> {
             "-o" | "--option" => {
                 let opt = it.next().context("-o needs an option")?;
                 apply_ssh_option(&opt, &mut p.policy);
+            }
+            a if split(a, "-o").is_some() => {
+                apply_ssh_option(&split(a, "-o").unwrap_or_default(), &mut p.policy);
             }
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -362,6 +394,20 @@ fn parse_connect(args: Vec<String>) -> Result<Cli> {
     Ok(Cli {
         opts: p.into_options(host, command),
     })
+}
+
+fn apply_short_flags(flags: &str, p: &mut Parsed) {
+    for c in flags.chars().skip(1) {
+        match c {
+            't' => p.pty = PtyPolicy::Force,
+            'T' => p.pty = PtyPolicy::Never,
+            'q' => p.quiet = true,
+            'n' => p.no_stdin = true,
+            '4' => p.family = AddressFamily::V4,
+            '6' => p.family = AddressFamily::V6,
+            _ => {}
+        }
+    }
 }
 
 /// Understand the handful of `-o` settings that map onto qsh behaviour.
@@ -490,6 +536,25 @@ mod tests {
         assert_eq!(o.host, "h");
         assert_eq!(o.command.unwrap(), vec!["true"]);
         assert_eq!(o.host_key_policy, HostKeyPolicy::Ask);
+    }
+
+    #[test]
+    fn bundled_ssh_flags_and_attached_options_work() {
+        let o = parse(&["-tt", "-vvv", "-qn", "-oStrictHostKeyChecking=yes", "h"]);
+        assert_eq!(o.pty, PtyPolicy::Force);
+        assert_eq!(o.host_key_policy, HostKeyPolicy::Refuse);
+        assert!(o.no_stdin && o.quiet);
+        assert!(!parse(&["h"]).no_stdin);
+        assert!(parse(&["-n", "h"]).no_stdin);
+    }
+
+    #[test]
+    fn identity_options_apply_to_management_commands() {
+        let args = vec!["-i".into(), "dir with spaces".into(), "list".into()];
+        let (paths, rest) = command_paths(&args).unwrap();
+        assert_eq!(paths.dir, PathBuf::from("dir with spaces"));
+        assert_eq!(rest, &["list"]);
+        assert!(command_paths(&["-i".into()]).is_err());
     }
 
     #[test]
