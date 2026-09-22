@@ -232,6 +232,15 @@ idle_timeout_secs = 60      # also how quickly a killed client is cleaned up
 keepalive_secs = 15
 ```
 
+An absent default configuration file uses the built-in defaults. An explicitly
+selected `qsh-server serve --config FILE` must exist and be readable and valid;
+otherwise startup fails.
+
+QUIC uses the smaller of the two peers' idle timeouts. The qsh client currently
+offers 60 seconds, so increasing the server value above 60 does not extend a
+qsh connection's outage tolerance. Lower server values still take effect.
+Keep-alives keep a reachable, otherwise quiet session active.
+
 `/etc/qsh/authorized/<name>.toml`, written by `authorize` and editable by hand:
 
 ```toml
