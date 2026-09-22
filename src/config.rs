@@ -292,12 +292,18 @@ impl AuthStore {
     /// # Errors
     /// Fails only if the directory itself cannot be listed.
     pub fn load(dir: &Path) -> Result<Self> {
+        Self::load_with_warnings(dir, |warning| eprintln!("{warning}"))
+    }
+
+    /// Let a long-running caller deduplicate diagnostics across reloads.
+    pub(crate) fn load_with_warnings(dir: &Path, mut warn: impl FnMut(String)) -> Result<Self> {
         let mut entries = BTreeMap::new();
-        if !dir.exists() {
-            return Ok(Self { entries });
-        }
-        let mut names: Vec<_> = fs::read_dir(dir)
-            .with_context(|| format!("reading {}", dir.display()))?
+        let directory = match fs::read_dir(dir) {
+            Ok(directory) => directory,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self { entries }),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+        };
+        let mut names: Vec<_> = directory
             .collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()
             .map(|e| e.path())
@@ -312,7 +318,7 @@ impl AuthStore {
                 .unwrap_or("?")
                 .to_string();
             let meta_path = cert_path.with_extension("toml");
-            let load = || -> Result<AuthEntry> {
+            let mut load = || -> Result<AuthEntry> {
                 let cert = load_cert(&cert_path)?;
                 let fingerprint = Fingerprint::of_cert(&cert)?;
                 let text = fs::read_to_string(&meta_path)
@@ -335,11 +341,11 @@ impl AuthStore {
                     // upgrade does not lock everyone out, but it cannot be
                     // checked, so say so — rewriting the entry with
                     // `qsh-server authorize` records the key.
-                    None => eprintln!(
+                    None => warn(format!(
                         "qsh-server: warning: {} does not record which key it is for; \
                          re-run `qsh-server authorize` for `{name}` to fix that",
                         meta_path.display()
-                    ),
+                    )),
                 }
                 Ok(AuthEntry {
                     name: name.clone(),
@@ -351,7 +357,9 @@ impl AuthStore {
                 Ok(entry) => {
                     entries.insert(entry.fingerprint, entry);
                 }
-                Err(e) => eprintln!("qsh-server: ignoring authorization `{name}`: {e:#}"),
+                Err(e) => warn(format!(
+                    "qsh-server: ignoring authorization `{name}`: {e:#}"
+                )),
             }
         }
         Ok(Self { entries })
