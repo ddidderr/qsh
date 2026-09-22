@@ -8,7 +8,7 @@
 //! newline translation, no encoding conversion. That is what makes `rsync -e
 //! qsh` work.
 
-use std::io;
+use std::{borrow::Cow, io};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -136,14 +136,20 @@ impl Frame {
         }
     }
 
-    fn payload(&self) -> io::Result<Vec<u8>> {
+    fn payload(&self) -> io::Result<Cow<'_, [u8]>> {
         let out = match self {
-            Frame::Request(r) => postcard::to_stdvec(r).map_err(|e| invalid(e.to_string()))?,
-            Frame::Resize(s) => postcard::to_stdvec(s).map_err(|e| invalid(e.to_string()))?,
-            Frame::Exit(s) => postcard::to_stdvec(s).map_err(|e| invalid(e.to_string()))?,
-            Frame::Signal(s) | Frame::Error(s) => s.as_bytes().to_vec(),
-            Frame::Stdin(b) | Frame::Stdout(b) | Frame::Stderr(b) => b.clone(),
-            Frame::Started | Frame::StdinEof => Vec::new(),
+            Frame::Request(r) => {
+                Cow::Owned(postcard::to_stdvec(r).map_err(|e| invalid(e.to_string()))?)
+            }
+            Frame::Resize(s) => {
+                Cow::Owned(postcard::to_stdvec(s).map_err(|e| invalid(e.to_string()))?)
+            }
+            Frame::Exit(s) => {
+                Cow::Owned(postcard::to_stdvec(s).map_err(|e| invalid(e.to_string()))?)
+            }
+            Frame::Signal(s) | Frame::Error(s) => Cow::Borrowed(s.as_bytes()),
+            Frame::Stdin(b) | Frame::Stdout(b) | Frame::Stderr(b) => Cow::Borrowed(b.as_slice()),
+            Frame::Started | Frame::StdinEof => Cow::Borrowed(&[][..]),
         };
         if out.len() > MAX_FRAME {
             return Err(invalid("frame payload too large"));
@@ -270,6 +276,41 @@ mod tests {
         match roundtrip(Frame::Stdout(payload.clone())).await {
             Frame::Stdout(got) => assert_eq!(got, payload),
             other => panic!("wrong frame: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_payloads_keep_the_wire_format_and_size_limit() {
+        for (tag, frame, payload) in [
+            (kind::STDIN, Frame::Stdin(vec![0, 255]), vec![0, 255]),
+            (kind::STDOUT, Frame::Stdout(vec![0, 255]), vec![0, 255]),
+            (kind::STDERR, Frame::Stderr(vec![0, 255]), vec![0, 255]),
+            (kind::SIGNAL, Frame::Signal("INT".into()), b"INT".to_vec()),
+            (kind::ERROR, Frame::Error("oops".into()), b"oops".to_vec()),
+            (kind::STARTED, Frame::Started, Vec::new()),
+            (kind::STDIN_EOF, Frame::StdinEof, Vec::new()),
+        ] {
+            let mut encoded = Vec::new();
+            write_frame(&mut encoded, &frame).await.unwrap();
+            let mut expected = vec![tag];
+            expected.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            expected.extend_from_slice(&payload);
+            assert_eq!(encoded, expected);
+        }
+        let mut encoded = Vec::new();
+        write_frame(&mut encoded, &Frame::Stdout(vec![0; MAX_FRAME]))
+            .await
+            .unwrap();
+        assert_eq!(encoded.len(), MAX_FRAME + 5);
+        for frame in [
+            Frame::Stdin(vec![0; MAX_FRAME + 1]),
+            Frame::Stdout(vec![0; MAX_FRAME + 1]),
+            Frame::Stderr(vec![0; MAX_FRAME + 1]),
+            Frame::Error("x".repeat(MAX_FRAME + 1)),
+        ] {
+            let mut encoded = Vec::new();
+            assert!(write_frame(&mut encoded, &frame).await.is_err());
+            assert!(encoded.is_empty());
         }
     }
 
