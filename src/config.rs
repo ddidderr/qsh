@@ -232,6 +232,11 @@ pub struct AuthMeta {
     /// presented certificate's own validity window cannot bound access.
     #[serde(default)]
     pub expires_at_unix: Option<i64>,
+    /// Kill all processes remaining in each session cgroup when that session
+    /// ends. This opt-in policy requires a Linux cgroup v2 delegated to the
+    /// root-owned server and a non-root target account.
+    #[serde(default)]
+    pub kill_session_processes: bool,
 }
 
 fn yes() -> bool {
@@ -247,6 +252,7 @@ impl Default for AuthMeta {
             allowed_commands: Vec::new(),
             key_fingerprint: None,
             expires_at_unix: None,
+            kill_session_processes: false,
         }
     }
 }
@@ -656,6 +662,17 @@ mod tests {
         assert!(!meta.is_expired(999));
         assert!(!meta.is_expired(1_000));
         assert!(meta.is_expired(1_001));
+    }
+
+    #[test]
+    fn session_cgroup_policy_is_opt_in_and_round_trips() {
+        let legacy: AuthMeta = toml::from_str("user = 'guest'").unwrap();
+        assert!(!legacy.kill_session_processes);
+        let restricted: AuthMeta =
+            toml::from_str("user = 'guest'\nkill_session_processes = true\n").unwrap();
+        assert!(restricted.kill_session_processes);
+        let encoded = toml::to_string(&restricted).unwrap();
+        assert!(encoded.contains("kill_session_processes = true"));
     }
 
     #[test]

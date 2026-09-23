@@ -91,6 +91,10 @@ struct Authorize {
     /// later presents.
     #[arg(long, value_name = "DAYS")]
     expires_in_days: Option<u32>,
+    /// Kill processes still in this key's session cgroup when each session
+    /// ends. Requires Linux cgroup v2 and a root daemon serving a non-root user.
+    #[arg(long)]
+    kill_session_processes: bool,
     /// Overwrite an existing entry with the same name.
     #[arg(long)]
     force: bool,
@@ -235,7 +239,10 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
     let fp = Fingerprint::of_cert(&cert)?;
 
     // Fail early rather than at first login.
-    qsh::child::resolve_user(&args.user)?;
+    let target = qsh::child::resolve_user(&args.user)?;
+    if args.kill_session_processes && target.uid.is_root() {
+        bail!("--kill-session-processes cannot constrain root; authorize a non-root account");
+    }
 
     let name = args
         .name
@@ -289,6 +296,7 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
         allowed_commands: args.commands.clone(),
         key_fingerprint: Some(fp.to_string()),
         expires_at_unix: expires,
+        kill_session_processes: args.kill_session_processes,
     };
 
     let pem = std::fs::read_to_string(&args.certificate)
@@ -335,6 +343,9 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
     }
     if !meta.allow_exec {
         println!("Remote commands are refused for this key.");
+    }
+    if meta.kill_session_processes {
+        println!("Session descendants are killed at session end (Linux cgroup v2 required).");
     }
     println!("The change takes effect within a second; no restart needed.");
     Ok(())
@@ -385,6 +396,9 @@ fn list(paths: &ServerPaths) -> Result<()> {
                 "commands={}",
                 entry.meta.allowed_commands.join("+")
             ));
+        }
+        if entry.meta.kill_session_processes {
+            notes.push("kill-session-processes".to_owned());
         }
         if let Some(deadline) = entry.meta.expires_at_unix {
             let now = unix_now();
