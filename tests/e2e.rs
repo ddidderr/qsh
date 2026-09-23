@@ -36,7 +36,7 @@ fn process_running(pid: u32) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn wait_for_pid(path: &Path) -> u32 {
+fn wait_for_detached_pid(path: &Path) -> u32 {
     let start = Instant::now();
     loop {
         if let Ok(text) = std::fs::read_to_string(path) {
@@ -1582,7 +1582,7 @@ fn cgroup_policy_kills_detached_descendants_or_fails_before_exec() {
     let ordinary_script = detached_script(&ordinary_marker);
     let (code, _, error) = f.exec(&["sh", "-c", &ordinary_script]);
     assert_eq!(code, 0, "ordinary session failed: {error}");
-    let ordinary_pid = wait_for_pid(&ordinary_marker);
+    let ordinary_pid = wait_for_detached_pid(&ordinary_marker);
     assert!(
         process_running(ordinary_pid),
         "ordinary detached job did not survive"
@@ -1620,7 +1620,7 @@ fn cgroup_policy_kills_detached_descendants_or_fails_before_exec() {
     let (code, _, error) = f.exec(&["sh", "-c", &restricted_script]);
     if cgroup_available {
         assert_eq!(code, 0, "delegated cgroup session failed: {error}");
-        wait_until_gone(wait_for_pid(&restricted_marker));
+        wait_until_gone(wait_for_detached_pid(&restricted_marker));
 
         // This descendant deliberately keeps the stdout pipe open. Killing
         // the cgroup only *after* drain would leave the client waiting for it.
@@ -1640,7 +1640,7 @@ fn cgroup_policy_kills_detached_descendants_or_fails_before_exec() {
             started.elapsed() < Duration::from_secs(5),
             "detached pipe writer held the restricted session open"
         );
-        wait_until_gone(wait_for_pid(&held_marker));
+        wait_until_gone(wait_for_detached_pid(&held_marker));
 
         let disconnect_marker = f.tmp.path().join("disconnected-detached.pid");
         let script = format!("{}; sleep 30", detached_script(&disconnect_marker));
@@ -1662,7 +1662,7 @@ fn cgroup_policy_kills_detached_descendants_or_fails_before_exec() {
                     assert!(start.elapsed() < Duration::from_secs(5));
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                let pid = wait_for_pid(&disconnect_marker);
+                let pid = wait_for_detached_pid(&disconnect_marker);
                 conn.close(0u32.into(), b"test disconnect");
                 pid
             });

@@ -66,7 +66,7 @@ mod linux {
                 let path = root.join(format!("session-{}-{number:016x}", std::process::id()));
                 match fs::create_dir(&path) {
                     Ok(()) => return Self::open_new(path),
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(error) => {
                         return Err(error).with_context(|| format!("creating {}", path.display()));
                     }
