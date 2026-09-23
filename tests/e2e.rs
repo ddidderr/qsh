@@ -1626,7 +1626,7 @@ fn cgroup_policy_kills_detached_descendants_or_fails_before_exec() {
         let updated = if cgroup_available {
             code == 0 && output.trim() == target.uid.as_raw().to_string()
         } else {
-            code != 0 && error.contains("restricted sessions")
+            code != 0 && error.contains("session cgroup")
         };
         if updated {
             break;
