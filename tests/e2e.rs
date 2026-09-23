@@ -24,6 +24,60 @@ use tokio::io::AsyncWriteExt;
 const SERVER_BIN: &str = env!("CARGO_BIN_EXE_qsh-server");
 const CLIENT_BIN: &str = env!("CARGO_BIN_EXE_qsh");
 
+#[cfg(target_os = "linux")]
+fn process_running(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // A killed child can remain a zombie until its adoptive parent reaps it.
+    stat.rsplit_once(") ")
+        .and_then(|(_, tail)| tail.chars().next())
+        .is_some_and(|state| state != 'Z' && state != 'X')
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_detached_pid(path: &Path) -> u32 {
+    let start = Instant::now();
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            return text.trim().parse().unwrap();
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "no detached PID at {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_until_gone(pid: u32, stage: &str) {
+    let start = Instant::now();
+    while process_running(pid) {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{stage}: detached process {pid} is still running; stat={:?}; cgroup={:?}",
+            std::fs::read_to_string(format!("/proc/{pid}/stat")),
+            std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detached_script(marker: &Path) -> String {
+    format!(
+        "setsid sh -c 'trap \"\" HUP TERM; echo $$ > {}; exec sleep 30' \
+         </dev/null >/dev/null 2>&1 & \
+         n=0; while [ ! -s {} ] && [ \"$n\" -lt 100 ]; do sleep .01; n=$((n+1)); done; \
+         test -s {}",
+        marker.display(),
+        marker.display(),
+        marker.display()
+    )
+}
+
 #[test]
 fn explicitly_missing_server_config_fails_before_startup() {
     let dir = tempfile::tempdir().unwrap();
@@ -1498,6 +1552,167 @@ fn an_interactive_session_ends_even_with_a_job_left_on_the_terminal() {
         Some(4),
         "the client never got an exit status past a job left on the terminal: {text}"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one fixture exercises ordinary detach, strict cleanup, and fail-closed setup"
+)]
+fn cgroup_policy_kills_detached_descendants_or_fails_before_exec() {
+    let target = if nix::unistd::Uid::effective().is_root() {
+        nix::unistd::User::from_name("nobody").unwrap().unwrap()
+    } else {
+        nix::unistd::User::from_uid(nix::unistd::Uid::current())
+            .unwrap()
+            .unwrap()
+    };
+    let cgroup_available = qsh::cgroup::SessionCgroup::create(&target).is_ok();
+    if std::env::var_os("QSH_REQUIRE_DELEGATED_CGROUP").is_some() {
+        assert!(
+            cgroup_available,
+            "CI requested the delegated cgroup success path, but cgroup v2 is unavailable"
+        );
+    }
+    let f = Fixture::start(&[]);
+    // Let the non-root account write test markers without making the parent
+    // of the server's configuration directory writable to that account.
+    std::fs::set_permissions(f.tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let markers = f.tmp.path().join("markers");
+    std::fs::create_dir(&markers).unwrap();
+    std::fs::set_permissions(&markers, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    let ordinary_marker = markers.join("ordinary-detached.pid");
+    let ordinary_script = detached_script(&ordinary_marker);
+    let (code, _, error) = f.exec(&["sh", "-c", &ordinary_script]);
+    assert_eq!(code, 0, "ordinary session failed: {error}");
+    let ordinary_pid = wait_for_detached_pid(&ordinary_marker);
+    assert!(
+        process_running(ordinary_pid),
+        "ordinary detached job did not survive"
+    );
+    let killed = Command::new("kill")
+        .args(["-KILL", &ordinary_pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(
+        killed.success(),
+        "could not clean up the ordinary detached job"
+    );
+    wait_until_gone(ordinary_pid, "ordinary job after explicit test cleanup");
+
+    let cert = f.client_dir.join("id.crt");
+    run(
+        SERVER_BIN,
+        &[
+            "--dir",
+            f.server_dir.to_str().unwrap(),
+            "authorize",
+            cert.to_str().unwrap(),
+            "--user",
+            &target.name,
+            "--name",
+            "tester",
+            "--kill-session-processes",
+            "--force",
+        ],
+    );
+    // Authorization reloads periodically. Observe the new policy through the
+    // server instead of guessing when its next reload tick will occur.
+    let reload_start = Instant::now();
+    loop {
+        let (code, output, error) = f.exec(&["id", "-u"]);
+        let updated = if cgroup_available {
+            code == 0 && output.trim() == target.uid.as_raw().to_string()
+        } else {
+            code != 0 && (error.contains("session cgroup") || error.contains("restricted sessions"))
+        };
+        if updated {
+            break;
+        }
+        assert!(
+            reload_start.elapsed() < Duration::from_secs(6),
+            "updated authorization did not take effect: code={code}, stdout={output:?}, stderr={error:?}, server_log={:?}",
+            std::fs::read_to_string(f.tmp.path().join("server.log"))
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let restricted_marker = markers.join("restricted-detached.pid");
+    let restricted_script = detached_script(&restricted_marker);
+    let (code, _, error) = f.exec(&["sh", "-c", &restricted_script]);
+    if cgroup_available {
+        assert_eq!(code, 0, "delegated cgroup session failed: {error}");
+        wait_until_gone(
+            wait_for_detached_pid(&restricted_marker),
+            "restricted job after normal session exit",
+        );
+
+        // This descendant deliberately keeps the stdout pipe open. Killing
+        // the cgroup only *after* drain would leave the client waiting for it.
+        let held_marker = markers.join("held-output.pid");
+        let held_script = format!(
+            "setsid sh -c 'echo $$ > {}; exec sleep 15' & \
+             n=0; while [ ! -s {} ] && [ \"$n\" -lt 100 ]; do sleep .01; n=$((n+1)); done; \
+             test -s {}",
+            held_marker.display(),
+            held_marker.display(),
+            held_marker.display()
+        );
+        let started = Instant::now();
+        let (code, _, error) = f.exec(&["sh", "-c", &held_script]);
+        assert_eq!(code, 0, "restricted pipe session failed: {error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "detached pipe writer held the restricted session open"
+        );
+        wait_until_gone(
+            wait_for_detached_pid(&held_marker),
+            "restricted pipe writer after normal session exit",
+        );
+
+        let disconnect_marker = markers.join("disconnected-detached.pid");
+        let script = format!("{}; sleep 30", detached_script(&disconnect_marker));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let conn = raw_connect(&f.client_dir, f.port).await;
+                let (_send, mut recv) = raw_request(&conn, &["sh", "-c", &script], true)
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    qsh::proto::read_frame(&mut recv).await.unwrap(),
+                    Some(qsh::proto::Frame::Started)
+                ));
+                let start = Instant::now();
+                while !disconnect_marker.exists() {
+                    assert!(start.elapsed() < Duration::from_secs(5));
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                let pid = wait_for_detached_pid(&disconnect_marker);
+                conn.close(0u32.into(), b"test disconnect");
+                // Keep Quinn's endpoint driver running until the peer has
+                // observed the close. Dropping this single-thread runtime
+                // immediately can discard the close packet before it is sent.
+                tokio::task::spawn_blocking(move || {
+                    wait_until_gone(pid, "restricted job after disconnect");
+                })
+                .await
+                .unwrap();
+            });
+    } else {
+        assert_ne!(
+            code, 0,
+            "a restricted session ran without usable cgroup support"
+        );
+        assert!(
+            !restricted_marker.exists(),
+            "the command ran before cgroup setup failed"
+        );
+    }
 }
 
 #[test]

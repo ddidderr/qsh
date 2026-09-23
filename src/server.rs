@@ -16,6 +16,7 @@ use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+use crate::cgroup::SessionCgroup;
 use crate::child::{self, ChildIo, Spawned};
 use crate::config::{AuthEntry, AuthStore, ServerConfig, ServerPaths};
 use crate::crypto::{self, AuthorizedClientVerifier, Fingerprint};
@@ -599,21 +600,25 @@ async fn handle_session(
         authorize_request(&entry, &req, unix_now())?;
         let grant = RequestGrant::from_request(&req)?;
         let authorized_user = entry.meta.user;
+        let restricted = entry.meta.kill_session_processes;
         let lookup_name = authorized_user.clone();
 
-        // Account and supplementary-group lookups can block on NSS (LDAP or
-        // SSSD). Neither the authorization lock nor a Tokio worker may wait on
-        // them: both are shared by every connection and policy reload.
-        let (user, identity) = tokio::task::spawn_blocking(move || {
+        // Account/group lookups and cgroup setup can block. No authorization
+        // lock or Tokio worker waits on them, and no child is spawned inside
+        // this cancellation-prone blocking task.
+        let (user, identity, cgroup) = tokio::task::spawn_blocking(move || {
             let user = child::resolve_user(&lookup_name)?;
             let identity = child::prepare_identity(&user)?;
-            Ok::<_, anyhow::Error>((user, identity))
+            let cgroup = restricted
+                .then(|| SessionCgroup::create(&user))
+                .transpose()?;
+            Ok::<_, anyhow::Error>((user, identity, cgroup))
         })
         .await
-        .context("preparing the authorized local account")??;
+        .context("preparing the authorized local account and session cgroup")??;
 
-        // Recheck after slow preparation. A changed target account must use a
-        // fresh identity lookup; a withdrawn or narrowed grant must not spawn.
+        // Recheck after slow preparation. A changed user or cleanup policy
+        // needs fresh preparation; a withdrawn or narrowed grant cannot spawn.
         let current = crate::sync::read(&store);
         let entry = current
             .lookup(&fingerprint)
@@ -622,19 +627,24 @@ async fn handle_session(
         if entry.meta.user != authorized_user {
             bail!("client authorization changed its target user");
         }
+        if entry.meta.kill_session_processes != restricted {
+            bail!("client authorization changed its session cleanup policy");
+        }
         drop(current);
 
         // The periodic session check handles a policy change racing this
         // final check. Do not hold the shared store lock over fork/exec.
         Ok::<_, anyhow::Error>((
-            child::spawn_prepared(&user, &req, identity)?,
+            child::spawn_prepared(&user, &req, identity, cgroup.as_ref())?,
+            cgroup,
             authorized_user,
             grant,
+            restricted,
         ))
     }
     .await;
 
-    let (spawned, authorized_user, grant) = match start {
+    let (spawned, cgroup, authorized_user, grant, restricted) = match start {
         Ok(s) => s,
         Err(e) => {
             // Report the refusal in-band so the client can print it, then end
@@ -663,8 +673,9 @@ async fn handle_session(
         fingerprint,
         grant,
         authorized_user,
+        restricted,
     };
-    run_session(send, recv, conn, authorization, spawned).await
+    run_session(send, recv, conn, authorization, spawned, cgroup).await
 }
 
 /// Diagnostics can contain client-supplied request fields. Keep each message
@@ -693,6 +704,7 @@ struct LiveAuthorization {
     fingerprint: Fingerprint,
     grant: RequestGrant,
     authorized_user: String,
+    restricted: bool,
 }
 
 impl RequestGrant {
@@ -712,6 +724,7 @@ fn request_still_authorized(auth: &LiveAuthorization) -> bool {
     let current = crate::sync::read(&auth.store);
     current.lookup(&auth.fingerprint).is_some_and(|entry| {
         entry.meta.user == auth.authorized_user
+            && entry.meta.kill_session_processes == auth.restricted
             && !entry.meta.is_expired(unix_now())
             && match &auth.grant {
                 RequestGrant::Shell => entry.meta.allow_shell,
@@ -728,7 +741,7 @@ fn request_still_authorized(auth: &LiveAuthorization) -> bool {
     })
 }
 
-/// Kills the remote process group if the session goes away.
+/// Kills the remote job if the session goes away.
 ///
 /// Tokio deliberately leaves a child running when its handle is dropped, so
 /// without this a client that is killed — or a server that is shutting down —
@@ -736,18 +749,23 @@ fn request_still_authorized(auth: &LiveAuthorization) -> bool {
 /// including task cancellation, which is the one path an `async` cleanup step
 /// could never cover.
 ///
-/// Its reach is the session's initial process group. PTY job control can put
-/// foreground or background work in a different group; `setsid` does likewise.
-/// Closing the PTY sends a hangup to its foreground group, but an ignoring
-/// process can survive. Full containment requires a session cgroup or a
-/// different job-control policy.
+/// Ordinary sessions guard the initial process group. For keys that opt into
+/// strict cleanup, the child joins a private cgroup before exec and the guard
+/// kills that entire cgroup on every ending, including a successful one.
 struct ProcessGroupGuard {
     pid: Option<u32>,
+    cgroup: Option<SessionCgroup>,
 }
 
 impl ProcessGroupGuard {
     fn new(pid: Option<u32>) -> Self {
-        Self { pid }
+        Self { pid, cgroup: None }
+    }
+
+    fn with_cgroup(pid: Option<u32>, cgroup: Option<SessionCgroup>) -> Self {
+        let mut guard = Self::new(pid);
+        guard.cgroup = cgroup;
+        guard
     }
 
     /// Stop guarding the group.
@@ -759,12 +777,52 @@ impl ProcessGroupGuard {
         self.pid = None;
     }
 
+    /// A successful session is still an ending for a restricted cgroup: any
+    /// detached descendants must die before we report completion.
+    fn complete(&mut self) -> Result<()> {
+        self.kill_restricted()?;
+        self.disarm();
+        Ok(())
+    }
+
+    fn kill_restricted(&mut self) -> Result<()> {
+        if let Some(cgroup) = &mut self.cgroup {
+            cgroup.kill()?;
+            self.disarm();
+        }
+        Ok(())
+    }
+
+    async fn clean_cgroup(&mut self) -> Result<()> {
+        if let Some(cgroup) = &mut self.cgroup {
+            cgroup.remove_empty().await?;
+        }
+        Ok(())
+    }
+
     /// Ask the job to go away, escalating if it will not.
     ///
     /// The pid stays in place across both grace periods. Taking it up front
     /// would disarm the guard while this spends time awaiting, so a daemon
     /// shutdown could leave a job that ignores `SIGHUP` and `SIGTERM` behind.
-    async fn terminate(&mut self) {
+    async fn terminate(&mut self) -> Result<()> {
+        if let Some(cgroup) = &mut self.cgroup {
+            match cgroup.kill() {
+                Ok(()) => {
+                    self.disarm();
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.terminate_group().await;
+                    return Err(error);
+                }
+            }
+        }
+        self.terminate_group().await;
+        Ok(())
+    }
+
+    async fn terminate_group(&mut self) {
         let Some(pid) = self.pid else { return };
         child::signal_process_group(pid, libc::SIGHUP);
         // Keep the leader waitable so its PID/PGID cannot be reused. Its exit
@@ -828,11 +886,12 @@ async fn run_session(
     conn: quinn::Connection,
     authorization: LiveAuthorization,
     spawned: Spawned,
+    cgroup: Option<SessionCgroup>,
 ) -> Result<()> {
     let Spawned { mut child, io } = spawned;
     let pid = child.id();
     // Armed before anything that can fail, so no error path can leak the job.
-    let mut guard = ProcessGroupGuard::new(pid);
+    let mut guard = ProcessGroupGuard::with_cgroup(pid, cgroup);
 
     let (tx, mut rx) = mpsc::channel::<Frame>(64);
 
@@ -849,8 +908,10 @@ async fn run_session(
     }));
 
     if tx.send(Frame::Started).await.is_err() {
-        guard.terminate().await;
+        let stopped = guard.terminate().await;
         let _ = child.wait().await;
+        stopped?;
+        guard.clean_cgroup().await?;
         bail!("client closed the session before it started");
     }
 
@@ -864,8 +925,10 @@ async fn run_session(
                 Ok(fd) => Some(fd),
                 Err(e) => {
                     writer.abort();
-                    guard.terminate().await;
+                    let stopped = guard.terminate().await;
                     let _ = child.wait().await;
+                    stopped?;
+                    guard.clean_cgroup().await?;
                     return Err(e).context("duplicating PTY descriptor for resize");
                 }
             };
@@ -930,6 +993,15 @@ async fn run_session(
         return abandon(&mut guard, &mut child, outputs).await;
     }
 
+    // In strict mode, descendants must die as soon as the leader exits.
+    // Waiting for pipe EOF first would hang forever if a detached descendant
+    // keeps stdout open, and would never reach the cgroup cleanup below.
+    if let Err(error) = guard.kill_restricted() {
+        let _ = guard.terminate().await;
+        let _ = child.wait().await;
+        return Err(error);
+    }
+
     // The leader is gone, but its descendants may still hold the output open.
     // Drain with disconnect and policy watches still running. Pin the drain
     // future so a timer tick never restarts a partly completed drain.
@@ -968,11 +1040,16 @@ async fn run_session(
 
     let exit = match drained {
         Drained::Fully => {
-            // Everything the session produced has been delivered, so nothing
-            // left in the group is attached to it any more: whatever survives
-            // has deliberately detached, and killing it would be wrong.
-            guard.disarm();
+            // Everything produced before exit has been delivered. Ordinary
+            // sessions permit deliberately detached work; restricted sessions
+            // have already killed their cgroup before output drain.
+            if let Err(error) = guard.complete() {
+                let _ = guard.terminate().await;
+                let _ = child.wait().await;
+                return Err(error);
+            }
             let status = child.wait().await.context("reaping the remote process")?;
+            guard.clean_cgroup().await?;
             ExitStatus {
                 code: status.code().unwrap_or(0),
                 signal: status.signal(),
@@ -998,8 +1075,10 @@ async fn run_session(
 
     // Kill the job before trying to talk to a peer that may never answer.
     if matches!(drained, Drained::Incomplete(_)) {
-        guard.terminate().await;
+        let stopped = guard.terminate().await;
         let _ = child.wait().await;
+        stopped?;
+        guard.clean_cgroup().await?;
     }
 
     let _ = tokio::time::timeout(SHUTDOWN_GRACE, tx.send(Frame::Exit(exit))).await;
@@ -1034,8 +1113,10 @@ async fn abandon(
     }
     // Reap only after the last signal; otherwise this PID can be recycled
     // while a descendant still holds output or the guard is escalating.
-    guard.terminate().await;
+    let stopped = guard.terminate().await;
     let _ = child.wait().await;
+    stopped?;
+    guard.clean_cgroup().await?;
     Ok(())
 }
 
@@ -1513,6 +1594,7 @@ mod tests {
             allowed_commands: vec!["rsync".into()],
             key_fingerprint: None,
             expires_at_unix: None,
+            kill_session_processes: false,
         });
         assert!(authorize_request(&e, &request(None), 0).is_err());
         assert!(authorize_request(&e, &request(Some(&["rsync", "--server"])), 0).is_ok());
@@ -1528,6 +1610,7 @@ mod tests {
             allowed_commands: vec![],
             key_fingerprint: None,
             expires_at_unix: None,
+            kill_session_processes: false,
         });
         assert!(authorize_request(&e, &request(None), 0).is_ok());
         assert!(authorize_request(&e, &request(Some(&["ls"])), 0).is_err());
@@ -1551,6 +1634,35 @@ mod tests {
             ..Default::default()
         });
         assert!(authorize_request(&e, &request(Some(&[])), 0).is_err());
+    }
+
+    #[test]
+    fn changing_cgroup_policy_ends_an_existing_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pem, _) = crypto::generate_identity("client", &["client".into()], 30).unwrap();
+        std::fs::write(dir.path().join("client.crt"), &pem).unwrap();
+        let fingerprint = Fingerprint::of_cert(&crypto::cert_from_pem(&pem).unwrap()).unwrap();
+        let mut meta = AuthMeta {
+            user: "guest".into(),
+            key_fingerprint: Some(fingerprint.to_string()),
+            ..Default::default()
+        };
+        let policy = dir.path().join("client.toml");
+        std::fs::write(&policy, toml::to_string(&meta).unwrap()).unwrap();
+        let store = Arc::new(RwLock::new(AuthStore::load(dir.path()).unwrap()));
+        let live = LiveAuthorization {
+            store: Arc::clone(&store),
+            fingerprint,
+            grant: RequestGrant::Exec("true".into()),
+            authorized_user: "guest".into(),
+            restricted: false,
+        };
+        assert!(request_still_authorized(&live));
+
+        meta.kill_session_processes = true;
+        std::fs::write(&policy, toml::to_string(&meta).unwrap()).unwrap();
+        *crate::sync::write(&store) = AuthStore::load(dir.path()).unwrap();
+        assert!(!request_still_authorized(&live));
     }
 
     /// Start a job that ignores the polite signals, in its own process group.
@@ -1599,7 +1711,7 @@ mod tests {
 
         // Cancel the guard mid-escalation, exactly as a daemon shutdown would.
         let task = tokio::spawn(async move {
-            ProcessGroupGuard::new(Some(pid)).terminate().await;
+            ProcessGroupGuard::new(Some(pid)).terminate().await.unwrap();
         });
         tokio::time::sleep(Duration::from_millis(200)).await;
         task.abort();
@@ -1620,7 +1732,7 @@ mod tests {
         let (mut child, pid, _stdin) = stubborn_job().await;
         let mut guard = ProcessGroupGuard::new(Some(pid));
         let started = tokio::time::Instant::now();
-        guard.terminate().await;
+        guard.terminate().await.unwrap();
         let _ = child.wait().await;
         assert!(!child::process_group_alive(pid));
         // It should have taken both grace periods to get there.
@@ -1676,7 +1788,7 @@ mod tests {
 
         let mut guard = ProcessGroupGuard::new(Some(pid));
         let started = tokio::time::Instant::now();
-        guard.terminate().await;
+        guard.terminate().await.unwrap();
         let _ = child.wait().await;
         tokio::time::timeout(Duration::from_secs(5), stdout.read_to_end(&mut output))
             .await
