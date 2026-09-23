@@ -67,6 +67,10 @@ struct Keygen {
 }
 
 #[derive(Args)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "these are independent Clap switches, not program state"
+)]
 struct Authorize {
     /// The client's `id.crt`.
     certificate: PathBuf,
