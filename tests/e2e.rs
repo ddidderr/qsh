@@ -694,7 +694,9 @@ fn child_stdin_closing_does_not_discard_output_or_exit_status() {
 
         assert_eq!(status, 42, "the signal was not delivered after EPIPE");
         assert_eq!(stdout, b"after-broken-pipe");
-        assert_eq!(stderr, b"stderr-marker");
+        // The shell may also report that its `sleep` child received USR1;
+        // the trap's output must still arrive after the broken stdin write.
+        assert!(stderr.ends_with(b"stderr-marker"), "{stderr:?}");
     });
 }
 
