@@ -591,16 +591,48 @@ async fn handle_session(
         None => return Ok(()),
     };
 
-    let start = (|| -> Result<(Spawned, String, RequestGrant)> {
+    let start = async {
+        let entry = crate::sync::read(&store)
+            .lookup(&fingerprint)
+            .cloned()
+            .ok_or_else(|| anyhow!("client authorization was withdrawn"))?;
+        authorize_request(&entry, &req, unix_now())?;
+        let grant = RequestGrant::from_request(&req)?;
+        let authorized_user = entry.meta.user;
+        let lookup_name = authorized_user.clone();
+
+        // Account and supplementary-group lookups can block on NSS (LDAP or
+        // SSSD). Neither the authorization lock nor a Tokio worker may wait on
+        // them: both are shared by every connection and policy reload.
+        let (user, identity) = tokio::task::spawn_blocking(move || {
+            let user = child::resolve_user(&lookup_name)?;
+            let identity = child::prepare_identity(&user)?;
+            Ok::<_, anyhow::Error>((user, identity))
+        })
+        .await
+        .context("preparing the authorized local account")??;
+
+        // Recheck after slow preparation. A changed target account must use a
+        // fresh identity lookup; a withdrawn or narrowed grant must not spawn.
         let current = crate::sync::read(&store);
         let entry = current
             .lookup(&fingerprint)
             .ok_or_else(|| anyhow!("client authorization was withdrawn"))?;
         authorize_request(entry, &req, unix_now())?;
-        let grant = RequestGrant::from_request(&req)?;
-        let user = child::resolve_user(&entry.meta.user)?;
-        Ok((child::spawn(&user, &req)?, entry.meta.user.clone(), grant))
-    })();
+        if entry.meta.user != authorized_user {
+            bail!("client authorization changed its target user");
+        }
+        drop(current);
+
+        // The periodic session check handles a policy change racing this
+        // final check. Do not hold the shared store lock over fork/exec.
+        Ok::<_, anyhow::Error>((
+            child::spawn_prepared(&user, &req, identity)?,
+            authorized_user,
+            grant,
+        ))
+    }
+    .await;
 
     let (spawned, authorized_user, grant) = match start {
         Ok(s) => s,
@@ -730,25 +762,17 @@ impl ProcessGroupGuard {
     /// Ask the job to go away, escalating if it will not.
     ///
     /// The pid stays in place across both grace periods. Taking it up front
-    /// would disarm the guard for the several seconds this spends awaiting,
-    /// and a cancellation in that window — daemon shutdown, say — would then
-    /// drop the child handle without killing anything, which is precisely the
-    /// case a job that ignores `SIGHUP` and `SIGTERM` survives.
+    /// would disarm the guard while this spends time awaiting, so a daemon
+    /// shutdown could leave a job that ignores `SIGHUP` and `SIGTERM` behind.
     async fn terminate(&mut self) {
         let Some(pid) = self.pid else { return };
-        for sig in [libc::SIGHUP, libc::SIGTERM] {
-            child::signal_process_group(pid, sig);
-            // Keep the leader waitable so its PID cannot be reused. Once it
-            // exits, kill any stragglers still in its process group.
-            if matches!(
-                tokio::time::timeout(TERMINATE_GRACE, wait_for_leader_exit(Some(pid))).await,
-                Ok(Ok(()))
-            ) {
-                child::signal_process_group(pid, libc::SIGKILL);
-                self.pid = None;
-                return;
-            }
-        }
+        child::signal_process_group(pid, libc::SIGHUP);
+        // Keep the leader waitable so its PID/PGID cannot be reused. Its exit
+        // does not prove that the rest of the group has exited: a descendant
+        // may still need time to handle SIGTERM and clean up.
+        let _ = tokio::time::timeout(TERMINATE_GRACE, wait_for_leader_exit(Some(pid))).await;
+        child::signal_process_group(pid, libc::SIGTERM);
+        tokio::time::sleep(TERMINATE_GRACE).await;
         child::signal_process_group(pid, libc::SIGKILL);
         self.pid = None;
     }
@@ -1252,8 +1276,10 @@ async fn control_loop(
         match read_frame(&mut recv).await {
             Ok(Some(Frame::Stdin(data))) => {
                 if let Some(sink) = stdin_sink.as_mut() {
-                    if !write_stdin_or_peer_closed(&mut recv, sink.as_mut(), &data).await {
-                        break;
+                    match write_stdin_or_peer_closed(&mut recv, sink.as_mut(), &data).await {
+                        StdinWrite::Written => {}
+                        StdinWrite::SinkClosed => stdin_sink = None,
+                        StdinWrite::PeerGone => break,
                     }
                 }
             }
@@ -1273,15 +1299,24 @@ async fn control_loop(
                     // harmless when the queue was already empty: the reader
                     // has stopped by then.
                     if let Some(sink) = stdin_sink.as_mut() {
-                        if !write_stdin_or_peer_closed(&mut recv, sink.as_mut(), &[EOT, EOT]).await
+                        match write_stdin_or_peer_closed(&mut recv, sink.as_mut(), &[EOT, EOT])
+                            .await
                         {
-                            break;
-                        }
-                        tokio::select! {
-                            _ = recv.received_reset() => break,
-                            result = sink.flush() => {
-                                if result.is_err() { break; }
+                            StdinWrite::Written => {
+                                let flushed = tokio::select! {
+                                    _ = recv.received_reset() => StdinWrite::PeerGone,
+                                    result = sink.flush() => {
+                                        if result.is_ok() { StdinWrite::Written } else { StdinWrite::SinkClosed }
+                                    }
+                                };
+                                match flushed {
+                                    StdinWrite::Written => {}
+                                    StdinWrite::SinkClosed => stdin_sink = None,
+                                    StdinWrite::PeerGone => break,
+                                }
                             }
+                            StdinWrite::SinkClosed => stdin_sink = None,
+                            StdinWrite::PeerGone => break,
                         }
                     }
                 } else {
@@ -1310,14 +1345,24 @@ async fn control_loop(
 
 /// Child stdin can block forever when the program stops reading. A peer reset
 /// or FIN must still end the control task so the session guard can clean up.
+/// A closed child stdin is different: keep consuming client frames so stdout
+/// and the child's exit status can still be delivered.
+enum StdinWrite {
+    Written,
+    SinkClosed,
+    PeerGone,
+}
+
 async fn write_stdin_or_peer_closed(
     recv: &mut quinn::RecvStream,
     sink: &mut (dyn AsyncWrite + Unpin + Send),
     data: &[u8],
-) -> bool {
+) -> StdinWrite {
     tokio::select! {
-        _ = recv.received_reset() => false,
-        result = sink.write_all(data) => result.is_ok(),
+        _ = recv.received_reset() => StdinWrite::PeerGone,
+        result = sink.write_all(data) => {
+            if result.is_ok() { StdinWrite::Written } else { StdinWrite::SinkClosed }
+        },
     }
 }
 
@@ -1583,11 +1628,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminate_returns_promptly_for_a_job_that_takes_the_hint() {
-        // Observing without reaping lets termination return promptly while
-        // reserving the PID through its final group signal.
-        let mut cmd = tokio::process::Command::new("sleep");
-        cmd.arg("60");
+    async fn terminate_gives_descendants_time_after_the_leader_exits() {
+        // The leader exits on HUP, but a member of the same group ignores HUP
+        // and writes a cleanup marker when TERM arrives. An immediate KILL
+        // after observing leader exit would prevent that cleanup.
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(
+            "trap 'exit 0' HUP; \
+             sh -c 'trap \"\" HUP; trap \"echo cleaned; exit 0\" TERM; \
+             echo child-ready; while :; do sleep 60; done' & \
+             echo parent-ready; read line",
+        );
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
         // SAFETY: setsid is async-signal-safe; mirrors what child::spawn does.
         #[allow(unsafe_code, reason = "the test needs its own process group")]
         unsafe {
@@ -1600,19 +1654,40 @@ mod tests {
         }
         let mut child = cmd.spawn().unwrap();
         let pid = child.id().unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _stdin = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut output = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !output
+                .windows(b"parent-ready".len())
+                .any(|w| w == b"parent-ready")
+                || !output
+                    .windows(b"child-ready".len())
+                    .any(|w| w == b"child-ready")
+            {
+                let mut buf = [0u8; 64];
+                let n = stdout.read(&mut buf).await.unwrap();
+                assert!(n > 0, "the test job closed stdout before it was ready");
+                output.extend_from_slice(&buf[..n]);
+            }
+        })
+        .await
+        .expect("the test job did not become ready");
 
         let mut guard = ProcessGroupGuard::new(Some(pid));
         let started = tokio::time::Instant::now();
         guard.terminate().await;
         let _ = child.wait().await;
-        let elapsed = started.elapsed();
-
-        assert!(!child::process_group_alive(pid));
+        tokio::time::timeout(Duration::from_secs(5), stdout.read_to_end(&mut output))
+            .await
+            .expect("the process group kept stdout open")
+            .unwrap();
         assert!(
-            elapsed < TERMINATE_GRACE,
-            "SIGHUP should have been enough, but termination took {elapsed:?}"
+            output.windows(b"cleaned".len()).any(|w| w == b"cleaned"),
+            "the descendant got no TERM cleanup time: {}",
+            String::from_utf8_lossy(&output)
         );
+        assert!(started.elapsed() >= TERMINATE_GRACE);
     }
 
     #[test]

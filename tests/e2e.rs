@@ -637,6 +637,68 @@ fn binary_data_survives_a_round_trip() {
 }
 
 #[test]
+fn child_stdin_closing_does_not_discard_output_or_exit_status() {
+    let f = Fixture::start(&[]);
+    let ready = f.tmp.path().join("child-closed-stdin");
+    let script = "trap 'printf after-broken-pipe; printf stderr-marker >&2; exit 42' USR1; \
+                  exec 0<&-; printf ready > \"$1\"; sleep 8; exit 99";
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let conn = raw_connect(&f.client_dir, f.port).await;
+        let (mut send, mut recv) = raw_request(
+            &conn,
+            &["sh", "-c", script, "sh", ready.to_str().unwrap()],
+            false,
+        )
+        .await
+        .expect("opening the session");
+        wait_for_started(&mut recv).await;
+
+        // The marker is written only after the child closes fd 0. Sending a
+        // Stdin frame after this point guarantees a broken child pipe, then
+        // the Signal frame tests that control input is still handled.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the child never closed stdin");
+        qsh::proto::write_frame(&mut send, &qsh::proto::Frame::Stdin(vec![b'x'; 64 * 1024]))
+            .await
+            .unwrap();
+        qsh::proto::write_frame(&mut send, &qsh::proto::Frame::Signal("USR1".into()))
+            .await
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match qsh::proto::read_frame(&mut recv).await {
+                    Ok(Some(qsh::proto::Frame::Stdout(bytes))) => stdout.extend(bytes),
+                    Ok(Some(qsh::proto::Frame::Stderr(bytes))) => stderr.extend(bytes),
+                    Ok(Some(qsh::proto::Frame::Exit(exit))) => break exit.wait_status(),
+                    Ok(Some(qsh::proto::Frame::Error(error))) => panic!("{error}"),
+                    Ok(Some(other)) => panic!("unexpected frame: {other:?}"),
+                    Ok(None) | Err(_) => panic!("session ended without an exit status"),
+                }
+            }
+        })
+        .await
+        .expect("closed child stdin stopped the control stream");
+
+        assert_eq!(status, 42, "the signal was not delivered after EPIPE");
+        assert_eq!(stdout, b"after-broken-pipe");
+        assert_eq!(stderr, b"stderr-marker");
+    });
+}
+
+#[test]
 fn environment_is_controlled_by_the_server() {
     let f = Fixture::start(&[]);
     let (_, out, _) = f.exec(&["sh", "-c", "echo \"${LD_PRELOAD:-none}\""]);

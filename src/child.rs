@@ -141,6 +141,33 @@ fn needs_identity_switch(user: &User) -> Result<bool> {
     Ok(must_switch)
 }
 
+/// The identity information that may require NSS lookups. Resolve this before
+/// taking the server's short-lived authorization lock for the final check.
+#[derive(Debug)]
+pub(crate) struct PreparedIdentity {
+    switch: bool,
+    groups: Vec<libc::gid_t>,
+}
+
+/// Resolve the target's supplementary groups before spawning a child.
+///
+/// # Errors
+/// Fails if the daemon cannot assume the target identity or group lookup fails.
+pub(crate) fn prepare_identity(user: &User) -> Result<PreparedIdentity> {
+    let switch = needs_identity_switch(user)?;
+    let username = CString::new(user.name.as_str()).context("user name contains a NUL byte")?;
+    let groups = if switch {
+        nix::unistd::getgrouplist(&username, user.gid)
+            .with_context(|| format!("looking up the groups of `{}`", user.name))?
+            .into_iter()
+            .map(Gid::as_raw)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(PreparedIdentity { switch, groups })
+}
+
 /// Start the process described by `req` as `user`.
 ///
 /// When the server does not run as root, `user` must be the account the
@@ -149,9 +176,22 @@ fn needs_identity_switch(user: &User) -> Result<bool> {
 /// # Errors
 /// Fails if the target user cannot be assumed, a PTY cannot be allocated, or
 /// the program cannot be executed.
-#[allow(unsafe_code, reason = "pre_exec runs between fork and exec")]
 pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
-    let must_switch = needs_identity_switch(user)?;
+    spawn_prepared(user, req, prepare_identity(user)?)
+}
+
+/// Spawn using identity data that was resolved before the final authorization
+/// check. The caller must not use this for another account.
+///
+/// # Errors
+/// Fails if a PTY cannot be allocated or the program cannot be executed.
+#[allow(unsafe_code, reason = "pre_exec runs between fork and exec")]
+pub(crate) fn spawn_prepared(
+    user: &User,
+    req: &Request,
+    identity: PreparedIdentity,
+) -> Result<Spawned> {
+    let PreparedIdentity { switch, groups } = identity;
 
     let home = home_of(user);
     let shell = shell_of(user);
@@ -191,28 +231,10 @@ pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
         }
     }
 
-    // Everything the pre-exec hook needs, resolved *before* the fork.
-    //
-    // The supplementary groups in particular: `initgroups` goes through NSS,
-    // which may load modules, allocate and take locks — none of it
-    // async-signal-safe. In a forked child of a multi-threaded process (which
-    // a tokio server always is) a lock held by another thread at fork time
-    // stays locked forever, so calling it after the fork can hang logins
-    // outright on an LDAP or SSSD host. Resolve the list here and apply the
-    // finished numbers with a bare `setgroups` in the child.
-    let username = CString::new(user.name.as_str()).context("user name contains a NUL byte")?;
+    // All NSS/group lookups have already finished before the fork. In the
+    // child the pre-exec hook only applies the resolved numeric identities.
     let uid = user.uid.as_raw();
     let gid = user.gid.as_raw();
-    let switch = must_switch;
-    let groups: Vec<libc::gid_t> = if must_switch {
-        nix::unistd::getgrouplist(&username, user.gid)
-            .with_context(|| format!("looking up the groups of `{}`", user.name))?
-            .into_iter()
-            .map(Gid::as_raw)
-            .collect()
-    } else {
-        Vec::new()
-    };
 
     let master = if let Some(p) = &req.pty {
         let (master, slave) = pty::open(p.size)?;
