@@ -52,12 +52,14 @@ fn wait_for_detached_pid(path: &Path) -> u32 {
 }
 
 #[cfg(target_os = "linux")]
-fn wait_until_gone(pid: u32) {
+fn wait_until_gone(pid: u32, stage: &str) {
     let start = Instant::now();
     while process_running(pid) {
         assert!(
             start.elapsed() < Duration::from_secs(5),
-            "detached process {pid} survived its restricted session"
+            "{stage}: detached process {pid} is still running; stat={:?}; cgroup={:?}",
+            std::fs::read_to_string(format!("/proc/{pid}/stat")),
+            std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -1574,11 +1576,14 @@ fn cgroup_policy_kills_detached_descendants_or_fails_before_exec() {
         );
     }
     let f = Fixture::start(&[]);
-    // The temporary directory is private by default. The non-root account
-    // needs to create only the marker used by this test, not server state.
-    std::fs::set_permissions(f.tmp.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    // Let the non-root account write test markers without making the parent
+    // of the server's configuration directory writable to that account.
+    std::fs::set_permissions(f.tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let markers = f.tmp.path().join("markers");
+    std::fs::create_dir(&markers).unwrap();
+    std::fs::set_permissions(&markers, std::fs::Permissions::from_mode(0o777)).unwrap();
 
-    let ordinary_marker = f.tmp.path().join("ordinary-detached.pid");
+    let ordinary_marker = markers.join("ordinary-detached.pid");
     let ordinary_script = detached_script(&ordinary_marker);
     let (code, _, error) = f.exec(&["sh", "-c", &ordinary_script]);
     assert_eq!(code, 0, "ordinary session failed: {error}");
@@ -1595,7 +1600,7 @@ fn cgroup_policy_kills_detached_descendants_or_fails_before_exec() {
         killed.success(),
         "could not clean up the ordinary detached job"
     );
-    wait_until_gone(ordinary_pid);
+    wait_until_gone(ordinary_pid, "ordinary job after explicit test cleanup");
 
     let cert = f.client_dir.join("id.crt");
     run(
@@ -1613,18 +1618,40 @@ fn cgroup_policy_kills_detached_descendants_or_fails_before_exec() {
             "--force",
         ],
     );
-    std::thread::sleep(Duration::from_millis(1_200));
+    // Authorization reloads periodically. Observe the new policy through the
+    // server instead of guessing when its next reload tick will occur.
+    let reload_start = Instant::now();
+    loop {
+        let (code, output, error) = f.exec(&["id", "-u"]);
+        let updated = if cgroup_available {
+            code == 0 && output.trim() == target.uid.as_raw().to_string()
+        } else {
+            code != 0 && error.contains("restricted sessions")
+        };
+        if updated {
+            break;
+        }
+        assert!(
+            reload_start.elapsed() < Duration::from_secs(6),
+            "updated authorization did not take effect: code={code}, stdout={output:?}, stderr={error:?}, server_log={:?}",
+            std::fs::read_to_string(f.tmp.path().join("server.log"))
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
-    let restricted_marker = f.tmp.path().join("restricted-detached.pid");
+    let restricted_marker = markers.join("restricted-detached.pid");
     let restricted_script = detached_script(&restricted_marker);
     let (code, _, error) = f.exec(&["sh", "-c", &restricted_script]);
     if cgroup_available {
         assert_eq!(code, 0, "delegated cgroup session failed: {error}");
-        wait_until_gone(wait_for_detached_pid(&restricted_marker));
+        wait_until_gone(
+            wait_for_detached_pid(&restricted_marker),
+            "restricted job after normal session exit",
+        );
 
         // This descendant deliberately keeps the stdout pipe open. Killing
         // the cgroup only *after* drain would leave the client waiting for it.
-        let held_marker = f.tmp.path().join("held-output.pid");
+        let held_marker = markers.join("held-output.pid");
         let held_script = format!(
             "setsid sh -c 'echo $$ > {}; exec sleep 15' & \
              n=0; while [ ! -s {} ] && [ \"$n\" -lt 100 ]; do sleep .01; n=$((n+1)); done; \
@@ -1640,9 +1667,12 @@ fn cgroup_policy_kills_detached_descendants_or_fails_before_exec() {
             started.elapsed() < Duration::from_secs(5),
             "detached pipe writer held the restricted session open"
         );
-        wait_until_gone(wait_for_detached_pid(&held_marker));
+        wait_until_gone(
+            wait_for_detached_pid(&held_marker),
+            "restricted pipe writer after normal session exit",
+        );
 
-        let disconnect_marker = f.tmp.path().join("disconnected-detached.pid");
+        let disconnect_marker = markers.join("disconnected-detached.pid");
         let script = format!("{}; sleep 30", detached_script(&disconnect_marker));
         let disconnected_pid = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1666,7 +1696,7 @@ fn cgroup_policy_kills_detached_descendants_or_fails_before_exec() {
                 conn.close(0u32.into(), b"test disconnect");
                 pid
             });
-        wait_until_gone(disconnected_pid);
+        wait_until_gone(disconnected_pid, "restricted job after disconnect");
     } else {
         assert_ne!(
             code, 0,
