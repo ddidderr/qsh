@@ -1,10 +1,13 @@
 //! The qsh server: accept QUIC connections, authenticate them against the
 //! authorisation store and run one process per session stream.
 
+use std::future::Future;
 use std::net::SocketAddr;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -47,6 +50,14 @@ const RELOAD_INTERVAL: Duration = Duration::from_secs(1);
 /// Connections being served at once. Reached only under attack: a legitimate
 /// deployment has a handful.
 const MAX_CONNECTIONS: usize = 256;
+
+/// Established connections one client key may keep at once. This leaves room
+/// for other authorized keys even when a client opens idle connections.
+const MAX_CONNECTIONS_PER_KEY: usize = 32;
+
+/// A program path longer than this cannot be executed on the supported Unix
+/// hosts. This also bounds what a live session retains for policy rechecks.
+const MAX_PROGRAM_LEN: usize = 4096;
 
 /// Handshakes in flight at once.
 ///
@@ -155,6 +166,7 @@ pub async fn serve(
     let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_HANDSHAKES));
     let per_source = Arc::new(PerSourceHandshakes::default());
+    let per_key = Arc::new(PerKeyConnections::default());
 
     while let Some(incoming) = endpoint.accept().await {
         // Make the peer prove it can receive at its claimed address before we
@@ -182,25 +194,36 @@ pub async fn serve(
 
         let store = Arc::clone(&store);
         let counters = Arc::clone(&counters);
+        let per_key = Arc::clone(&per_key);
         tokio::spawn(async move {
             // The permit lives as long as the connection does.
             let _permit = permit;
-            match handle_connection(incoming, store, (handshake_permit, source_slot)).await {
-                // Only reachable once a client has authenticated; anyone can
-                // provoke the failures before that, so they are counted and
-                // reported in batches instead of logged one per attempt.
-                Err(e) => eprintln!("qsh-server: {e:#}"),
-                Ok(Authenticated::No) => {
-                    counters
-                        .unauthenticated
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                Ok(Authenticated::Yes) => {}
-            }
+            let outcome =
+                handle_connection(incoming, store, per_key, (handshake_permit, source_slot)).await;
+            record_connection_outcome(&counters, outcome);
         });
     }
     refresher.abort();
     Ok(())
+}
+
+fn record_connection_outcome(counters: &AdmissionCounters, outcome: Result<Authenticated>) {
+    match outcome {
+        // Only reachable once a client has authenticated; anyone can provoke
+        // pre-authentication failures, so count those instead of logging each.
+        Err(e) => eprintln!("qsh-server: {}", bounded_diagnostic(&e)),
+        Ok(Authenticated::No) => {
+            counters
+                .unauthenticated
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(Authenticated::OverLimit) => {
+            counters
+                .rejected
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(Authenticated::Yes) => {}
+    }
 }
 
 /// Counts handshakes in flight per source address.
@@ -241,6 +264,44 @@ impl Drop for SourceSlot {
             *count -= 1;
             if *count == 0 {
                 in_flight.remove(&self.source);
+            }
+        }
+    }
+}
+
+/// Established connection slots are counted by proved client key, not IP.
+#[derive(Debug, Default)]
+struct PerKeyConnections {
+    established: std::sync::Mutex<std::collections::HashMap<Fingerprint, usize>>,
+}
+
+struct KeySlot {
+    limiter: Arc<PerKeyConnections>,
+    fingerprint: Fingerprint,
+}
+
+impl PerKeyConnections {
+    fn try_acquire(self: &Arc<Self>, fingerprint: Fingerprint) -> Option<KeySlot> {
+        let mut established = crate::sync::mutex(&self.established);
+        let count = established.entry(fingerprint).or_insert(0);
+        if *count >= MAX_CONNECTIONS_PER_KEY {
+            return None;
+        }
+        *count += 1;
+        Some(KeySlot {
+            limiter: Arc::clone(self),
+            fingerprint,
+        })
+    }
+}
+
+impl Drop for KeySlot {
+    fn drop(&mut self) {
+        let mut established = crate::sync::mutex(&self.limiter.established);
+        if let Some(count) = established.get_mut(&self.fingerprint) {
+            *count -= 1;
+            if *count == 0 {
+                established.remove(&self.fingerprint);
             }
         }
     }
@@ -361,11 +422,13 @@ fn peer_key(conn: &quinn::Connection) -> Result<Fingerprint> {
 enum Authenticated {
     Yes,
     No,
+    OverLimit,
 }
 
 async fn handle_connection(
     incoming: quinn::Incoming,
     store: Arc<RwLock<AuthStore>>,
+    per_key: Arc<PerKeyConnections>,
     handshake_permit: (tokio::sync::OwnedSemaphorePermit, SourceSlot),
 ) -> Result<Authenticated> {
     // An unauthenticated peer must not be able to sit on an admission slot.
@@ -387,13 +450,36 @@ async fn handle_connection(
     let Some(entry) = crate::sync::read(&store).lookup(&fingerprint).cloned() else {
         return Ok(Authenticated::No);
     };
+    if entry.meta.is_expired(unix_now()) {
+        conn.close(1u32.into(), b"authorization expired");
+        return Ok(Authenticated::No);
+    }
+    let Some(_key_slot) = per_key.try_acquire(fingerprint) else {
+        conn.close(1u32.into(), b"key connection limit reached");
+        return Ok(Authenticated::OverLimit);
+    };
     eprintln!(
         "qsh-server: {peer} authenticated as `{}` (key `{}`)",
         entry.meta.user, entry.name
     );
 
+    let mut policy_tick = tokio::time::interval(RELOAD_INTERVAL);
+    policy_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let stream = match conn.accept_bi().await {
+        let stream = match tokio::select! {
+            _ = policy_tick.tick() => {
+                let current = crate::sync::read(&store);
+                if current
+                    .lookup(&fingerprint)
+                    .is_none_or(|entry| entry.meta.is_expired(unix_now()))
+                {
+                    conn.close(1u32.into(), b"authorization withdrawn or expired");
+                    return Ok(Authenticated::Yes);
+                }
+                continue;
+            }
+            accepted = conn.accept_bi() => accepted,
+        } {
             Ok(s) => s,
             Err(
                 quinn::ConnectionError::ApplicationClosed(_)
@@ -402,18 +488,29 @@ async fn handle_connection(
             ) => return Ok(Authenticated::Yes),
             Err(e) => return Err(e).context("accepting a session stream"),
         };
-        // Re-resolve the policy for every session rather than reusing the one
-        // captured at handshake time. Otherwise a long-lived connection would
-        // keep the rights it started with, and `revoke` would not reach it.
-        let Some(entry) = crate::sync::read(&store).lookup(&fingerprint).cloned() else {
+        // Refuse a withdrawn key promptly; handle_session checks again after
+        // its request arrives so a pending first frame cannot keep old rights.
+        let current = crate::sync::read(&store);
+        let allowed = current
+            .lookup(&fingerprint)
+            .is_some_and(|entry| !entry.meta.is_expired(unix_now()));
+        drop(current);
+        if !allowed {
             eprintln!("qsh-server: {peer} is no longer authorized; dropping the connection");
             conn.close(1u32.into(), b"authorization withdrawn");
             return Ok(Authenticated::Yes);
-        };
+        }
+        let session_store = Arc::clone(&store);
+        let session_conn = conn.clone();
         tokio::spawn(async move {
             let (send, recv) = stream;
-            if let Err(e) = handle_session(send, recv, entry).await {
-                eprintln!("qsh-server: session from {peer} ended: {e:#}");
+            if let Err(e) =
+                handle_session(send, recv, session_conn, session_store, fingerprint).await
+            {
+                eprintln!(
+                    "qsh-server: session from {peer} ended: {}",
+                    bounded_diagnostic(&e)
+                );
             }
         });
     }
@@ -453,6 +550,12 @@ fn authorize_request(entry: &AuthEntry, req: &Request, now_unix: i64) -> Result<
             if argv.is_empty() {
                 bail!("empty command");
             }
+            if argv
+                .first()
+                .is_some_and(|program| program.len() > MAX_PROGRAM_LEN)
+            {
+                bail!("program name is too long");
+            }
             if !entry.meta.allow_exec {
                 bail!("key `{}` may not execute commands", entry.name);
             }
@@ -472,7 +575,9 @@ fn authorize_request(entry: &AuthEntry, req: &Request, now_unix: i64) -> Result<
 async fn handle_session(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
-    entry: AuthEntry,
+    conn: quinn::Connection,
+    store: Arc<RwLock<AuthStore>>,
+    fingerprint: Fingerprint,
 ) -> Result<()> {
     // A stream that never says what it wants must not hold resources open.
     // Only the first frame is on a clock; `control_loop` has to stay
@@ -482,22 +587,59 @@ async fn handle_session(
         .map_err(|_| anyhow!("client opened a session but sent no request"))?;
     let req = match first? {
         Some(Frame::Request(r)) => r,
-        Some(other) => bail!("expected a request frame first, got {other:?}"),
+        Some(_) => bail!("expected a request frame first"),
         None => return Ok(()),
     };
 
-    let start = (|| -> Result<Spawned> {
+    let start = async {
+        let entry = crate::sync::read(&store)
+            .lookup(&fingerprint)
+            .cloned()
+            .ok_or_else(|| anyhow!("client authorization was withdrawn"))?;
         authorize_request(&entry, &req, unix_now())?;
-        let user = child::resolve_user(&entry.meta.user)?;
-        child::spawn(&user, &req)
-    })();
+        let grant = RequestGrant::from_request(&req)?;
+        let authorized_user = entry.meta.user;
+        let lookup_name = authorized_user.clone();
 
-    let spawned = match start {
+        // Account and supplementary-group lookups can block on NSS (LDAP or
+        // SSSD). Neither the authorization lock nor a Tokio worker may wait on
+        // them: both are shared by every connection and policy reload.
+        let (user, identity) = tokio::task::spawn_blocking(move || {
+            let user = child::resolve_user(&lookup_name)?;
+            let identity = child::prepare_identity(&user)?;
+            Ok::<_, anyhow::Error>((user, identity))
+        })
+        .await
+        .context("preparing the authorized local account")??;
+
+        // Recheck after slow preparation. A changed target account must use a
+        // fresh identity lookup; a withdrawn or narrowed grant must not spawn.
+        let current = crate::sync::read(&store);
+        let entry = current
+            .lookup(&fingerprint)
+            .ok_or_else(|| anyhow!("client authorization was withdrawn"))?;
+        authorize_request(entry, &req, unix_now())?;
+        if entry.meta.user != authorized_user {
+            bail!("client authorization changed its target user");
+        }
+        drop(current);
+
+        // The periodic session check handles a policy change racing this
+        // final check. Do not hold the shared store lock over fork/exec.
+        Ok::<_, anyhow::Error>((
+            child::spawn_prepared(&user, &req, identity)?,
+            authorized_user,
+            grant,
+        ))
+    }
+    .await;
+
+    let (spawned, authorized_user, grant) = match start {
         Ok(s) => s,
         Err(e) => {
             // Report the refusal in-band so the client can print it, then end
             // the session with a shell-like "cannot execute" status.
-            let _ = write_frame(&mut send, &Frame::Error(format!("{e:#}"))).await;
+            let _ = write_frame(&mut send, &Frame::Error(bounded_diagnostic(&e))).await;
             let _ = write_frame(
                 &mut send,
                 &Frame::Exit(ExitStatus {
@@ -511,7 +653,79 @@ async fn handle_session(
         }
     };
 
-    run_session(send, recv, spawned).await
+    // Child spawn has consumed the request; keep only the command identity
+    // needed to detect a later policy change, not its potentially large argv,
+    // environment and terminal metadata for the lifetime of the process.
+    drop(req);
+
+    let authorization = LiveAuthorization {
+        store,
+        fingerprint,
+        grant,
+        authorized_user,
+    };
+    run_session(send, recv, conn, authorization, spawned).await
+}
+
+/// Diagnostics can contain client-supplied request fields. Keep each message
+/// short and single-line for both the server log and the in-band refusal.
+fn bounded_diagnostic(error: &anyhow::Error) -> String {
+    const MAX_CHARS: usize = 512;
+    let mut bounded = String::new();
+    for (index, ch) in format!("{error:#}").chars().enumerate() {
+        if index == MAX_CHARS {
+            bounded.push('…');
+            break;
+        }
+        bounded.push(if ch.is_control() { ' ' } else { ch });
+    }
+    bounded
+}
+
+#[derive(Debug)]
+enum RequestGrant {
+    Shell,
+    Exec(String),
+}
+
+struct LiveAuthorization {
+    store: Arc<RwLock<AuthStore>>,
+    fingerprint: Fingerprint,
+    grant: RequestGrant,
+    authorized_user: String,
+}
+
+impl RequestGrant {
+    fn from_request(request: &Request) -> Result<Self> {
+        match &request.command {
+            None => Ok(Self::Shell),
+            Some(argv) => argv
+                .first()
+                .cloned()
+                .map(Self::Exec)
+                .ok_or_else(|| anyhow!("empty command")),
+        }
+    }
+}
+
+fn request_still_authorized(auth: &LiveAuthorization) -> bool {
+    let current = crate::sync::read(&auth.store);
+    current.lookup(&auth.fingerprint).is_some_and(|entry| {
+        entry.meta.user == auth.authorized_user
+            && !entry.meta.is_expired(unix_now())
+            && match &auth.grant {
+                RequestGrant::Shell => entry.meta.allow_shell,
+                RequestGrant::Exec(program) => {
+                    entry.meta.allow_exec
+                        && (entry.meta.allowed_commands.is_empty()
+                            || entry
+                                .meta
+                                .allowed_commands
+                                .iter()
+                                .any(|allowed| allowed == program))
+                }
+            }
+    })
 }
 
 /// Kills the remote process group if the session goes away.
@@ -522,13 +736,11 @@ async fn handle_session(
 /// including task cancellation, which is the one path an `async` cleanup step
 /// could never cover.
 ///
-/// Its reach is the session's process group and no further. A job the user
-/// backgrounded with `&` in an interactive shell is in a group of its own —
-/// that is what job control does — and so are `setsid` and `nohup` children;
-/// none of them are signalled here. That matches ssh, and it is the behaviour
-/// people rely on to leave work running after logging out. Killing them anyway
-/// would need the session in its own cgroup, which is a bigger and more
-/// intrusive design than this tool wants.
+/// Its reach is the session's initial process group. PTY job control can put
+/// foreground or background work in a different group; `setsid` does likewise.
+/// Closing the PTY sends a hangup to its foreground group, but an ignoring
+/// process can survive. Full containment requires a session cgroup or a
+/// different job-control policy.
 struct ProcessGroupGuard {
     pid: Option<u32>,
 }
@@ -540,11 +752,9 @@ impl ProcessGroupGuard {
 
     /// Stop guarding the group.
     ///
-    /// Only correct once the leader has been reaped *and* its output drained
-    /// to end of file: at that point nothing in the group still holds our
-    /// stdio, so whatever is left has deliberately detached — a `nohup`ed
-    /// daemon — and killing it would be wrong. Every other exit path must go
-    /// through `terminate` instead.
+    /// Only correct once the leader has exited *and* its output has drained
+    /// to end of file. Nothing left is attached to this session, and reaping
+    /// the leader after disarming cannot race a later group signal.
     fn disarm(&mut self) {
         self.pid = None;
     }
@@ -552,23 +762,17 @@ impl ProcessGroupGuard {
     /// Ask the job to go away, escalating if it will not.
     ///
     /// The pid stays in place across both grace periods. Taking it up front
-    /// would disarm the guard for the several seconds this spends awaiting,
-    /// and a cancellation in that window — daemon shutdown, say — would then
-    /// drop the child handle without killing anything, which is precisely the
-    /// case a job that ignores `SIGHUP` and `SIGTERM` survives.
+    /// would disarm the guard while this spends time awaiting, so a daemon
+    /// shutdown could leave a job that ignores `SIGHUP` and `SIGTERM` behind.
     async fn terminate(&mut self) {
         let Some(pid) = self.pid else { return };
-        for sig in [libc::SIGHUP, libc::SIGTERM] {
-            child::signal_process_group(pid, sig);
-            // Anything that is going to exit on a hangup does so promptly.
-            if tokio::time::timeout(TERMINATE_GRACE, wait_for_exit(pid))
-                .await
-                .is_ok()
-            {
-                self.pid = None;
-                return;
-            }
-        }
+        child::signal_process_group(pid, libc::SIGHUP);
+        // Keep the leader waitable so its PID/PGID cannot be reused. Its exit
+        // does not prove that the rest of the group has exited: a descendant
+        // may still need time to handle SIGTERM and clean up.
+        let _ = tokio::time::timeout(TERMINATE_GRACE, wait_for_leader_exit(Some(pid))).await;
+        child::signal_process_group(pid, libc::SIGTERM);
+        tokio::time::sleep(TERMINATE_GRACE).await;
         child::signal_process_group(pid, libc::SIGKILL);
         self.pid = None;
     }
@@ -584,23 +788,45 @@ impl Drop for ProcessGroupGuard {
     }
 }
 
-/// Poll until the process group has no members left.
-///
-/// The caller must be reaping the leader concurrently: an exited but unreaped
-/// child is a zombie, and a zombie still answers `kill(pid, 0)`, so without a
-/// concurrent `wait` this can never observe the group going away.
-async fn wait_for_exit(pid: u32) {
+/// Observe leader exit without reaping it. The reserved PID prevents later
+/// group and terminal signals from targeting an unrelated process.
+#[allow(
+    unsafe_code,
+    reason = "waitid with WNOWAIT preserves the child PID until cleanup"
+)]
+async fn wait_for_leader_exit(pid: Option<u32>) -> Result<()> {
+    let pid = pid.ok_or_else(|| anyhow!("remote child has no PID"))?;
+    let id = libc::id_t::try_from(pid).context("remote child PID is out of range")?;
     loop {
-        if !child::process_group_alive(pid) {
-            return;
+        // SAFETY: zeroed siginfo_t is the writable output buffer for waitid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                id,
+                &raw mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error()).context("observing remote process exit");
+        }
+        if unsafe { info.si_pid() } != 0 {
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the session lifecycle keeps the unreaped child and signal guard in one owner"
+)]
 async fn run_session(
     send: quinn::SendStream,
     recv: quinn::RecvStream,
+    conn: quinn::Connection,
+    authorization: LiveAuthorization,
     spawned: Spawned,
 ) -> Result<()> {
     let Spawned { mut child, io } = spawned;
@@ -612,7 +838,7 @@ async fn run_session(
 
     // Single writer for the stream: stdout, stderr and the exit status all
     // funnel through here, so frames never interleave.
-    let mut writer = tokio::spawn(async move {
+    let mut writer = AbortOnDrop(tokio::spawn(async move {
         let mut stream = SessionStream::new(send);
         while let Some(frame) = rx.recv().await {
             if stream.write(&frame).await.is_err() {
@@ -620,22 +846,29 @@ async fn run_session(
             }
         }
         stream.finish().await;
-    });
+    }));
 
     if tx.send(Frame::Started).await.is_err() {
-        // Reap while terminating: the escalation watches for the group to go
-        // away, and a zombie would keep it looking alive.
-        let ((), _) = tokio::join!(guard.terminate(), child.wait());
+        guard.terminate().await;
+        let _ = child.wait().await;
         bail!("client closed the session before it started");
     }
 
     let mut outputs = Vec::new();
     let stdin_sink: Box<dyn AsyncWrite + Unpin + Send>;
-    let pty_fd: Option<RawFd>;
+    let pty_fd: Option<OwnedFd>;
 
     match io {
         ChildIo::Pty(master) => {
-            pty_fd = Some(master.as_raw_fd());
+            pty_fd = match master.try_clone_fd() {
+                Ok(fd) => Some(fd),
+                Err(e) => {
+                    writer.abort();
+                    guard.terminate().await;
+                    let _ = child.wait().await;
+                    return Err(e).context("duplicating PTY descriptor for resize");
+                }
+            };
             let (r, w) = tokio::io::split(master);
             stdin_sink = Box::new(w);
             outputs.push(spawn_pump(r, tx.clone(), Frame::Stdout));
@@ -652,29 +885,86 @@ async fn run_session(
         }
     }
 
-    // `control` is the only thing watching for the client going away, so it
-    // has to stay alive right up to the end of the session — including
-    // through the drain below, which can take arbitrarily long.
-    let mut control = tokio::spawn(control_loop(recv, stdin_sink, pid, pty_fd));
+    // Keep control alive through output drain. Connection closure and policy
+    // changes are watched independently, even if control blocks on child stdin.
+    let is_pty = pty_fd.is_some();
+    let (events_tx, mut events_rx) = mpsc::channel::<ControlEvent>(32);
+    let mut control = AbortOnDrop(tokio::spawn(control_loop(
+        recv, stdin_sink, is_pty, events_tx,
+    )));
+    let mut policy_tick = tokio::time::interval(RELOAD_INTERVAL);
+    policy_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // Race the process against the client. Waiting only on the child would
-    // let a killed client strand a `sleep` here forever.
-    let status = tokio::select! {
-        status = child.wait() => Some(status.context("waiting for the remote process")?),
-        _ = &mut control => None,
+    // Observe exit without reaping: a zombie keeps the leader's PID reserved
+    // until every possible process-group signal has been sent.
+    let leader_exited = loop {
+        tokio::select! {
+            exited = wait_for_leader_exit(pid) => {
+                if let Err(error) = exited {
+                    eprintln!("qsh-server: could not observe child exit: {error:#}");
+                    break None;
+                }
+                break Some(());
+            }
+            _ = &mut control => break None,
+            _ = conn.closed() => break None,
+            event = events_rx.recv() => {
+                if let Some(event) = event {
+                    apply_control_event(event, pty_fd.as_ref(), pid);
+                } else {
+                    break None;
+                }
+            }
+            _ = policy_tick.tick() => {
+                if !request_still_authorized(&authorization) {
+                    break None;
+                }
+            }
+        }
     };
-    let Some(status) = status else {
+    if leader_exited.is_none() {
+        control.abort();
+        let _ = control.await;
+        writer.abort();
+        let _ = writer.await;
         return abandon(&mut guard, &mut child, outputs).await;
-    };
+    }
 
     // The leader is gone, but its descendants may still hold the output open.
-    // Drain with the disconnect watch still running, so a client that dies
-    // mid-drain takes the whole job down with it.
-    let drained = tokio::select! {
-        drained = drain(&mut outputs, pty_fd.is_some()) => drained,
-        _ = &mut control => return abandon(&mut guard, &mut child, outputs).await,
+    // Drain with disconnect and policy watches still running. Pin the drain
+    // future so a timer tick never restarts a partly completed drain.
+    let drained = {
+        let pending = drain(&mut outputs, is_pty);
+        tokio::pin!(pending);
+        loop {
+            tokio::select! {
+                result = &mut pending => break Some(result),
+                _ = &mut control => break None,
+                _ = conn.closed() => break None,
+                event = events_rx.recv() => {
+                    if let Some(event) = event {
+                        apply_control_event(event, pty_fd.as_ref(), pid);
+                    } else {
+                        break None;
+                    }
+                }
+                _ = policy_tick.tick() => {
+                    if !request_still_authorized(&authorization) {
+                        break None;
+                    }
+                }
+            }
+        }
+    };
+    let Some(drained) = drained else {
+        control.abort();
+        let _ = control.await;
+        writer.abort();
+        let _ = writer.await;
+        return abandon(&mut guard, &mut child, outputs).await;
     };
     control.abort();
+    let _ = control.await;
 
     let exit = match drained {
         Drained::Fully => {
@@ -682,6 +972,7 @@ async fn run_session(
             // left in the group is attached to it any more: whatever survives
             // has deliberately detached, and killing it would be wrong.
             guard.disarm();
+            let status = child.wait().await.context("reaping the remote process")?;
             ExitStatus {
                 code: status.code().unwrap_or(0),
                 signal: status.signal(),
@@ -707,7 +998,8 @@ async fn run_session(
 
     // Kill the job before trying to talk to a peer that may never answer.
     if matches!(drained, Drained::Incomplete(_)) {
-        let ((), _) = tokio::join!(guard.terminate(), child.wait());
+        guard.terminate().await;
+        let _ = child.wait().await;
     }
 
     let _ = tokio::time::timeout(SHUTDOWN_GRACE, tx.send(Frame::Exit(exit))).await;
@@ -740,11 +1032,10 @@ async fn abandon(
     for pump in &outputs {
         pump.task.abort();
     }
-    // Reaping has to run alongside the escalation, not after it: until the
-    // leader is reaped it lingers as a zombie, which still answers
-    // `kill(pid, 0)`, and the polite signals would look like they had no
-    // effect.
-    let ((), _) = tokio::join!(guard.terminate(), child.wait());
+    // Reap only after the last signal; otherwise this PID can be recycled
+    // while a descendant still holds output or the guard is escalating.
+    guard.terminate().await;
+    let _ = child.wait().await;
     Ok(())
 }
 
@@ -877,8 +1168,33 @@ impl Drop for SessionStream {
 
 /// One output stream being forwarded, with a cooperative drain cutoff.
 struct Pump {
-    task: tokio::task::JoinHandle<PumpEnd>,
+    task: AbortOnDrop<PumpEnd>,
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// Spawned session tasks must stop when their parent is canceled. A bare
+/// `JoinHandle` detaches on drop and could keep I/O alive after cleanup.
+#[derive(Debug)]
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> AbortOnDrop<T> {
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+impl<T> Future for AbortOnDrop<T> {
+    type Output = std::result::Result<T, tokio::task::JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Start forwarding one output stream of the child into frames.
@@ -889,7 +1205,7 @@ fn spawn_pump<R: AsyncRead + Unpin + Send + 'static>(
 ) -> Pump {
     let (cancel, cancelled) = tokio::sync::oneshot::channel();
     Pump {
-        task: tokio::spawn(pump(src, tx, wrap, cancelled)),
+        task: AbortOnDrop(tokio::spawn(pump(src, tx, wrap, cancelled))),
         cancel: Some(cancel),
     }
 }
@@ -932,24 +1248,43 @@ async fn pump<R: AsyncRead + Unpin>(
 }
 
 /// Handle everything the client sends after the request.
+#[derive(Debug, Clone, Copy)]
+enum ControlEvent {
+    Resize(PtySize),
+    Signal(i32),
+}
+
+fn apply_control_event(event: ControlEvent, pty_fd: Option<&OwnedFd>, pid: Option<u32>) {
+    match event {
+        ControlEvent::Resize(size) => resize(pty_fd, pid, size),
+        ControlEvent::Signal(sig) => {
+            if let Some(pid) = pid {
+                child::signal_process_group(pid, sig);
+            }
+        }
+    }
+}
+
 async fn control_loop(
     mut recv: quinn::RecvStream,
     stdin_sink: Box<dyn AsyncWrite + Unpin + Send>,
-    pid: Option<u32>,
-    pty_fd: Option<RawFd>,
+    is_pty: bool,
+    events: mpsc::Sender<ControlEvent>,
 ) {
     let mut stdin_sink = Some(stdin_sink);
     loop {
         match read_frame(&mut recv).await {
             Ok(Some(Frame::Stdin(data))) => {
                 if let Some(sink) = stdin_sink.as_mut() {
-                    if sink.write_all(&data).await.is_err() {
-                        stdin_sink = None;
+                    match write_stdin_or_peer_closed(&mut recv, sink.as_mut(), &data).await {
+                        StdinWrite::Written => {}
+                        StdinWrite::SinkClosed => stdin_sink = None,
+                        StdinWrite::PeerGone => break,
                     }
                 }
             }
             Ok(Some(Frame::StdinEof)) => {
-                if pty_fd.is_some() {
+                if is_pty {
                     // A terminal has no "close one end": dropping our write
                     // half would leave the read half owning the same master,
                     // so the child would never see EOF.
@@ -964,8 +1299,25 @@ async fn control_loop(
                     // harmless when the queue was already empty: the reader
                     // has stopped by then.
                     if let Some(sink) = stdin_sink.as_mut() {
-                        let _ = sink.write_all(&[EOT, EOT]).await;
-                        let _ = sink.flush().await;
+                        match write_stdin_or_peer_closed(&mut recv, sink.as_mut(), &[EOT, EOT])
+                            .await
+                        {
+                            StdinWrite::Written => {
+                                let flushed = tokio::select! {
+                                    _ = recv.received_reset() => StdinWrite::PeerGone,
+                                    result = sink.flush() => {
+                                        if result.is_ok() { StdinWrite::Written } else { StdinWrite::SinkClosed }
+                                    }
+                                };
+                                match flushed {
+                                    StdinWrite::Written => {}
+                                    StdinWrite::SinkClosed => stdin_sink = None,
+                                    StdinWrite::PeerGone => break,
+                                }
+                            }
+                            StdinWrite::SinkClosed => stdin_sink = None,
+                            StdinWrite::PeerGone => break,
+                        }
                     }
                 } else {
                     // Dropping the writer closes the pipe, which the child
@@ -973,10 +1325,16 @@ async fn control_loop(
                     stdin_sink = None;
                 }
             }
-            Ok(Some(Frame::Resize(size))) => resize(pty_fd, pid, size),
+            Ok(Some(Frame::Resize(size))) => {
+                if events.send(ControlEvent::Resize(size)).await.is_err() {
+                    break;
+                }
+            }
             Ok(Some(Frame::Signal(name))) => {
-                if let (Some(pid), Some(sig)) = (pid, signal_number(&name)) {
-                    child::signal_process_group(pid, sig);
+                if let Some(sig) = signal_number(&name) {
+                    if events.send(ControlEvent::Signal(sig)).await.is_err() {
+                        break;
+                    }
                 }
             }
             Ok(Some(_)) => {}
@@ -985,9 +1343,32 @@ async fn control_loop(
     }
 }
 
-fn resize(pty_fd: Option<RawFd>, pid: Option<u32>, size: PtySize) {
+/// Child stdin can block forever when the program stops reading. A peer reset
+/// or FIN must still end the control task so the session guard can clean up.
+/// A closed child stdin is different: keep consuming client frames so stdout
+/// and the child's exit status can still be delivered.
+enum StdinWrite {
+    Written,
+    SinkClosed,
+    PeerGone,
+}
+
+async fn write_stdin_or_peer_closed(
+    recv: &mut quinn::RecvStream,
+    sink: &mut (dyn AsyncWrite + Unpin + Send),
+    data: &[u8],
+) -> StdinWrite {
+    tokio::select! {
+        _ = recv.received_reset() => StdinWrite::PeerGone,
+        result = sink.write_all(data) => {
+            if result.is_ok() { StdinWrite::Written } else { StdinWrite::SinkClosed }
+        },
+    }
+}
+
+fn resize(pty_fd: Option<&OwnedFd>, pid: Option<u32>, size: PtySize) {
     let Some(fd) = pty_fd else { return };
-    if pty::set_size(fd, size).is_ok() {
+    if pty::set_size(fd.as_raw_fd(), size).is_ok() {
         if let Some(pid) = pid {
             child::signal_process_group(pid, libc::SIGWINCH);
         }
@@ -1015,6 +1396,36 @@ mod tests {
             fingerprint: Fingerprint::of_cert(&crypto::cert_from_pem(&pem).unwrap()).unwrap(),
             meta,
         }
+    }
+
+    #[test]
+    fn per_key_connection_limit_preserves_other_keys_and_releases_slots() {
+        let limiter = Arc::new(PerKeyConnections::default());
+        let first = entry(AuthMeta::default()).fingerprint;
+        let second = entry(AuthMeta::default()).fingerprint;
+        let mut held = (0..MAX_CONNECTIONS_PER_KEY)
+            .map(|_| limiter.try_acquire(first).unwrap())
+            .collect::<Vec<_>>();
+        assert!(limiter.try_acquire(first).is_none());
+        assert!(limiter.try_acquire(second).is_some());
+        held.pop();
+        assert!(limiter.try_acquire(first).is_some());
+    }
+
+    #[tokio::test]
+    async fn observing_leader_exit_keeps_it_waitable() {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        tokio::time::timeout(Duration::from_secs(5), wait_for_leader_exit(pid))
+            .await
+            .unwrap()
+            .unwrap();
+        // WNOWAIT reports the same completed child again: it was not reaped.
+        wait_for_leader_exit(pid).await.unwrap();
+        assert_eq!(child.wait().await.unwrap().code(), Some(7));
     }
 
     fn request(command: Option<&[&str]>) -> Request {
@@ -1185,7 +1596,6 @@ mod tests {
     async fn a_cancelled_terminate_still_kills_the_group() {
         let (mut child, pid, _stdin) = stubborn_job().await;
         assert!(child::process_group_alive(pid));
-        let reaper = tokio::spawn(async move { child.wait().await });
 
         // Cancel the guard mid-escalation, exactly as a daemon shutdown would.
         let task = tokio::spawn(async move {
@@ -1197,15 +1607,12 @@ mod tests {
 
         // `Drop` must have delivered SIGKILL even though the escalation never
         // finished, because the guard stayed armed across the awaits.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while child::process_group_alive(pid) {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "a job ignoring HUP and TERM survived a cancelled terminate"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        let _ = reaper.await;
+        tokio::time::timeout(Duration::from_secs(5), wait_for_leader_exit(Some(pid)))
+            .await
+            .expect("a job ignoring HUP and TERM survived a cancelled terminate")
+            .unwrap();
+        let _ = child.wait().await;
+        assert!(!child::process_group_alive(pid));
     }
 
     #[tokio::test]
@@ -1213,19 +1620,28 @@ mod tests {
         let (mut child, pid, _stdin) = stubborn_job().await;
         let mut guard = ProcessGroupGuard::new(Some(pid));
         let started = tokio::time::Instant::now();
-        let ((), _) = tokio::join!(guard.terminate(), child.wait());
+        guard.terminate().await;
+        let _ = child.wait().await;
         assert!(!child::process_group_alive(pid));
         // It should have taken both grace periods to get there.
         assert!(started.elapsed() >= TERMINATE_GRACE);
     }
 
     #[tokio::test]
-    async fn terminate_returns_promptly_for_a_job_that_takes_the_hint() {
-        // Without a concurrent reap this would sit through both grace periods
-        // even for a job that died instantly, because the unreaped leader is a
-        // zombie and a zombie still answers `kill(pid, 0)`.
-        let mut cmd = tokio::process::Command::new("sleep");
-        cmd.arg("60");
+    async fn terminate_gives_descendants_time_after_the_leader_exits() {
+        // The leader exits on HUP, but a member of the same group ignores HUP
+        // and writes a cleanup marker when TERM arrives. An immediate KILL
+        // after observing leader exit would prevent that cleanup.
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(
+            "trap 'exit 0' HUP; \
+             sh -c 'trap \"\" HUP; trap \"echo cleaned; exit 0\" TERM; \
+             echo child-ready; while :; do sleep 60; done' & \
+             echo parent-ready; read line",
+        );
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
         // SAFETY: setsid is async-signal-safe; mirrors what child::spawn does.
         #[allow(unsafe_code, reason = "the test needs its own process group")]
         unsafe {
@@ -1238,18 +1654,40 @@ mod tests {
         }
         let mut child = cmd.spawn().unwrap();
         let pid = child.id().unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _stdin = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut output = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !output
+                .windows(b"parent-ready".len())
+                .any(|w| w == b"parent-ready")
+                || !output
+                    .windows(b"child-ready".len())
+                    .any(|w| w == b"child-ready")
+            {
+                let mut buf = [0u8; 64];
+                let n = stdout.read(&mut buf).await.unwrap();
+                assert!(n > 0, "the test job closed stdout before it was ready");
+                output.extend_from_slice(&buf[..n]);
+            }
+        })
+        .await
+        .expect("the test job did not become ready");
 
         let mut guard = ProcessGroupGuard::new(Some(pid));
         let started = tokio::time::Instant::now();
-        let ((), _) = tokio::join!(guard.terminate(), child.wait());
-        let elapsed = started.elapsed();
-
-        assert!(!child::process_group_alive(pid));
+        guard.terminate().await;
+        let _ = child.wait().await;
+        tokio::time::timeout(Duration::from_secs(5), stdout.read_to_end(&mut output))
+            .await
+            .expect("the process group kept stdout open")
+            .unwrap();
         assert!(
-            elapsed < TERMINATE_GRACE,
-            "SIGHUP should have been enough, but termination took {elapsed:?}"
+            output.windows(b"cleaned".len()).any(|w| w == b"cleaned"),
+            "the descendant got no TERM cleanup time: {}",
+            String::from_utf8_lossy(&output)
         );
+        assert!(started.elapsed() >= TERMINATE_GRACE);
     }
 
     #[test]
