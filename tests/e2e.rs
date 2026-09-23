@@ -1674,7 +1674,7 @@ fn cgroup_policy_kills_detached_descendants_or_fails_before_exec() {
 
         let disconnect_marker = markers.join("disconnected-detached.pid");
         let script = format!("{}; sleep 30", detached_script(&disconnect_marker));
-        let disconnected_pid = tokio::runtime::Builder::new_current_thread()
+        tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
@@ -1694,9 +1694,15 @@ fn cgroup_policy_kills_detached_descendants_or_fails_before_exec() {
                 }
                 let pid = wait_for_detached_pid(&disconnect_marker);
                 conn.close(0u32.into(), b"test disconnect");
-                pid
+                // Keep Quinn's endpoint driver running until the peer has
+                // observed the close. Dropping this single-thread runtime
+                // immediately can discard the close packet before it is sent.
+                tokio::task::spawn_blocking(move || {
+                    wait_until_gone(pid, "restricted job after disconnect");
+                })
+                .await
+                .unwrap();
             });
-        wait_until_gone(disconnected_pid, "restricted job after disconnect");
     } else {
         assert_ne!(
             code, 0,
