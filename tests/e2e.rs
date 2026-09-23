@@ -828,7 +828,7 @@ fn a_disallowed_large_request_cannot_expand_into_a_large_log_line() {
                                     .windows(marker.len())
                                     .any(|window| window == marker.as_slice())
                         })
-                        .map(|line| line.len())
+                        .map(<[u8]>::len)
                 });
                 if let Some(len) = complete {
                     break len;
@@ -2129,17 +2129,15 @@ fn an_expired_key_cannot_keep_or_open_an_idle_connection() {
         let connecting = endpoint
             .connect(std::net::SocketAddr::from(([127, 0, 0, 1], f.port)), "qsh")
             .unwrap();
-        match tokio::time::timeout(Duration::from_secs(5), connecting)
+        if let Ok(new_conn) = tokio::time::timeout(Duration::from_secs(5), connecting)
             .await
             .expect("expired-key admission did not finish")
         {
-            Ok(new_conn) => {
-                tokio::time::timeout(Duration::from_secs(5), new_conn.closed())
-                    .await
-                    .expect("an expired key kept a new idle connection");
-            }
-            Err(_) => {} // TLS admission refused the expired key.
+            tokio::time::timeout(Duration::from_secs(5), new_conn.closed())
+                .await
+                .expect("an expired key kept a new idle connection");
         }
+        // TLS may also refuse the expired key before the handshake completes.
     });
 }
 
