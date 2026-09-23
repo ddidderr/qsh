@@ -121,6 +121,14 @@ impl PtyMaster {
         self.inner.get_ref().as_raw_fd()
     }
 
+    /// Keep a separate owned reference for operations that outlive a split I/O half.
+    ///
+    /// # Errors
+    /// Fails if the descriptor cannot be duplicated.
+    pub fn try_clone_fd(&self) -> io::Result<OwnedFd> {
+        self.inner.get_ref().as_fd().try_clone_to_owned()
+    }
+
     /// Resize the terminal.
     ///
     /// # Errors
@@ -328,6 +336,28 @@ mod tests {
         let n = master.read(&mut buf).await.unwrap();
         assert!(n > 0);
         drop(slave);
+    }
+
+    #[tokio::test]
+    async fn cloned_master_descriptor_remains_valid_after_master_drop() {
+        let (master, _slave) = open(PtySize { cols: 80, rows: 24 }).unwrap();
+        let duplicate = master.try_clone_fd().unwrap();
+        drop(master);
+        set_size(
+            duplicate.as_raw_fd(),
+            PtySize {
+                cols: 100,
+                rows: 30,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            get_size(duplicate.as_raw_fd()).unwrap(),
+            PtySize {
+                cols: 100,
+                rows: 30
+            }
+        );
     }
 
     #[tokio::test]
