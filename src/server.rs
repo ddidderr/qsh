@@ -198,28 +198,32 @@ pub async fn serve(
         tokio::spawn(async move {
             // The permit lives as long as the connection does.
             let _permit = permit;
-            match handle_connection(incoming, store, per_key, (handshake_permit, source_slot)).await
-            {
-                // Only reachable once a client has authenticated; anyone can
-                // provoke the failures before that, so they are counted and
-                // reported in batches instead of logged one per attempt.
-                Err(e) => eprintln!("qsh-server: {}", bounded_diagnostic(&e)),
-                Ok(Authenticated::No) => {
-                    counters
-                        .unauthenticated
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                Ok(Authenticated::OverLimit) => {
-                    counters
-                        .rejected
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                Ok(Authenticated::Yes) => {}
-            }
+            let outcome =
+                handle_connection(incoming, store, per_key, (handshake_permit, source_slot)).await;
+            record_connection_outcome(&counters, outcome);
         });
     }
     refresher.abort();
     Ok(())
+}
+
+fn record_connection_outcome(counters: &AdmissionCounters, outcome: Result<Authenticated>) {
+    match outcome {
+        // Only reachable once a client has authenticated; anyone can provoke
+        // pre-authentication failures, so count those instead of logging each.
+        Err(e) => eprintln!("qsh-server: {}", bounded_diagnostic(&e)),
+        Ok(Authenticated::No) => {
+            counters
+                .unauthenticated
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(Authenticated::OverLimit) => {
+            counters
+                .rejected
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(Authenticated::Yes) => {}
+    }
 }
 
 /// Counts handshakes in flight per source address.
@@ -465,7 +469,10 @@ async fn handle_connection(
         let stream = match tokio::select! {
             _ = policy_tick.tick() => {
                 let current = crate::sync::read(&store);
-                if !current.lookup(&fingerprint).is_some_and(|entry| !entry.meta.is_expired(unix_now())) {
+                if current
+                    .lookup(&fingerprint)
+                    .is_none_or(|entry| entry.meta.is_expired(unix_now()))
+                {
                     conn.close(1u32.into(), b"authorization withdrawn or expired");
                     return Ok(Authenticated::Yes);
                 }
@@ -543,7 +550,10 @@ fn authorize_request(entry: &AuthEntry, req: &Request, now_unix: i64) -> Result<
             if argv.is_empty() {
                 bail!("empty command");
             }
-            if argv.first().is_some_and(|program| program.len() > MAX_PROGRAM_LEN) {
+            if argv
+                .first()
+                .is_some_and(|program| program.len() > MAX_PROGRAM_LEN)
+            {
                 bail!("program name is too long");
             }
             if !entry.meta.allow_exec {
@@ -616,17 +626,13 @@ async fn handle_session(
     // environment and terminal metadata for the lifetime of the process.
     drop(req);
 
-    run_session(
-        send,
-        recv,
-        conn,
+    let authorization = LiveAuthorization {
         store,
         fingerprint,
         grant,
         authorized_user,
-        spawned,
-    )
-    .await
+    };
+    run_session(send, recv, conn, authorization, spawned).await
 }
 
 /// Diagnostics can contain client-supplied request fields. Keep each message
@@ -650,6 +656,13 @@ enum RequestGrant {
     Exec(String),
 }
 
+struct LiveAuthorization {
+    store: Arc<RwLock<AuthStore>>,
+    fingerprint: Fingerprint,
+    grant: RequestGrant,
+    authorized_user: String,
+}
+
 impl RequestGrant {
     fn from_request(request: &Request) -> Result<Self> {
         match &request.command {
@@ -663,22 +676,21 @@ impl RequestGrant {
     }
 }
 
-fn request_still_authorized(
-    store: &RwLock<AuthStore>,
-    fingerprint: &Fingerprint,
-    grant: &RequestGrant,
-    authorized_user: &str,
-) -> bool {
-    let current = crate::sync::read(store);
-    current.lookup(fingerprint).is_some_and(|entry| {
-        entry.meta.user == authorized_user
+fn request_still_authorized(auth: &LiveAuthorization) -> bool {
+    let current = crate::sync::read(&auth.store);
+    current.lookup(&auth.fingerprint).is_some_and(|entry| {
+        entry.meta.user == auth.authorized_user
             && !entry.meta.is_expired(unix_now())
-            && match grant {
+            && match &auth.grant {
                 RequestGrant::Shell => entry.meta.allow_shell,
                 RequestGrant::Exec(program) => {
                     entry.meta.allow_exec
                         && (entry.meta.allowed_commands.is_empty()
-                            || entry.meta.allowed_commands.iter().any(|allowed| allowed == program))
+                            || entry
+                                .meta
+                                .allowed_commands
+                                .iter()
+                                .any(|allowed| allowed == program))
                 }
             }
     })
@@ -768,7 +780,7 @@ async fn wait_for_leader_exit(pid: Option<u32>) -> Result<()> {
             libc::waitid(
                 libc::P_PID,
                 id,
-                &mut info,
+                &raw mut info,
                 libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
             )
         };
@@ -782,14 +794,15 @@ async fn wait_for_leader_exit(pid: Option<u32>) -> Result<()> {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the session lifecycle keeps the unreaped child and signal guard in one owner"
+)]
 async fn run_session(
     send: quinn::SendStream,
     recv: quinn::RecvStream,
     conn: quinn::Connection,
-    store: Arc<RwLock<AuthStore>>,
-    fingerprint: Fingerprint,
-    grant: RequestGrant,
-    authorized_user: String,
+    authorization: LiveAuthorization,
     spawned: Spawned,
 ) -> Result<()> {
     let Spawned { mut child, io } = spawned;
@@ -879,7 +892,7 @@ async fn run_session(
                 }
             }
             _ = policy_tick.tick() => {
-                if !request_still_authorized(&store, &fingerprint, &grant, &authorized_user) {
+                if !request_still_authorized(&authorization) {
                     break None;
                 }
             }
@@ -912,7 +925,7 @@ async fn run_session(
                     }
                 }
                 _ = policy_tick.tick() => {
-                    if !request_still_authorized(&store, &fingerprint, &grant, &authorized_user) {
+                    if !request_still_authorized(&authorization) {
                         break None;
                     }
                 }
@@ -1136,7 +1149,7 @@ struct Pump {
 }
 
 /// Spawned session tasks must stop when their parent is canceled. A bare
-/// JoinHandle detaches on drop and could keep I/O alive after cleanup.
+/// `JoinHandle` detaches on drop and could keep I/O alive after cleanup.
 #[derive(Debug)]
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 
@@ -1211,7 +1224,7 @@ async fn pump<R: AsyncRead + Unpin>(
 }
 
 /// Handle everything the client sends after the request.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum ControlEvent {
     Resize(PtySize),
     Signal(i32),

@@ -105,19 +105,9 @@ fn shell_of(user: &User) -> PathBuf {
     }
 }
 
-/// Start the process described by `req` as `user`.
-///
-/// When the server does not run as root, `user` must be the account the
-/// server itself runs as; there is no way to change identity otherwise.
-///
-/// # Errors
-/// Fails if the target user cannot be assumed, a PTY cannot be allocated, or
-/// the program cannot be executed.
-#[allow(
-    unsafe_code,
-    reason = "pre_exec and platform credential checks require unsafe libc calls"
-)]
-pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
+/// Decide before forking whether the target needs fresh supplementary groups.
+#[allow(unsafe_code, reason = "issetugid has no safe wrapper")]
+fn needs_identity_switch(user: &User) -> Result<bool> {
     let running_as_root = Uid::effective().is_root();
     let must_switch = user.uid != Uid::current()
         || user.uid != Uid::effective()
@@ -148,6 +138,20 @@ pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
             user.name
         );
     }
+    Ok(must_switch)
+}
+
+/// Start the process described by `req` as `user`.
+///
+/// When the server does not run as root, `user` must be the account the
+/// server itself runs as; there is no way to change identity otherwise.
+///
+/// # Errors
+/// Fails if the target user cannot be assumed, a PTY cannot be allocated, or
+/// the program cannot be executed.
+#[allow(unsafe_code, reason = "pre_exec runs between fork and exec")]
+pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
+    let must_switch = needs_identity_switch(user)?;
 
     let home = home_of(user);
     let shell = shell_of(user);
@@ -301,15 +305,27 @@ fn drop_privileges(
             if libc::setresuid(uid, uid, uid) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            let (mut rgid, mut egid, mut sgid) = (0, 0, 0);
-            if libc::getresgid(&mut rgid, &mut egid, &mut sgid) != 0 {
+            let (mut group_real, mut group_effective, mut group_saved) = (0, 0, 0);
+            if libc::getresgid(
+                &raw mut group_real,
+                &raw mut group_effective,
+                &raw mut group_saved,
+            ) != 0
+            {
                 return Err(std::io::Error::last_os_error());
             }
-            let (mut ruid, mut euid, mut suid) = (0, 0, 0);
-            if libc::getresuid(&mut ruid, &mut euid, &mut suid) != 0 {
+            let (mut user_real, mut user_effective, mut user_saved) = (0, 0, 0);
+            if libc::getresuid(
+                &raw mut user_real,
+                &raw mut user_effective,
+                &raw mut user_saved,
+            ) != 0
+            {
                 return Err(std::io::Error::last_os_error());
             }
-            if [rgid, egid, sgid] != [gid; 3] || [ruid, euid, suid] != [uid; 3] {
+            if [group_real, group_effective, group_saved] != [gid; 3]
+                || [user_real, user_effective, user_saved] != [uid; 3]
+            {
                 return Err(std::io::Error::other("failed to drop privileges"));
             }
         }
