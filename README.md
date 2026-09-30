@@ -215,7 +215,7 @@ long-lived self-signed **Ed25519** certificate.
   a root daemon, a non-root target account, Linux 5.14+ with cgroup v2, and
   a writable delegated service cgroup (`Delegate=yes` under systemd). qsh
   does not grant the target account write access to the cgroup tree. It also
-  sets Linux `no_new_privs` and clears ambient capabilities for these
+  sets Linux `no_new_privs` and clears inheritable and ambient capabilities for these
   sessions, so `sudo`, setuid programs, and file capabilities cannot grant
   new privilege through this login.
 
@@ -274,10 +274,10 @@ long-lived self-signed **Ed25519** certificate.
   The supplementary groups are resolved *before* the fork: looking them up
   afterwards would mean calling NSS in a forked child, which is not
   async-signal-safe and deadlocks under LDAP or SSSD.
-  Linux ambient capabilities are cleared for every child, including when a
-  non-root daemon already has the requested UID. Ordinary sessions can still
-  use the account's setuid and file-capability programs; `no_new_privs` remains
-  specific to `--kill-session-processes`.
+  Linux inheritable and ambient capabilities are cleared for every child,
+  including when a non-root daemon already has the requested UID. Ordinary
+  sessions can still use the account's setuid and file-permitted-capability
+  programs; `no_new_privs` remains specific to `--kill-session-processes`.
   A non-root daemon inherits its account's supplementary groups at startup and
   cannot reset them. Restart it after removing group membership, and do not
   grant service-specific supplementary groups that remote sessions should lack.

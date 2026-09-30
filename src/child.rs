@@ -258,7 +258,7 @@ pub(crate) fn spawn_prepared(
     // SAFETY: only async-signal-safe libc calls between fork and exec.
     unsafe {
         cmd.as_std_mut().pre_exec(move || {
-            clear_ambient_capabilities()?;
+            clear_inheritable_capabilities()?;
             if let Some(procs) = &cgroup_procs {
                 cgroup::join_pre_exec(procs.as_raw_fd())?;
                 #[cfg(target_os = "linux")]
@@ -300,41 +300,61 @@ pub(crate) fn spawn_prepared(
     Ok(Spawned { child, io })
 }
 
-/// Service-specific ambient capabilities must not reach remote commands, even
-/// when a non-root daemon already has the requested UID. This does not prevent
-/// ordinary sessions from using their account's setuid or file-capability tools.
-#[cfg(target_os = "linux")]
-#[allow(unsafe_code, reason = "prctl is an async-signal-safe pre-exec syscall")]
-fn clear_ambient_capabilities() -> std::io::Result<()> {
-    // SAFETY: this operation takes integer arguments and no pointers.
-    if unsafe {
-        libc::prctl(
-            libc::PR_CAP_AMBIENT,
-            libc::PR_CAP_AMBIENT_CLEAR_ALL,
-            0,
-            0,
-            0,
-        )
-    } == 0
-    {
-        return Ok(());
+/// Service-specific inheritable or ambient capabilities must not reach remote
+/// commands. Preserve the current permitted/effective sets until the remaining
+/// cgroup and identity syscalls finish; ordinary exec then applies its normal
+/// setuid and file-permitted-capability rules.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(
+    unsafe_code,
+    reason = "capget and capset are async-signal-safe pre-exec syscalls"
+)]
+fn clear_inheritable_capabilities() -> std::io::Result<()> {
+    const VERSION_3: u32 = 0x2008_0522;
+
+    #[repr(C)]
+    struct Header {
+        version: u32,
+        pid: i32,
     }
-    let error = std::io::Error::last_os_error();
-    // Kernels predating ambient capabilities reject this operation with EINVAL;
-    // they cannot carry the authority we are clearing.
-    if error.raw_os_error() == Some(libc::EINVAL) {
-        Ok(())
-    } else {
-        Err(error)
+
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    struct Data {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
     }
+
+    let mut header = Header {
+        version: VERSION_3,
+        pid: 0,
+    };
+    let mut data = [Data {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: both syscalls receive fixed-size stack objects matching the Linux
+    // capability v3 ABI, and pid 0 selects the calling thread.
+    if unsafe { libc::syscall(libc::SYS_capget, &raw mut header, data.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    for word in &mut data {
+        word.inheritable = 0;
+    }
+    if unsafe { libc::syscall(libc::SYS_capset, &raw const header, data.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 #[allow(
     clippy::unnecessary_wraps,
     reason = "same pre-exec contract on every Unix platform"
 )]
-fn clear_ambient_capabilities() -> std::io::Result<()> {
+fn clear_inheritable_capabilities() -> std::io::Result<()> {
     Ok(())
 }
 
@@ -678,28 +698,45 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn same_user_sessions_do_not_inherit_ambient_capabilities() {
-        const MARKER: &str = "QSH_TEST_AMBIENT_CAPABILITIES";
+    async fn sessions_do_not_inherit_service_capabilities() {
+        const MARKER: &str = "QSH_TEST_SERVICE_CAPABILITIES";
         if let Ok(case) = std::env::var(MARKER) {
             let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
-            let ambient = status
-                .lines()
-                .find(|line| line.starts_with("CapAmb:"))
-                .unwrap();
-            assert!(ambient.ends_with("0000000000000400"), "{ambient}");
+            let capability = |field: &str| {
+                let line = status.lines().find(|line| line.starts_with(field)).unwrap();
+                u64::from_str_radix(line.split_whitespace().nth(1).unwrap(), 16).unwrap()
+            };
+            assert_eq!(capability("CapInh:"), 0x400);
             if case == "direct" {
-                clear_ambient_capabilities().unwrap();
-                let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
-                let ambient = status
+                assert_eq!(capability("CapAmb:"), 0x400);
+                let permitted = capability("CapPrm:");
+                let effective = capability("CapEff:");
+                clear_inheritable_capabilities().unwrap();
+                let cleared = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+                for field in ["CapInh:", "CapAmb:"] {
+                    let line = cleared
+                        .lines()
+                        .find(|line| line.starts_with(field))
+                        .unwrap();
+                    assert!(line.ends_with("0000000000000000"), "{line}");
+                }
+                assert!(cleared
                     .lines()
-                    .find(|line| line.starts_with("CapAmb:"))
-                    .unwrap();
-                assert!(ambient.ends_with("0000000000000000"), "{ambient}");
+                    .any(|line| line == format!("CapPrm:\t{permitted:016x}")));
+                assert!(cleared
+                    .lines()
+                    .any(|line| line == format!("CapEff:\t{effective:016x}")));
                 return;
             }
-            assert_eq!(case, "child");
-            let user = current_user().unwrap();
-            assert!(!user.uid.is_root());
+            let user = if case == "child" {
+                let user = current_user().unwrap();
+                assert!(!user.uid.is_root());
+                user
+            } else {
+                assert_eq!(case, "root-switch");
+                assert!(Uid::effective().is_root());
+                resolve_user("nobody").unwrap()
+            };
             let mut spawned = spawn(&user, &request(&["cat", "/proc/self/status"], false)).unwrap();
             let ChildIo::Pipes { stdout, .. } = &mut spawned.io else {
                 panic!("expected pipes");
@@ -707,7 +744,7 @@ mod tests {
             let mut child_status = String::new();
             stdout.read_to_string(&mut child_status).await.unwrap();
             assert!(spawned.child.wait().await.unwrap().success());
-            for field in ["CapAmb:", "CapPrm:", "CapEff:"] {
+            for field in ["CapInh:", "CapAmb:", "CapPrm:", "CapEff:"] {
                 let line = child_status
                     .lines()
                     .find(|line| line.starts_with(field))
@@ -720,31 +757,45 @@ mod tests {
             return;
         }
         if !Uid::effective().is_root() {
-            eprintln!("skipping ambient capability integration: requires root and setpriv");
+            eprintln!("skipping service capability integration: requires root and setpriv");
             return;
         }
         let user = resolve_user("nobody").unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let test = "child::tests::sessions_do_not_inherit_service_capabilities";
+        for case in ["direct", "child"] {
+            let output = std::process::Command::new("setpriv")
+                .args([
+                    "--reuid",
+                    &user.uid.as_raw().to_string(),
+                    "--regid",
+                    &user.gid.as_raw().to_string(),
+                    "--clear-groups",
+                    "--inh-caps=+net_bind_service",
+                    "--ambient-caps=+net_bind_service",
+                ])
+                .arg(&executable)
+                .args(["--exact", test])
+                .env(MARKER, case)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: stdout: {} stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         let output = std::process::Command::new("setpriv")
-            .args([
-                "--reuid",
-                &user.uid.as_raw().to_string(),
-                "--regid",
-                &user.gid.as_raw().to_string(),
-                "--clear-groups",
-                "--inh-caps=+net_bind_service",
-                "--ambient-caps=+net_bind_service",
-            ])
-            .arg(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "child::tests::same_user_sessions_do_not_inherit_ambient_capabilities",
-            ])
-            .env(MARKER, "child")
+            .arg("--inh-caps=+net_bind_service")
+            .arg(&executable)
+            .args(["--exact", test])
+            .env(MARKER, "root-switch")
             .output()
             .unwrap();
         assert!(
             output.status.success(),
-            "stdout: {} stderr: {}",
+            "root-switch: stdout: {} stderr: {}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
