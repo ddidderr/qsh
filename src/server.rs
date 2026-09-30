@@ -1749,6 +1749,32 @@ mod tests {
         assert!(diagnostics.reload(&store, &authorized).is_empty());
     }
 
+    #[test]
+    fn reload_replaces_an_active_key_with_a_fail_closed_duplicate_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let authorized = dir.path();
+        let (pem, _) = crypto::generate_identity("client", &["client".into()], 30).unwrap();
+        let fingerprint = Fingerprint::of_cert(&crypto::cert_from_pem(&pem).unwrap()).unwrap();
+        let policy = format!("user = \"guest\"\nkey_fingerprint = \"{fingerprint}\"\n");
+        std::fs::write(authorized.join("alpha.crt"), &pem).unwrap();
+        std::fs::write(authorized.join("alpha.toml"), &policy).unwrap();
+        let store = RwLock::new(AuthStore::load(authorized).unwrap());
+        assert!(crate::sync::read(&store).lookup(&fingerprint).is_some());
+
+        std::fs::copy(authorized.join("alpha.crt"), authorized.join("beta.crt")).unwrap();
+        std::fs::copy(authorized.join("alpha.toml"), authorized.join("beta.toml")).unwrap();
+        let mut diagnostics = ReloadDiagnostics {
+            warnings: Vec::new(),
+            failure: None,
+        };
+        let messages = diagnostics.reload(&store, authorized);
+
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("refusing duplicate authorizations")));
+        assert!(crate::sync::read(&store).lookup(&fingerprint).is_none());
+    }
+
     #[tokio::test]
     async fn rejection_counts_are_reported_without_another_connection() {
         use std::sync::atomic::Ordering;

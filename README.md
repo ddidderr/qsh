@@ -323,6 +323,16 @@ different key, the entry is refused rather than applied.
 private keys, unrelated text, and later changes to the submitted path are not
 copied into the authorization store.
 
+Two authorization names may not hold the same public key. If concurrent or
+interrupted administration leaves duplicate fingerprints on disk, the server
+refuses every conflicting entry instead of choosing one by filename. `list`
+marks all of them as conflicts; `authorize --force` or `revoke` removes every
+alias while management commands are serialized by an advisory lock. If a
+management process stops partway through, a denial marker keeps that key
+inactive. Revocation markers remain as tombstones; an explicit later
+`authorize` for the same key removes its marker only after the new pair is
+complete.
+
 Environment overrides for both binaries: `QSH_HOME` (client directory) and
 `QSH_SERVER_HOME` (server directory); `qsh-server --dir` and `qsh -i` do the
 same per invocation.

@@ -1,6 +1,6 @@
 //! On-disk layout, configuration files and the authorisation store.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{load_cert, Fingerprint};
+use crate::crypto::{load_cert, write_public, Fingerprint};
 
 /// Default UDP port. QUIC is UDP, so this does not collide with sshd.
 pub const DEFAULT_PORT: u16 = 2222;
@@ -299,10 +299,21 @@ pub struct AuthEntry {
 }
 
 /// All authorised clients, loaded from `authorized/`.
+///
+/// Entries retain their administrator-visible names. A second name for the
+/// same public key is retained for management and diagnostics, but the
+/// fingerprint is not exposed through [`Self::lookup`] until the conflict is
+/// repaired. Silently choosing either policy would let removing one name
+/// reactivate the other.
 #[derive(Debug, Clone, Default)]
 pub struct AuthStore {
-    entries: BTreeMap<Fingerprint, AuthEntry>,
+    entries: Vec<AuthEntry>,
+    names_by_fingerprint: BTreeMap<Fingerprint, Vec<String>>,
+    fingerprints_by_name: BTreeMap<String, Fingerprint>,
+    denied_fingerprints: BTreeSet<Fingerprint>,
 }
+
+const AUTH_DENIAL_PREFIX: &str = ".qsh-deny-sha256-";
 
 impl AuthStore {
     /// Load every `<name>.crt` in `dir` together with its `<name>.toml`.
@@ -311,104 +322,320 @@ impl AuthStore {
     /// failing the whole server: one broken file must not lock everyone out.
     ///
     /// # Errors
-    /// Fails only if the directory itself cannot be listed.
+    /// Fails if the shared store lock cannot be acquired or the directory
+    /// cannot be listed.
     pub fn load(dir: &Path) -> Result<Self> {
-        Self::load_with_warnings(dir, |warning| eprintln!("{warning}"))
+        let lock_path = authorization_lock_target(dir)?;
+        let _lock = FileLock::acquire(&lock_path, nix::fcntl::FlockArg::LockShared)?;
+        Self::load_unlocked(dir, |warning| eprintln!("{warning}"))
     }
 
     /// Let a long-running caller deduplicate diagnostics across reloads.
-    pub(crate) fn load_with_warnings(dir: &Path, mut warn: impl FnMut(String)) -> Result<Self> {
-        let mut entries = BTreeMap::new();
+    pub(crate) fn load_with_warnings(dir: &Path, warn: impl FnMut(String)) -> Result<Self> {
+        let lock_path = authorization_lock_target(dir)?;
+        let _lock = FileLock::acquire(&lock_path, nix::fcntl::FlockArg::LockShared)?;
+        Self::load_unlocked(dir, warn)
+    }
+
+    fn load_unlocked(dir: &Path, mut warn: impl FnMut(String)) -> Result<Self> {
+        let mut entries = Vec::new();
+        let mut names_by_fingerprint: BTreeMap<Fingerprint, Vec<String>> = BTreeMap::new();
+        let mut fingerprints_by_name = BTreeMap::new();
         let directory = match fs::read_dir(dir) {
             Ok(directory) => directory,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self { entries }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
         };
-        let mut names: Vec<_> = directory
+        let mut paths: Vec<_> = directory
             .collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()
             .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == "crt"))
             .collect();
-        names.sort();
+        paths.sort();
+        let denied_fingerprints = load_denial_markers(&paths, &mut warn);
+
+        let names = paths
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "crt"))
+            .collect::<Vec<_>>();
 
         for cert_path in names {
-            let name = cert_path
+            let utf8_name = cert_path
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .unwrap_or("?")
-                .to_string();
-            let meta_path = cert_path.with_extension("toml");
-            let mut load = || -> Result<AuthEntry> {
-                let cert = load_cert(&cert_path)?;
-                let fingerprint = Fingerprint::of_cert(&cert)?;
-                let text = fs::read_to_string(&meta_path)
-                    .with_context(|| format!("reading {}", meta_path.display()))?;
-                let meta: AuthMeta = toml::from_str(&text)
-                    .with_context(|| format!("parsing {}", meta_path.display()))?;
-                if meta.user.is_empty() {
-                    bail!("{} does not name a user", meta_path.display());
-                }
-                if !meta.allowed_commands.is_empty() {
+                .map(str::to_owned);
+            let name = utf8_name.clone().unwrap_or_else(|| "?".to_owned());
+            let cert = match load_cert(&cert_path) {
+                Ok(cert) => cert,
+                Err(error) => {
                     warn(format!(
-                        "qsh-server: warning: authorization `{name}` uses an executable-name \
-                         filter; its arguments and subprocesses remain unrestricted"
+                        "qsh-server: ignoring authorization `{name}`: {error:#}"
                     ));
+                    continue;
                 }
-                // Refuse a policy that was written for a different key rather
-                // than applying it to this one.
-                match &meta.key_fingerprint {
-                    Some(expected) if expected != &fingerprint.to_string() => bail!(
-                        "{} was written for key {expected}, but {} holds {fingerprint}",
-                        meta_path.display(),
-                        cert_path.display()
-                    ),
-                    Some(_) => {}
-                    // Written before this field existed. Accepted so an
-                    // upgrade does not lock everyone out, but it cannot be
-                    // checked, so say so — rewriting the entry with
-                    // `qsh-server authorize` records the key.
-                    None => warn(format!(
-                        "qsh-server: warning: {} does not record which key it is for; \
-                         re-run `qsh-server authorize` for `{name}` to fix that",
-                        meta_path.display()
-                    )),
-                }
-                Ok(AuthEntry {
-                    name: name.clone(),
-                    fingerprint,
-                    meta,
-                })
             };
-            match load() {
-                Ok(entry) => {
-                    entries.insert(entry.fingerprint, entry);
-                }
+            let fingerprint = Fingerprint::of_cert(&cert)?;
+            names_by_fingerprint
+                .entry(fingerprint)
+                .or_default()
+                .push(name.clone());
+            if let Some(name) = utf8_name {
+                fingerprints_by_name.insert(name, fingerprint);
+            }
+
+            match load_auth_entry(&cert_path, name.clone(), fingerprint, &mut warn) {
+                Ok(entry) => entries.push(entry),
                 Err(e) => warn(format!(
                     "qsh-server: ignoring authorization `{name}`: {e:#}"
                 )),
             }
         }
-        Ok(Self { entries })
+        for (fingerprint, names) in &names_by_fingerprint {
+            if names.len() > 1 {
+                warn(format!(
+                    "qsh-server: refusing duplicate authorizations for {fingerprint}: {}; \
+                     revoke the duplicates or repair them with `qsh-server authorize --force`",
+                    names.join(", ")
+                ));
+            }
+        }
+        for fingerprint in &denied_fingerprints {
+            if names_by_fingerprint.contains_key(fingerprint) {
+                warn(format!(
+                    "qsh-server: refusing {fingerprint}: an authorization mutation was \
+                     interrupted; rerun `authorize --force` to enable it or `revoke` to \
+                     finish removing it"
+                ));
+            }
+        }
+        Ok(Self {
+            entries,
+            names_by_fingerprint,
+            fingerprints_by_name,
+            denied_fingerprints,
+        })
     }
 
     #[must_use]
     pub fn fingerprints(&self) -> Vec<Fingerprint> {
-        self.entries.keys().copied().collect()
+        self.names_by_fingerprint
+            .keys()
+            .filter(|fingerprint| self.lookup(fingerprint).is_some())
+            .copied()
+            .collect()
     }
 
     #[must_use]
     pub fn lookup(&self, fp: &Fingerprint) -> Option<&AuthEntry> {
-        self.entries.get(fp)
+        if self.denied_fingerprints.contains(fp) {
+            return None;
+        }
+        let names = self.names_by_fingerprint.get(fp)?;
+        let [_name] = names.as_slice() else {
+            return None;
+        };
+        self.entries.iter().find(|entry| entry.fingerprint == *fp)
     }
 
     pub fn entries(&self) -> impl Iterator<Item = &AuthEntry> {
-        self.entries.values()
+        self.entries
+            .iter()
+            .filter(|entry| self.lookup(&entry.fingerprint).is_some())
+    }
+
+    /// Every valid on-disk entry, including entries refused due to a duplicate
+    /// fingerprint. Management commands use this to make conflicts visible.
+    pub fn stored_entries(&self) -> impl Iterator<Item = &AuthEntry> {
+        self.entries.iter()
+    }
+
+    /// All administrator-visible names holding this public key.
+    #[must_use]
+    pub fn names_for_fingerprint(&self, fingerprint: &Fingerprint) -> &[String] {
+        self.names_by_fingerprint
+            .get(fingerprint)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// The public key stored under `name`, even when duplicate names make it
+    /// ineligible for authentication.
+    #[must_use]
+    pub fn fingerprint_for_name(&self, name: &str) -> Option<Fingerprint> {
+        self.fingerprints_by_name.get(name).copied()
+    }
+
+    #[must_use]
+    pub fn has_fingerprint_conflict(&self, fingerprint: &Fingerprint) -> bool {
+        self.names_for_fingerprint(fingerprint).len() > 1
+    }
+
+    #[must_use]
+    pub fn is_fingerprint_denied(&self, fingerprint: &Fingerprint) -> bool {
+        self.denied_fingerprints.contains(fingerprint)
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries().next().is_none()
+    }
+
+    /// Serialize `qsh-server` mutations of one authorization directory.
+    ///
+    /// Runtime reloads take the matching shared lock so they observe either the
+    /// old state or the completed mutation, never a mixture of both.
+    ///
+    /// # Errors
+    /// Fails if the sidecar lock cannot be created or acquired.
+    pub fn lock_directory(dir: &Path) -> Result<AuthorizationLock> {
+        let lock_path = authorization_lock_target(dir)?;
+        FileLock::acquire(&lock_path, nix::fcntl::FlockArg::LockExclusive).map(|lock| {
+            AuthorizationLock {
+                dir: dir.to_owned(),
+                _lock: lock,
+            }
+        })
+    }
+}
+
+fn load_denial_markers(paths: &[PathBuf], warn: &mut impl FnMut(String)) -> BTreeSet<Fingerprint> {
+    let mut denied = BTreeSet::new();
+    for path in paths {
+        let Some(result) = denial_fingerprint(path) else {
+            continue;
+        };
+        match result {
+            Ok(fingerprint) => {
+                denied.insert(fingerprint);
+            }
+            Err(error) => warn(format!(
+                "qsh-server: ignoring malformed authorization denial marker {}: {error:#}",
+                path.display()
+            )),
+        }
+    }
+    denied
+}
+
+fn load_auth_entry(
+    cert_path: &Path,
+    name: String,
+    fingerprint: Fingerprint,
+    warn: &mut impl FnMut(String),
+) -> Result<AuthEntry> {
+    let meta_path = cert_path.with_extension("toml");
+    let text = fs::read_to_string(&meta_path)
+        .with_context(|| format!("reading {}", meta_path.display()))?;
+    let meta: AuthMeta =
+        toml::from_str(&text).with_context(|| format!("parsing {}", meta_path.display()))?;
+    if meta.user.is_empty() {
+        bail!("{} does not name a user", meta_path.display());
+    }
+    if !meta.allowed_commands.is_empty() {
+        warn(format!(
+            "qsh-server: warning: authorization `{name}` uses an executable-name \
+             filter; its arguments and subprocesses remain unrestricted"
+        ));
+    }
+    // Refuse a policy that was written for a different key rather than
+    // applying it to this one.
+    match &meta.key_fingerprint {
+        Some(expected) if expected != &fingerprint.to_string() => bail!(
+            "{} was written for key {expected}, but {} holds {fingerprint}",
+            meta_path.display(),
+            cert_path.display()
+        ),
+        Some(_) => {}
+        // Written before this field existed. Accepted so an upgrade does not
+        // lock everyone out, but it cannot be checked, so say so.
+        None => warn(format!(
+            "qsh-server: warning: {} does not record which key it is for; \
+             re-run `qsh-server authorize` for `{name}` to fix that",
+            meta_path.display()
+        )),
+    }
+    Ok(AuthEntry {
+        name,
+        fingerprint,
+        meta,
+    })
+}
+
+/// Exclusive authorization-directory mutation guard.
+#[derive(Debug)]
+pub struct AuthorizationLock {
+    dir: PathBuf,
+    _lock: FileLock,
+}
+
+impl AuthorizationLock {
+    /// Load the store while this guard already holds its exclusive lock.
+    ///
+    /// # Errors
+    /// Fails if the authorization directory cannot be listed.
+    pub fn load(&self) -> Result<AuthStore> {
+        AuthStore::load_unlocked(&self.dir, |warning| eprintln!("{warning}"))
+    }
+
+    /// Deny a fingerprint before beginning a multi-file mutation. The marker
+    /// survives process interruption and keeps any remaining alias fail-closed.
+    ///
+    /// # Errors
+    /// Fails if the marker cannot be published atomically.
+    pub fn deny_fingerprint(&self, fingerprint: Fingerprint) -> Result<()> {
+        write_public(
+            &denial_path(&self.dir, fingerprint),
+            &format!("deny {fingerprint}\n"),
+        )
+    }
+
+    /// Clear a completed mutation's denial marker.
+    ///
+    /// # Errors
+    /// Fails if an existing marker cannot be removed.
+    pub fn clear_fingerprint_denial(&self, fingerprint: Fingerprint) -> Result<()> {
+        let path = denial_path(&self.dir, fingerprint);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+        }
+    }
+}
+
+fn denial_path(dir: &Path, fingerprint: Fingerprint) -> PathBuf {
+    let fingerprint = fingerprint.to_string();
+    let digest = fingerprint.strip_prefix("sha256:").unwrap_or(&fingerprint);
+    dir.join(format!("{AUTH_DENIAL_PREFIX}{digest}"))
+}
+
+fn denial_fingerprint(path: &Path) -> Option<Result<Fingerprint>> {
+    let digest = path
+        .file_name()?
+        .to_str()?
+        .strip_prefix(AUTH_DENIAL_PREFIX)?;
+    Some(Fingerprint::parse(&format!("sha256:{digest}")))
+}
+
+fn authorization_lock_target(dir: &Path) -> Result<PathBuf> {
+    match fs::canonicalize(dir) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some(parent) = dir.parent() else {
+                return Ok(dir.to_owned());
+            };
+            match fs::canonicalize(parent) {
+                Ok(parent) => Ok(dir
+                    .file_name()
+                    .map_or(parent.clone(), |name| parent.join(name))),
+                Err(parent_error) if parent_error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(dir.to_owned())
+                }
+                Err(parent_error) => {
+                    Err(parent_error).with_context(|| format!("resolving {}", parent.display()))
+                }
+            }
+        }
+        Err(error) => Err(error).with_context(|| format!("resolving {}", dir.display())),
     }
 }
 
@@ -423,13 +650,14 @@ enum Trust {
 ///
 /// The lock lives on a sidecar so that the file itself can still be replaced
 /// by an atomic rename underneath it.
+#[derive(Debug)]
 struct FileLock {
     /// Holding the `Flock` is what holds the lock; it releases on drop.
     _flock: nix::fcntl::Flock<fs::File>,
 }
 
 impl FileLock {
-    fn acquire(path: &Path) -> Result<Self> {
+    fn acquire(path: &Path, operation: nix::fcntl::FlockArg) -> Result<Self> {
         let lock_path = path.with_extension("lock");
         if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent)?;
@@ -440,7 +668,7 @@ impl FileLock {
             .write(true)
             .open(&lock_path)
             .with_context(|| format!("opening {}", lock_path.display()))?;
-        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+        nix::fcntl::Flock::lock(file, operation)
             .map(|flock| Self { _flock: flock })
             .map_err(|(_, e)| anyhow!("locking {}: {e}", lock_path.display()))
     }
@@ -534,7 +762,7 @@ impl KnownHosts {
         // Everything from here to the rename happens under the lock, so a
         // concurrent client cannot read the old file, decide, and write back a
         // snapshot that drops what we just added.
-        let _lock = FileLock::acquire(&self.path)?;
+        let _lock = FileLock::acquire(&self.path, nix::fcntl::FlockArg::LockExclusive)?;
         self.refresh()?;
         if trust == Trust::OnlyIfAbsentOrEqual {
             if let Some(existing) = self.get(&host_key) {
@@ -564,7 +792,7 @@ impl KnownHosts {
     /// Fails if the file cannot be written.
     pub fn remove(&mut self, host_key: &str) -> Result<usize> {
         let host_key = host::canonical_key(host_key)?;
-        let _lock = FileLock::acquire(&self.path)?;
+        let _lock = FileLock::acquire(&self.path, nix::fcntl::FlockArg::LockExclusive)?;
         self.refresh()?;
         let before = self.entries.len();
         self.entries.retain(|(h, _)| *h != host_key);
@@ -832,14 +1060,164 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cert_pem, _) =
             crate::crypto::generate_identity("laptop", &["laptop".into()], 30).unwrap();
+        let (orphan_pem, _) =
+            crate::crypto::generate_identity("orphan", &["orphan".into()], 30).unwrap();
         fs::write(dir.path().join("laptop.crt"), &cert_pem).unwrap();
         fs::write(dir.path().join("laptop.toml"), "user = \"alice\"\n").unwrap();
-        // No .toml companion: must be ignored, not fatal.
-        fs::write(dir.path().join("orphan.crt"), &cert_pem).unwrap();
+        // A distinct certificate with no .toml companion is ignored without
+        // affecting valid keys. A same-key orphan is deliberately a conflict.
+        fs::write(dir.path().join("orphan.crt"), &orphan_pem).unwrap();
 
         let store = AuthStore::load(dir.path()).unwrap();
         assert_eq!(store.entries().count(), 1);
         assert_eq!(store.entries().next().unwrap().meta.user, "alice");
+    }
+
+    #[test]
+    fn auth_store_refuses_duplicate_fingerprints_without_hiding_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_pem, _) =
+            crate::crypto::generate_identity("laptop", &["laptop".into()], 30).unwrap();
+        let cert = crate::crypto::cert_from_pem(&cert_pem).unwrap();
+        let fingerprint = Fingerprint::of_cert(&cert).unwrap();
+        let policy = format!("user = \"alice\"\nkey_fingerprint = \"{fingerprint}\"\n");
+        for name in ["alpha", "beta"] {
+            fs::write(dir.path().join(format!("{name}.crt")), &cert_pem).unwrap();
+            fs::write(dir.path().join(format!("{name}.toml")), &policy).unwrap();
+        }
+
+        let mut warnings = Vec::new();
+        let store =
+            AuthStore::load_with_warnings(dir.path(), |warning| warnings.push(warning)).unwrap();
+        assert!(store.lookup(&fingerprint).is_none());
+        assert!(store.is_empty());
+        assert!(store.has_fingerprint_conflict(&fingerprint));
+        assert_eq!(
+            store.names_for_fingerprint(&fingerprint),
+            &["alpha".to_owned(), "beta".to_owned()]
+        );
+        assert_eq!(store.stored_entries().count(), 2);
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("refusing duplicate authorizations")
+                && warning.contains("alpha")
+                && warning.contains("beta")
+        }));
+    }
+
+    #[test]
+    fn malformed_policy_alias_still_blocks_and_identifies_its_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_pem, _) =
+            crate::crypto::generate_identity("laptop", &["laptop".into()], 30).unwrap();
+        let cert = crate::crypto::cert_from_pem(&cert_pem).unwrap();
+        let fingerprint = Fingerprint::of_cert(&cert).unwrap();
+        fs::write(dir.path().join("alpha.crt"), &cert_pem).unwrap();
+        fs::write(
+            dir.path().join("alpha.toml"),
+            format!("user = \"alice\"\nkey_fingerprint = \"{fingerprint}\"\n"),
+        )
+        .unwrap();
+        fs::write(dir.path().join("broken.crt"), &cert_pem).unwrap();
+        fs::write(dir.path().join("broken.toml"), "not valid TOML").unwrap();
+
+        let store = AuthStore::load(dir.path()).unwrap();
+        assert!(store.lookup(&fingerprint).is_none());
+        assert_eq!(
+            store.names_for_fingerprint(&fingerprint),
+            &["alpha".to_owned(), "broken".to_owned()]
+        );
+        assert_eq!(store.fingerprint_for_name("broken"), Some(fingerprint));
+    }
+
+    #[test]
+    fn interrupted_mutation_marker_keeps_a_unique_entry_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_pem, _) =
+            crate::crypto::generate_identity("laptop", &["laptop".into()], 30).unwrap();
+        let cert = crate::crypto::cert_from_pem(&cert_pem).unwrap();
+        let fingerprint = Fingerprint::of_cert(&cert).unwrap();
+        fs::write(dir.path().join("laptop.crt"), &cert_pem).unwrap();
+        fs::write(
+            dir.path().join("laptop.toml"),
+            format!("user = \"alice\"\nkey_fingerprint = \"{fingerprint}\"\n"),
+        )
+        .unwrap();
+
+        let lock = AuthStore::lock_directory(dir.path()).unwrap();
+        lock.deny_fingerprint(fingerprint).unwrap();
+        drop(lock);
+        let store = AuthStore::load(dir.path()).unwrap();
+        assert!(store.is_fingerprint_denied(&fingerprint));
+        assert!(store.lookup(&fingerprint).is_none());
+
+        let lock = AuthStore::lock_directory(dir.path()).unwrap();
+        lock.clear_fingerprint_denial(fingerprint).unwrap();
+        drop(lock);
+        assert!(AuthStore::load(dir.path())
+            .unwrap()
+            .lookup(&fingerprint)
+            .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unique_non_utf8_authorization_name_remains_usable() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_pem, _) =
+            crate::crypto::generate_identity("laptop", &["laptop".into()], 30).unwrap();
+        let cert = crate::crypto::cert_from_pem(&cert_pem).unwrap();
+        let fingerprint = Fingerprint::of_cert(&cert).unwrap();
+        let cert_name = OsString::from_vec(b"laptop-\xff.crt".to_vec());
+        let meta_name = OsString::from_vec(b"laptop-\xff.toml".to_vec());
+        fs::write(dir.path().join(cert_name), &cert_pem).unwrap();
+        fs::write(
+            dir.path().join(meta_name),
+            format!("user = \"alice\"\nkey_fingerprint = \"{fingerprint}\"\n"),
+        )
+        .unwrap();
+
+        let store = AuthStore::load(dir.path()).unwrap();
+        assert_eq!(
+            store.lookup(&fingerprint).map(|entry| entry.name.as_str()),
+            Some("?")
+        );
+    }
+
+    #[test]
+    fn authorization_directory_lock_serializes_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("shared");
+        let first_home = dir.path().join("first");
+        let second_home = dir.path().join("second");
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(&first_home).unwrap();
+        fs::create_dir(&second_home).unwrap();
+        std::os::unix::fs::symlink(&target, first_home.join("authorized")).unwrap();
+        std::os::unix::fs::symlink(&target, second_home.join("authorized")).unwrap();
+        let first = AuthStore::lock_directory(&first_home.join("authorized")).unwrap();
+        let path = second_home.join("authorized");
+        let (attempting, started) = std::sync::mpsc::channel();
+        let (acquired, finished) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            attempting.send(()).unwrap();
+            let _second = AuthStore::lock_directory(&path).unwrap();
+            acquired.send(()).unwrap();
+        });
+
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(finished
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        drop(first);
+        finished
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        writer.join().unwrap();
     }
 
     #[test]

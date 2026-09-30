@@ -260,6 +260,7 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
     validate_entry_name(&name)?;
 
     let dir = paths.authorized();
+    let lock = AuthStore::lock_directory(&dir)?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let cert_path = dir.join(format!("{name}.crt"));
     if cert_path.exists() && !args.force {
@@ -269,24 +270,10 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
         );
     }
 
-    let existing = AuthStore::load(&dir)?;
-    let mut replaced: Option<String> = None;
-    if let Some(other) = existing.lookup(&fp) {
-        if other.name != name {
-            if !args.force {
-                bail!(
-                    "that key is already authorized as `{}`; revoke it first or pass --force",
-                    other.name
-                );
-            }
-            // The old files have to go — two entries for one key would be
-            // resolved by file name order, so the policy that actually applied
-            // would be a coin toss, and revoking the new name would quietly
-            // reinstate the old one. Removing them only after the new pair is
-            // on disk means a failure in between leaves the old authorization
-            // working rather than leaving the key locked out.
-            replaced = Some(other.name.clone());
-        }
+    let existing = lock.load()?;
+    let replacement = replacement_plan(&existing, fp, &name, args.force)?;
+    for fingerprint in &replacement.denied_fingerprints {
+        lock.deny_fingerprint(*fingerprint)?;
     }
 
     let expires = args
@@ -325,13 +312,26 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
     )?;
     crypto::write_certificate(&cert_path, &cert)?;
 
-    if let Some(old) = &replaced {
+    // Duplicate fingerprints are denied by AuthStore, so publishing the new
+    // pair before deleting every alias is fail-closed if this process stops.
+    for old in &replacement.aliases {
         remove_entry(&dir, old)?;
     }
+    // Displaced fingerprints stay tombstoned after their files are removed.
+    // Only this explicitly authorized key is made live again.
+    lock.clear_fingerprint_denial(fp)?;
 
     println!("Authorized `{name}` ({fp}) as user `{}`.", args.user);
-    if let Some(old) = replaced {
-        println!("Removed the previous authorization `{old}` for the same key.");
+    if !replacement.aliases.is_empty() {
+        println!(
+            "Removed previous authorization aliases: {}.",
+            replacement
+                .aliases
+                .iter()
+                .map(|old| format!("`{old}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     if let Some(days) = args.expires_in_days {
         println!("Expires in {days} days; after that the key is refused.");
@@ -355,15 +355,109 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
     Ok(())
 }
 
+struct ReplacementPlan {
+    aliases: Vec<String>,
+    denied_fingerprints: Vec<Fingerprint>,
+}
+
+fn replacement_plan(
+    existing: &AuthStore,
+    fingerprint: Fingerprint,
+    name: &str,
+    force: bool,
+) -> Result<ReplacementPlan> {
+    let aliases: Vec<_> = existing
+        .names_for_fingerprint(&fingerprint)
+        .iter()
+        .filter(|old| old.as_str() != name)
+        .cloned()
+        .collect();
+    if !aliases.is_empty() && !force {
+        bail!(
+            "that key is already authorized as {}; revoke it first or pass --force",
+            aliases
+                .iter()
+                .map(|old| format!("`{old}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let mut replaced = if force { aliases } else { Vec::new() };
+    let mut denied = Vec::new();
+    let mut deny_target = existing.is_fingerprint_denied(&fingerprint);
+    // Replacing a name that belongs to a conflicted old fingerprint must not
+    // make one of its formerly hidden aliases active. Treat those invalid
+    // aliases as part of the forced repair as well.
+    if force {
+        deny_target |= !replaced.is_empty() || existing.fingerprint_for_name(name).is_some();
+        if let Some(old_fingerprint) = existing.fingerprint_for_name(name) {
+            if old_fingerprint != fingerprint {
+                denied.push(old_fingerprint);
+                replaced.extend(
+                    existing
+                        .names_for_fingerprint(&old_fingerprint)
+                        .iter()
+                        .filter(|old| old.as_str() != name)
+                        .cloned(),
+                );
+            }
+        }
+        replaced.sort();
+        replaced.dedup();
+    }
+    denied.sort();
+    denied.dedup();
+    if deny_target {
+        denied.retain(|old| old != &fingerprint);
+        // Clear the target marker last, after displaced keys are already safe.
+        denied.push(fingerprint);
+    }
+    Ok(ReplacementPlan {
+        aliases: replaced,
+        denied_fingerprints: denied,
+    })
+}
+
 fn revoke(paths: &ServerPaths, args: &Revoke) -> Result<()> {
     // Without this, `revoke ../server` would delete the host key, and an
     // absolute name could reach any .crt/.toml on the filesystem.
     validate_entry_name(&args.name)?;
     let dir = paths.authorized();
-    if remove_entry(&dir, &args.name)? == 0 {
+    let lock = AuthStore::lock_directory(&dir)?;
+    let store = lock.load()?;
+    let fingerprint = store.fingerprint_for_name(&args.name);
+    if let Some(fingerprint) = fingerprint {
+        lock.deny_fingerprint(fingerprint)?;
+    }
+    let mut names = store.fingerprint_for_name(&args.name).map_or_else(
+        || vec![args.name.clone()],
+        |fingerprint| store.names_for_fingerprint(&fingerprint).to_vec(),
+    );
+    // Remove aliases first and the explicitly requested name last. If the
+    // process stops midway, no hidden alternate policy can become the winner.
+    names.retain(|name| name != &args.name);
+    names.push(args.name.clone());
+    let mut removed = 0;
+    for name in &names {
+        removed += remove_entry(&dir, name)?;
+    }
+    if removed == 0 {
         bail!("no authorization named `{}`", args.name);
     }
     println!("Revoked `{}`.", args.name);
+    let aliases = names
+        .get(..names.len().saturating_sub(1))
+        .unwrap_or_default();
+    if !aliases.is_empty() {
+        println!(
+            "Also removed duplicate aliases: {}.",
+            aliases
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -383,12 +477,18 @@ fn remove_entry(dir: &Path, name: &str) -> Result<usize> {
 
 fn list(paths: &ServerPaths) -> Result<()> {
     let store = AuthStore::load(&paths.authorized())?;
-    if store.is_empty() {
+    if store.stored_entries().next().is_none() {
         println!("no authorized clients in {}", paths.authorized().display());
         return Ok(());
     }
-    for entry in store.entries() {
+    for entry in store.stored_entries() {
         let mut notes = Vec::new();
+        if store.has_fingerprint_conflict(&entry.fingerprint) {
+            notes.push("CONFLICT: duplicate fingerprint; refused".to_owned());
+        }
+        if store.is_fingerprint_denied(&entry.fingerprint) {
+            notes.push("DENIED: interrupted mutation".to_owned());
+        }
         if !entry.meta.allow_shell {
             notes.push("no-shell".to_string());
         }
@@ -452,6 +552,37 @@ fn hostname() -> String {
 mod tests {
     use super::*;
 
+    fn current_user_name() -> String {
+        nix::unistd::User::from_uid(nix::unistd::getuid())
+            .unwrap()
+            .unwrap()
+            .name
+    }
+
+    fn authorize_args(certificate: &Path, name: &str, force: bool) -> Authorize {
+        Authorize {
+            certificate: certificate.to_path_buf(),
+            user: current_user_name(),
+            name: Some(name.to_owned()),
+            no_shell: false,
+            no_exec: false,
+            commands: Vec::new(),
+            expires_in_days: None,
+            kill_session_processes: false,
+            force,
+        }
+    }
+
+    fn copy_entry(dir: &Path, from: &str, to: &str) {
+        for extension in ["crt", "toml"] {
+            std::fs::copy(
+                dir.join(format!("{from}.{extension}")),
+                dir.join(format!("{to}.{extension}")),
+            )
+            .unwrap();
+        }
+    }
+
     #[test]
     fn authorize_publishes_only_the_certificate_bound_to_its_policy() {
         let dir = tempfile::tempdir().unwrap();
@@ -466,15 +597,13 @@ mod tests {
         .unwrap();
         let original = crypto::load_cert(&source).unwrap();
         let fingerprint = Fingerprint::of_cert(&original).unwrap();
-        let user = nix::unistd::User::from_uid(nix::unistd::getuid())
-            .unwrap()
-            .unwrap();
+        let user = current_user_name();
 
         authorize(
             &paths,
             Authorize {
                 certificate: source,
-                user: user.name.clone(),
+                user: user.clone(),
                 name: Some("client".into()),
                 no_shell: false,
                 no_exec: false,
@@ -494,7 +623,176 @@ mod tests {
         assert_eq!(sections[0].contents(), original.as_ref());
         let store = AuthStore::load(&paths.authorized()).unwrap();
         let entry = store.lookup(&fingerprint).unwrap();
-        assert_eq!(entry.meta.user, user.name);
+        assert_eq!(entry.meta.user, user);
         assert_eq!(entry.meta.key_fingerprint, Some(fingerprint.to_string()));
+    }
+
+    #[test]
+    fn force_authorize_repairs_every_alias_for_one_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ServerPaths::new(dir.path().join("server"));
+        let source = dir.path().join("submitted.crt");
+        let (cert_pem, _) = crypto::generate_identity("client", &["localhost".into()], 30).unwrap();
+        crypto::write_public(&source, &cert_pem).unwrap();
+
+        authorize(&paths, authorize_args(&source, "alpha", false)).unwrap();
+        copy_entry(&paths.authorized(), "alpha", "beta");
+        copy_entry(&paths.authorized(), "alpha", "gamma");
+        let fingerprint = Fingerprint::of_cert(&crypto::load_cert(&source).unwrap()).unwrap();
+        assert!(AuthStore::load(&paths.authorized())
+            .unwrap()
+            .lookup(&fingerprint)
+            .is_none());
+
+        authorize(&paths, authorize_args(&source, "current", true)).unwrap();
+
+        let store = AuthStore::load(&paths.authorized()).unwrap();
+        assert_eq!(
+            store.lookup(&fingerprint).map(|entry| entry.name.as_str()),
+            Some("current")
+        );
+        assert_eq!(store.stored_entries().count(), 1);
+        for old in ["alpha", "beta", "gamma"] {
+            assert!(!paths.authorized().join(format!("{old}.crt")).exists());
+            assert!(!paths.authorized().join(format!("{old}.toml")).exists());
+        }
+    }
+
+    #[test]
+    fn revoke_removes_every_alias_for_one_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ServerPaths::new(dir.path().join("server"));
+        let source = dir.path().join("submitted.crt");
+        let (cert_pem, _) = crypto::generate_identity("client", &["localhost".into()], 30).unwrap();
+        crypto::write_public(&source, &cert_pem).unwrap();
+
+        authorize(&paths, authorize_args(&source, "alpha", false)).unwrap();
+        copy_entry(&paths.authorized(), "alpha", "beta");
+        revoke(
+            &paths,
+            &Revoke {
+                name: "beta".into(),
+            },
+        )
+        .unwrap();
+
+        assert!(AuthStore::load(&paths.authorized()).unwrap().is_empty());
+        for name in ["alpha", "beta"] {
+            assert!(!paths.authorized().join(format!("{name}.crt")).exists());
+            assert!(!paths.authorized().join(format!("{name}.toml")).exists());
+        }
+    }
+
+    #[test]
+    fn interrupted_revoke_cannot_reactivate_the_remaining_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ServerPaths::new(dir.path().join("server"));
+        let source = dir.path().join("submitted.crt");
+        let (cert_pem, _) = crypto::generate_identity("client", &["localhost".into()], 30).unwrap();
+        crypto::write_public(&source, &cert_pem).unwrap();
+        authorize(&paths, authorize_args(&source, "alpha", false)).unwrap();
+        copy_entry(&paths.authorized(), "alpha", "beta");
+        let fingerprint = Fingerprint::of_cert(&crypto::load_cert(&source).unwrap()).unwrap();
+
+        let lock = AuthStore::lock_directory(&paths.authorized()).unwrap();
+        lock.deny_fingerprint(fingerprint).unwrap();
+        remove_entry(&paths.authorized(), "alpha").unwrap();
+        drop(lock); // Simulate the management process stopping before `beta`.
+
+        let interrupted = AuthStore::load(&paths.authorized()).unwrap();
+        assert_eq!(
+            interrupted.names_for_fingerprint(&fingerprint),
+            &["beta".to_owned()]
+        );
+        assert!(interrupted.lookup(&fingerprint).is_none());
+        revoke(
+            &paths,
+            &Revoke {
+                name: "beta".into(),
+            },
+        )
+        .unwrap();
+        assert!(AuthStore::load(&paths.authorized()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn revocation_tombstone_blocks_stale_files_until_reauthorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ServerPaths::new(dir.path().join("server"));
+        let source = dir.path().join("submitted.crt");
+        let (cert_pem, _) = crypto::generate_identity("client", &["localhost".into()], 30).unwrap();
+        crypto::write_public(&source, &cert_pem).unwrap();
+        authorize(&paths, authorize_args(&source, "client", false)).unwrap();
+        let cert = std::fs::read(paths.authorized().join("client.crt")).unwrap();
+        let policy = std::fs::read(paths.authorized().join("client.toml")).unwrap();
+        let fingerprint = Fingerprint::of_cert(&crypto::load_cert(&source).unwrap()).unwrap();
+
+        revoke(
+            &paths,
+            &Revoke {
+                name: "client".into(),
+            },
+        )
+        .unwrap();
+        std::fs::write(paths.authorized().join("client.crt"), cert).unwrap();
+        std::fs::write(paths.authorized().join("client.toml"), policy).unwrap();
+        assert!(AuthStore::load(&paths.authorized())
+            .unwrap()
+            .lookup(&fingerprint)
+            .is_none());
+
+        authorize(&paths, authorize_args(&source, "client", true)).unwrap();
+        assert!(AuthStore::load(&paths.authorized())
+            .unwrap()
+            .lookup(&fingerprint)
+            .is_some());
+    }
+
+    #[test]
+    fn interrupted_force_replacement_cannot_reactivate_the_old_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ServerPaths::new(dir.path().join("server"));
+        let old_source = dir.path().join("old.crt");
+        let new_source = dir.path().join("new.crt");
+        let (old_pem, _) = crypto::generate_identity("old", &["localhost".into()], 30).unwrap();
+        let (new_pem, _) = crypto::generate_identity("new", &["localhost".into()], 30).unwrap();
+        crypto::write_public(&old_source, &old_pem).unwrap();
+        crypto::write_public(&new_source, &new_pem).unwrap();
+        authorize(&paths, authorize_args(&old_source, "alpha", false)).unwrap();
+        copy_entry(&paths.authorized(), "alpha", "beta");
+        let old_fingerprint =
+            Fingerprint::of_cert(&crypto::load_cert(&old_source).unwrap()).unwrap();
+        let new_fingerprint =
+            Fingerprint::of_cert(&crypto::load_cert(&new_source).unwrap()).unwrap();
+
+        let lock = AuthStore::lock_directory(&paths.authorized()).unwrap();
+        lock.deny_fingerprint(old_fingerprint).unwrap();
+        let new_policy = AuthMeta {
+            user: current_user_name(),
+            key_fingerprint: Some(new_fingerprint.to_string()),
+            ..Default::default()
+        };
+        crypto::write_public(
+            &paths.authorized().join("alpha.toml"),
+            &toml::to_string(&new_policy).unwrap(),
+        )
+        .unwrap();
+        drop(lock); // Stop after policy replacement but before certificate replacement.
+
+        let interrupted = AuthStore::load(&paths.authorized()).unwrap();
+        assert!(interrupted.lookup(&old_fingerprint).is_none());
+        assert!(interrupted.lookup(&new_fingerprint).is_none());
+
+        authorize(&paths, authorize_args(&new_source, "alpha", true)).unwrap();
+        let repaired = AuthStore::load(&paths.authorized()).unwrap();
+        assert!(repaired.lookup(&old_fingerprint).is_none());
+        assert_eq!(
+            repaired
+                .lookup(&new_fingerprint)
+                .map(|entry| entry.name.as_str()),
+            Some("alpha")
+        );
+        assert!(!paths.authorized().join("beta.crt").exists());
+        assert!(!paths.authorized().join("beta.toml").exists());
     }
 }
