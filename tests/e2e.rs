@@ -24,6 +24,9 @@ use tokio::io::AsyncWriteExt;
 const SERVER_BIN: &str = env!("CARGO_BIN_EXE_qsh-server");
 const CLIENT_BIN: &str = env!("CARGO_BIN_EXE_qsh");
 
+#[path = "security_regressions/mod.rs"]
+mod security_regressions;
+
 #[cfg(target_os = "linux")]
 fn process_running(pid: u32) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
