@@ -11,6 +11,11 @@ Restart=on-failure
 RestartSec=2
 # Must start as root so sessions can switch to the authorized account.
 User=root
+# Let qsh create a private cgroup v2 leaf for keys explicitly authorized with
+# --kill-session-processes. Without delegation those sessions fail closed.
+Delegate=yes
+# On daemon death, systemd cleans up every process in the service cgroup.
+KillMode=control-group
 
 # Deliberately unsandboxed. Every remote session is a child of this unit and
 # inherits its namespaces, so daemon hardening is not private to the daemon:
@@ -27,9 +32,9 @@ NoNewPrivileges=false
 PrivateTmp=false
 
 # Every session is a child of this unit, so this is the effective bound on what
-# logged-in users can spawn — including a runaway or a fork bomb, which no
-# per-session limit inside qsh could prevent anyway. Raise it if you expect
-# many concurrent sessions.
+# logged-in users can spawn — including a runaway or a fork bomb. Restricted
+# session cgroups clean up processes at session end; they do not set resource
+# limits. Raise this bound if you expect many concurrent sessions.
 TasksMax=512
 
 [Install]

@@ -1,6 +1,7 @@
 //! Spawning the remote process: privilege drop, environment, PTY setup.
 
 use std::ffi::CString;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -10,6 +11,7 @@ use nix::sys::signal::{killpg, Signal};
 use nix::unistd::{Gid, Pid, Uid, User};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 
+use crate::cgroup::{self, SessionCgroup};
 use crate::config::env_allowed;
 use crate::proto::{PtySize, Request};
 use crate::pty::{self, PtyMaster};
@@ -177,7 +179,7 @@ pub(crate) fn prepare_identity(user: &User) -> Result<PreparedIdentity> {
 /// Fails if the target user cannot be assumed, a PTY cannot be allocated, or
 /// the program cannot be executed.
 pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
-    spawn_prepared(user, req, prepare_identity(user)?)
+    spawn_prepared(user, req, prepare_identity(user)?, None)
 }
 
 /// Spawn using identity data that was resolved before the final authorization
@@ -190,8 +192,10 @@ pub(crate) fn spawn_prepared(
     user: &User,
     req: &Request,
     identity: PreparedIdentity,
+    cgroup: Option<&SessionCgroup>,
 ) -> Result<Spawned> {
     let PreparedIdentity { switch, groups } = identity;
+    let cgroup_procs = cgroup.map(SessionCgroup::attach_fd).transpose()?;
 
     let home = home_of(user);
     let shell = shell_of(user);
@@ -254,6 +258,26 @@ pub(crate) fn spawn_prepared(
     // SAFETY: only async-signal-safe libc calls between fork and exec.
     unsafe {
         cmd.as_std_mut().pre_exec(move || {
+            if let Some(procs) = &cgroup_procs {
+                cgroup::join_pre_exec(procs.as_raw_fd())?;
+                #[cfg(target_os = "linux")]
+                {
+                    // An opted-in account must not use a setuid binary or
+                    // file capability to gain the right to migrate itself
+                    // out of the root-owned session cgroup.
+                    if libc::prctl(
+                        libc::PR_CAP_AMBIENT,
+                        libc::PR_CAP_AMBIENT_CLEAR_ALL,
+                        0,
+                        0,
+                        0,
+                    ) != 0
+                        || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+            }
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }

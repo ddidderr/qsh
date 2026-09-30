@@ -93,6 +93,9 @@ second — no restart. Useful variations:
 # rsync-only key: no interactive shell, no other programs
 sudo qsh-server authorize backup.crt --user backup --no-shell --command rsync
 
+# temporary login: kill this key's remaining session descendants at session end
+sudo qsh-server authorize guest.crt --user guest --kill-session-processes
+
 sudo qsh-server list
 sudo qsh-server revoke alice-laptop
 ```
@@ -192,12 +195,39 @@ long-lived self-signed **Ed25519** certificate.
   including while the last of the output is still draining, so a descendant
   that outlives the command it was started from is cleaned up too.
 
-  What this does **not** reliably reach is a process in another process group:
-  a PTY shell may move foreground and background jobs there through job
-  control, and a program may call `setsid` itself. Closing the PTY sends a
-  hangup to its foreground group, but a process can ignore that signal.
-  Fully containing those jobs would require a session cgroup or a different
-  job-control policy.
+  For an ordinary key, an intentional detached job may survive. PTY job
+  control or `setsid` can move work to another process group, beyond those
+  signals. This is useful for normal shell access.
+* `--kill-session-processes` opts one key into stricter cleanup. On Linux
+  cgroup v2, qsh puts each of its sessions in a root-owned cgroup before the
+  remote command starts. When the session ends, including a successful exit,
+  disconnect, expiry, or revocation, qsh uses `cgroup.kill` to kill processes
+  still in that session cgroup, even if they changed process group or called
+  `setsid`. If qsh cannot create, attach, or kill the cgroup, the restricted
+  session fails instead of silently becoming an ordinary one. This requires
+  a root daemon, a non-root target account, Linux 5.14+ with cgroup v2, and
+  a writable delegated service cgroup (`Delegate=yes` under systemd). qsh
+  does not grant the target account write access to the cgroup tree. It also
+  sets Linux `no_new_privs` and clears ambient capabilities for these
+  sessions, so `sudo`, setuid programs, and file capabilities cannot grant
+  new privilege through this login.
+
+  When the remote leader exits, qsh kills remaining processes in its cgroup
+  before draining buffered output; a detached writer cannot hold a restricted
+  session open forever. A hard daemon crash may leave an empty
+  `qsh-restricted/session-*` cgroup directory, even if the service manager
+  killed its processes. Empty leftovers can be removed by the server owner.
+
+  This controls that session's descendants, not every process the account
+  can start. A user with root or cgroup administration rights from another
+  path, or access to another launcher such as a user service, cron, or a process already
+  running as that UID may start work outside the session cgroup. Use a
+  dedicated constrained account when persistence must be restricted. Normal
+  keys retain their existing detached-job behavior. A policy change from
+  ordinary to restricted ends existing sessions; a later session starts in
+  the cgroup. If a standalone daemon is killed abruptly, its in-process
+  cleanup cannot run; the supplied systemd unit's `KillMode=control-group`
+  supplies the crash boundary.
 * Work is bounded before anyone has authenticated: peers must complete a QUIC
   retry to prove their address, a handshake has 5 seconds to finish, and a
   session stream has 10 seconds to say what it wants. Handshakes in flight
@@ -258,6 +288,7 @@ user = "alice"
 allow_shell = true
 allow_exec = true
 allowed_commands = []       # empty means "any program"; entries match argv[0] exactly
+kill_session_processes = false # true: cgroup cleanup for each session
 key_fingerprint = "sha256:…" # the key this policy was written for
 # expires_at_unix = 1793491200   # optional; set by --expires-in-days
 ```
@@ -337,6 +368,8 @@ ExecStart=/usr/local/bin/qsh-server serve
 Restart=on-failure
 # The server must start as root to switch to the target user.
 User=root
+Delegate=yes
+KillMode=control-group
 
 [Install]
 WantedBy=multi-user.target

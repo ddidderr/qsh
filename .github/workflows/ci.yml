@@ -104,6 +104,16 @@ jobs:
         run: sudo -E env "PATH=$PATH" cargo test --locked --test e2e
       - name: Check mixed real, effective and saved credentials as root
         run: sudo -E env "PATH=$PATH" cargo test --locked --lib child::tests::mixed_credentials_cannot_reach_remote_exec
+      # A plain hosted-runner shell may lack cgroup delegation. Run this one
+      # test in a transient root scope that delegates a cgroup v2 subtree and
+      # require the real success path, rather than accepting a fail-closed-only
+      # test as proof that cleanup works.
+      - name: Restricted session cgroup integration
+        run: |
+          sudo -E env "PATH=$PATH" systemd-run --scope --quiet --collect \
+            --same-dir -p Delegate=yes \
+            env QSH_REQUIRE_DELEGATED_CGROUP=1 cargo test --locked --test e2e \
+            cgroup_policy_kills_detached_descendants_or_fails_before_exec -- --exact --nocapture
 
   msrv-matches-lockfile:
     name: MSRV is honest

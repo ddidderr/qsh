@@ -9,6 +9,7 @@
 //! * [`pty`] and [`child`] — running the remote process,
 //! * [`server`] and [`client`] — the two ends.
 
+pub mod cgroup;
 pub mod child;
 pub mod client;
 pub mod config;
