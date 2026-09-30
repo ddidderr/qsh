@@ -255,7 +255,9 @@ long-lived self-signed **Ed25519** certificate.
   than logged one line per attempt.
   Live diagnostics use a bounded queue and a dedicated writer, with a global
   limit of 16 detailed messages per second and periodic suppression counts.
-  A full log pipe cannot block session handling or authorization reload.
+  Authorization-reload failures are retained separately and retried after
+  transient write errors. A full log pipe cannot block session handling or
+  authorization reload.
 
   This is a fairness reservation, not a rate limit: nothing is remembered
   after an attempt ends, so there is no per-address table to grow or expire.
