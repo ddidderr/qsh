@@ -353,14 +353,14 @@ impl AdmissionCounters {
 
         let rejected = self.rejected.swap(0, Ordering::Relaxed);
         if rejected > 0 {
-            diagnostics.emit(|| {
+            diagnostics.record(|| {
                 format!("qsh-server: refused {rejected} connection(s) over the concurrency limit")
             });
         }
         let failed = self.unauthenticated.swap(0, Ordering::Relaxed);
         if failed > 0 {
             diagnostics
-                .emit(|| format!("qsh-server: {failed} connection(s) failed to authenticate"));
+                .record(|| format!("qsh-server: {failed} connection(s) failed to authenticate"));
         }
     }
 }
@@ -501,7 +501,8 @@ async fn handle_connection(
         conn.close(1u32.into(), b"key connection limit reached");
         return Ok(Authenticated::OverLimit);
     };
-    diagnostics.emit(|| {
+    // The audit trail of who logged in must not share the peer budget.
+    diagnostics.record(|| {
         format!(
             "qsh-server: {peer} authenticated as `{}` (key `{}`)",
             entry.meta.user, entry.name
@@ -560,7 +561,7 @@ async fn serve_connection_sessions(
             .is_some_and(|entry| !entry.meta.is_expired(unix_now()));
         drop(current);
         if !allowed {
-            diagnostics.emit(|| {
+            diagnostics.record(|| {
                 format!("qsh-server: {peer} is no longer authorized; dropping the connection")
             });
             conn.close(1u32.into(), b"authorization withdrawn");

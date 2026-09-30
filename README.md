@@ -253,13 +253,16 @@ long-lived self-signed **Ed25519** certificate.
   Over-limit connections are dropped silently rather than answered, and
   failures before authentication are counted and reported in batches rather
   than logged one line per attempt.
-  Live diagnostics use a bounded queue and a dedicated writer, with a global
-  limit of 16 detailed messages per second and periodic suppression counts.
-  Authorization-reload failures are retained separately and retried after
-  transient write errors. Failed mandatory `cgroup.kill` attempts use their own
-  coalesced retained alert, so peer log pressure cannot hide them or evict an
-  authorization warning. A full log pipe cannot block session handling or
-  authorization reload.
+  Live diagnostics use a bounded queue and a dedicated writer. Peer-triggered
+  detail, such as session errors, shares a global limit of 16 messages per
+  second, with periodic suppression counts. Logins, withdrawn authorizations,
+  admission counters, and failed `cgroup.kill` attempts do not draw on that
+  budget, so a flood of failing sessions cannot silence them. They still share
+  the bounded queue; a line that finds it full is dropped and counted as
+  suppressed. While stderr is blocked, the newest authorization-reload
+  warnings wait in a small backlog. Logging is best effort: a failed write is
+  not retried. A full log pipe cannot block session handling or authorization
+  reload.
 
   This is a fairness reservation, not a rate limit: nothing is remembered
   after an attempt ends, so there is no per-address table to grow or expire.

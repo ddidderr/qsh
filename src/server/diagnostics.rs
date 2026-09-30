@@ -1,5 +1,19 @@
-//! Peer-triggered diagnostics have a global rate and memory budget. A dedicated
-//! writer keeps a blocked stderr pipe from blocking a Tokio worker.
+//! Server log lines go through a bounded queue to a dedicated writer thread,
+//! so a blocked stderr pipe never blocks a Tokio worker; lines that do not fit
+//! are counted and reported as suppressed. Delivery is best effort: a failed
+//! write is not retried.
+//!
+//! Three entry points, by who controls the volume:
+//!
+//! * [`Diagnostics::emit`] — peer-triggered detail (session errors, refused
+//!   streams). A global per-second budget stops a peer from flooding the log.
+//! * [`Diagnostics::record`] — audit and security-relevant server events
+//!   (logins, withdrawn authorizations, failed cgroup kills). They do not draw
+//!   on that budget, so failing sessions cannot silence them, but they share
+//!   the queue and are dropped (and counted) if it is full.
+//! * [`Diagnostics::emit_administrative`] — authorization-reload state, which
+//!   is reported once per change, so the newest few are held in a backlog
+//!   while stderr is blocked.
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
@@ -7,26 +21,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const QUEUE_CAPACITY: usize = 32;
+/// Burst headroom well above the peer budget, so a healthy writer should only
+/// fall this far behind when the sink blocks or logins arrive in a large burst.
+/// At most about 512 KiB of queued text.
+const QUEUE_CAPACITY: usize = 256;
 const ADMIN_CAPACITY: usize = 32;
 const MESSAGES_PER_SECOND: usize = 16;
 const MAX_MESSAGE_CHARS: usize = 512;
-const ADMIN_RETRY_INTERVAL: Duration = Duration::from_secs(1);
-
-type AdministrativeQueue = Arc<Mutex<VecDeque<Arc<str>>>>;
-type RetainedSlot = Arc<Mutex<Option<Arc<str>>>>;
 
 #[derive(Debug)]
 enum Event {
-    Peer(String),
-    Retained,
+    Line(String),
+    Administrative,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct Diagnostics {
     sender: mpsc::SyncSender<Event>,
-    administrative: AdministrativeQueue,
-    restricted_cleanup: RetainedSlot,
+    administrative: Arc<Mutex<VecDeque<String>>>,
     limit: Arc<Mutex<RateLimit>>,
     suppressed: Arc<AtomicU64>,
 }
@@ -40,30 +52,30 @@ impl Diagnostics {
         let (sender, receiver) = mpsc::sync_channel::<Event>(QUEUE_CAPACITY);
         let administrative = Arc::new(Mutex::new(VecDeque::new()));
         let pending = Arc::clone(&administrative);
-        let restricted_cleanup = Arc::new(Mutex::new(None));
-        let restricted = Arc::clone(&restricted_cleanup);
-        let suppressed = Arc::new(AtomicU64::new(0));
-        let writer_suppressed = Arc::clone(&suppressed);
         std::thread::Builder::new()
             .name("qsh-diagnostics".into())
-            .spawn(move || {
-                writer_loop(
-                    &mut writer,
-                    &receiver,
-                    &pending,
-                    &restricted,
-                    &writer_suppressed,
-                );
+            .spawn(move || loop {
+                let administrative = { crate::sync::mutex(&pending).pop_front() };
+                if let Some(message) = administrative {
+                    let _ = writeln!(writer, "{message}");
+                    continue;
+                }
+                match receiver.recv() {
+                    Ok(Event::Line(message)) => {
+                        let _ = writeln!(writer, "{message}");
+                    }
+                    Ok(Event::Administrative) => {}
+                    Err(_) => break,
+                }
             })?;
         Ok(Self {
             sender,
             administrative,
-            restricted_cleanup,
             limit: Arc::new(Mutex::new(RateLimit {
                 start: Instant::now(),
                 remaining: MESSAGES_PER_SECOND,
             })),
-            suppressed,
+            suppressed: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -76,7 +88,17 @@ impl Diagnostics {
         }
         let message = message();
         let message = bounded(&message, MAX_MESSAGE_CHARS);
-        if self.sender.try_send(Event::Peer(message)).is_err() {
+        if self.sender.try_send(Event::Line(message)).is_err() {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Log an audit or security-relevant server event without the peer
+    /// budget. It still never blocks: if the writer is backed up, the line is
+    /// counted as suppressed like any other.
+    pub(crate) fn record(&self, message: impl FnOnce() -> String) {
+        let message = bounded(&message(), MAX_MESSAGE_CHARS);
+        if self.sender.try_send(Event::Line(message)).is_err() {
             self.suppressed.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -85,9 +107,9 @@ impl Diagnostics {
     /// stderr is blocked, preserve the newest bounded set and write it before
     /// peer diagnostics once the sink recovers.
     pub(super) fn emit_administrative(&self, message: &str) {
-        let message: Arc<str> = bounded(message, MAX_MESSAGE_CHARS).into();
+        let message = bounded(message, MAX_MESSAGE_CHARS);
         let mut pending = crate::sync::mutex(&self.administrative);
-        if pending.iter().any(|old| old.as_ref() == message.as_ref()) {
+        if pending.iter().any(|old| old == &message) {
             return;
         }
         if pending.len() == ADMIN_CAPACITY {
@@ -95,15 +117,7 @@ impl Diagnostics {
         }
         pending.push_back(message);
         drop(pending);
-        let _ = self.sender.try_send(Event::Retained);
-    }
-
-    /// Retain the latest failed mandatory cgroup kill independently of both
-    /// authorization state and peer-triggered log pressure.
-    pub(crate) fn emit_restricted_kill_failure(&self, message: &str) {
-        let message: Arc<str> = bounded(message, MAX_MESSAGE_CHARS).into();
-        *crate::sync::mutex(&self.restricted_cleanup) = Some(message);
-        let _ = self.sender.try_send(Event::Retained);
+        let _ = self.sender.try_send(Event::Administrative);
     }
 
     /// Called once per reload interval, including after malicious traffic
@@ -113,183 +127,13 @@ impl Diagnostics {
         if count > 0
             && self
                 .sender
-                .try_send(Event::Peer(format!(
+                .try_send(Event::Line(format!(
                     "qsh-server: suppressed {count} diagnostic message(s)"
                 )))
                 .is_err()
         {
             self.suppressed.fetch_add(count, Ordering::Relaxed);
         }
-    }
-}
-
-enum WriterWait {
-    Event(Event),
-    Retry,
-    Disconnected,
-}
-
-enum RetainedSource {
-    Administrative,
-    RestrictedCleanup,
-}
-
-struct RetainedWrite {
-    source: RetainedSource,
-    message: Arc<str>,
-    line: Vec<u8>,
-    written: usize,
-}
-
-impl RetainedWrite {
-    fn new(source: RetainedSource, message: Arc<str>) -> Self {
-        let mut line = Vec::with_capacity(message.len() + 1);
-        line.extend_from_slice(message.as_bytes());
-        line.push(b'\n');
-        Self {
-            source,
-            message,
-            line,
-            written: 0,
-        }
-    }
-
-    fn write_to(&mut self, writer: &mut impl Write) -> io::Result<()> {
-        while self.written < self.line.len() {
-            let remaining = self
-                .line
-                .get(self.written..)
-                .ok_or_else(|| io::Error::other("invalid retained diagnostic offset"))?;
-            match writer.write(remaining) {
-                Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
-                Ok(count) => {
-                    let Some(written) = self
-                        .written
-                        .checked_add(count)
-                        .filter(|written| *written <= self.line.len())
-                    else {
-                        return Err(io::Error::other(
-                            "diagnostic writer reported an invalid byte count",
-                        ));
-                    };
-                    self.written = written;
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(())
-    }
-}
-
-fn writer_loop(
-    writer: &mut impl Write,
-    receiver: &mpsc::Receiver<Event>,
-    administrative: &AdministrativeQueue,
-    restricted_cleanup: &RetainedSlot,
-    suppressed: &AtomicU64,
-) {
-    let mut retry_at = None;
-    let mut retained_write: Option<RetainedWrite> = None;
-    let mut deferred_peers = VecDeque::new();
-    loop {
-        let now = Instant::now();
-        if retry_at.is_none_or(|deadline| now >= deadline) {
-            // An unstarted cgroup alert may yield to newer authorization state.
-            // Once any bytes were written, finish that line before switching.
-            if retained_write.as_ref().is_some_and(|pending| {
-                matches!(pending.source, RetainedSource::RestrictedCleanup)
-                    && pending.written == 0
-                    && !crate::sync::mutex(administrative).is_empty()
-            }) {
-                retained_write = None;
-            }
-            if retained_write.is_none() {
-                retained_write = next_retained(administrative, restricted_cleanup);
-            }
-            if let Some(pending) = retained_write.as_mut() {
-                if pending.write_to(writer).is_ok() {
-                    acknowledge(administrative, restricted_cleanup, pending);
-                    retained_write = None;
-                    retry_at = None;
-                    continue;
-                }
-                retry_at = Some(Instant::now() + ADMIN_RETRY_INTERVAL);
-            } else {
-                retry_at = None;
-            }
-        }
-
-        if retry_at.is_none() {
-            if let Some(message) = deferred_peers.pop_front() {
-                let _ = writeln!(writer, "{message}");
-                continue;
-            }
-        }
-
-        match wait_for_event(receiver, retry_at) {
-            WriterWait::Event(Event::Peer(message)) => {
-                if deferred_peers.len() == QUEUE_CAPACITY {
-                    suppressed.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    deferred_peers.push_back(message);
-                }
-            }
-            WriterWait::Event(Event::Retained) | WriterWait::Retry => {}
-            WriterWait::Disconnected => break,
-        }
-    }
-}
-
-fn next_retained(
-    administrative: &AdministrativeQueue,
-    restricted_cleanup: &RetainedSlot,
-) -> Option<RetainedWrite> {
-    if let Some(message) = crate::sync::mutex(administrative).front().cloned() {
-        return Some(RetainedWrite::new(RetainedSource::Administrative, message));
-    }
-    crate::sync::mutex(restricted_cleanup)
-        .clone()
-        .map(|message| RetainedWrite::new(RetainedSource::RestrictedCleanup, message))
-}
-
-fn acknowledge(
-    administrative: &AdministrativeQueue,
-    restricted_cleanup: &RetainedSlot,
-    written: &RetainedWrite,
-) {
-    match written.source {
-        RetainedSource::Administrative => {
-            let mut pending = crate::sync::mutex(administrative);
-            if pending
-                .front()
-                .is_some_and(|current| Arc::ptr_eq(current, &written.message))
-            {
-                pending.pop_front();
-            }
-        }
-        RetainedSource::RestrictedCleanup => {
-            let mut pending = crate::sync::mutex(restricted_cleanup);
-            if pending
-                .as_ref()
-                .is_some_and(|current| Arc::ptr_eq(current, &written.message))
-            {
-                pending.take();
-            }
-        }
-    }
-}
-
-fn wait_for_event(receiver: &mpsc::Receiver<Event>, retry_at: Option<Instant>) -> WriterWait {
-    let Some(deadline) = retry_at else {
-        return receiver
-            .recv()
-            .map_or(WriterWait::Disconnected, WriterWait::Event);
-    };
-    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Ok(event) => WriterWait::Event(event),
-        Err(mpsc::RecvTimeoutError::Timeout) => WriterWait::Retry,
-        Err(mpsc::RecvTimeoutError::Disconnected) => WriterWait::Disconnected,
     }
 }
 
@@ -353,7 +197,6 @@ mod tests {
         let diagnostics = Diagnostics {
             sender,
             administrative: Arc::new(Mutex::new(VecDeque::new())),
-            restricted_cleanup: Arc::new(Mutex::new(None)),
             limit: Arc::new(Mutex::new(RateLimit {
                 start: Instant::now(),
                 remaining: MESSAGES_PER_SECOND,
@@ -368,12 +211,12 @@ mod tests {
         assert_eq!(diagnostics.suppressed.load(Ordering::Relaxed), 16);
         diagnostics.report_suppressed();
         assert_eq!(diagnostics.suppressed.load(Ordering::Relaxed), 16);
-        let Event::Peer(message) = receiver.recv().unwrap() else {
+        let Event::Line(message) = receiver.recv().unwrap() else {
             panic!("expected peer diagnostic");
         };
         assert!(message.contains("request frame"));
         diagnostics.report_suppressed();
-        let Event::Peer(message) = receiver.recv().unwrap() else {
+        let Event::Line(message) = receiver.recv().unwrap() else {
             panic!("expected suppression diagnostic");
         };
         assert!(message.contains("suppressed 16"));
@@ -386,7 +229,6 @@ mod tests {
         let diagnostics = Diagnostics {
             sender,
             administrative: Arc::new(Mutex::new(VecDeque::new())),
-            restricted_cleanup: Arc::new(Mutex::new(None)),
             limit: Arc::new(Mutex::new(RateLimit {
                 start: Instant::now(),
                 remaining: MESSAGES_PER_SECOND,
@@ -394,7 +236,7 @@ mod tests {
             suppressed: Arc::new(AtomicU64::new(0)),
         };
         diagnostics.emit(|| "\n\x1btest".repeat(1024));
-        let Event::Peer(message) = receiver.recv().unwrap() else {
+        let Event::Line(message) = receiver.recv().unwrap() else {
             panic!("expected peer diagnostic");
         };
         assert_eq!(message.chars().count(), MAX_MESSAGE_CHARS);
@@ -402,243 +244,30 @@ mod tests {
     }
 
     #[test]
-    fn restricted_cleanup_lane_coalesces_without_evicting_administration() {
-        let (sender, _receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
+    fn recorded_events_bypass_an_exhausted_peer_budget() {
+        let (sender, receiver) = mpsc::sync_channel(2);
         let diagnostics = Diagnostics {
             sender,
             administrative: Arc::new(Mutex::new(VecDeque::new())),
-            restricted_cleanup: Arc::new(Mutex::new(None)),
             limit: Arc::new(Mutex::new(RateLimit {
                 start: Instant::now(),
-                remaining: MESSAGES_PER_SECOND,
+                remaining: 0,
             })),
             suppressed: Arc::new(AtomicU64::new(0)),
         };
-        for index in 0..ADMIN_CAPACITY {
-            diagnostics.emit_administrative(&format!("authorization failure {index}"));
-        }
-        diagnostics.emit_restricted_kill_failure("old cgroup failure");
-        diagnostics.emit_restricted_kill_failure("latest cgroup failure");
+        diagnostics.emit(|| unreachable!("the peer budget is exhausted"));
+        diagnostics.record(|| "qsh-server: peer authenticated as `alice`".into());
+        assert_eq!(diagnostics.suppressed.load(Ordering::Relaxed), 1);
+        let Event::Line(message) = receiver.recv().unwrap() else {
+            panic!("expected the recorded event");
+        };
+        assert!(message.contains("authenticated as"));
 
-        assert_eq!(
-            crate::sync::mutex(&diagnostics.administrative).len(),
-            ADMIN_CAPACITY
-        );
-        assert_eq!(
-            crate::sync::mutex(&diagnostics.restricted_cleanup).as_deref(),
-            Some("latest cgroup failure")
-        );
-    }
-
-    #[test]
-    fn authorization_state_preempts_an_unstarted_cgroup_retry() {
-        struct FailFirstWriter {
-            failed: bool,
-            attempts: mpsc::Sender<()>,
-            stopped: mpsc::Sender<()>,
-            output: Arc<Mutex<Vec<u8>>>,
-        }
-
-        impl Write for FailFirstWriter {
-            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-                self.attempts.send(()).unwrap();
-                if !self.failed {
-                    self.failed = true;
-                    return Err(io::Error::other("transient diagnostic failure"));
-                }
-                crate::sync::mutex(&self.output).extend_from_slice(buffer);
-                Ok(buffer.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl Drop for FailFirstWriter {
-            fn drop(&mut self) {
-                let _ = self.stopped.send(());
-            }
-        }
-
-        let (attempted, attempts) = mpsc::channel();
-        let (stopped, finished) = mpsc::channel();
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let diagnostics = Diagnostics::with_writer(FailFirstWriter {
-            failed: false,
-            attempts: attempted,
-            stopped,
-            output: Arc::clone(&output),
-        })
-        .unwrap();
-        diagnostics.emit_restricted_kill_failure("cgroup kill failed");
-        attempts.recv_timeout(Duration::from_secs(5)).unwrap();
-        diagnostics.emit_administrative("authorization reload failed");
-        attempts.recv_timeout(Duration::from_secs(5)).unwrap();
-        attempts.recv_timeout(Duration::from_secs(5)).unwrap();
-        drop(diagnostics);
-        finished.recv_timeout(Duration::from_secs(5)).unwrap();
-        let written = String::from_utf8(crate::sync::mutex(&output).clone()).unwrap();
-        assert_eq!(written, "authorization reload failed\ncgroup kill failed\n");
-    }
-
-    #[test]
-    fn failed_administrative_write_is_retried_without_another_message() {
-        struct FailOnceWriter {
-            failed: bool,
-            attempts: mpsc::Sender<()>,
-            stopped: mpsc::Sender<()>,
-            output: Arc<Mutex<Vec<u8>>>,
-        }
-
-        impl Write for FailOnceWriter {
-            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-                self.attempts.send(()).unwrap();
-                if !self.failed {
-                    self.failed = true;
-                    return Err(io::Error::other("transient diagnostic failure"));
-                }
-                crate::sync::mutex(&self.output).extend_from_slice(buffer);
-                Ok(buffer.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl Drop for FailOnceWriter {
-            fn drop(&mut self) {
-                let _ = self.stopped.send(());
-            }
-        }
-
-        let (attempted, attempts) = mpsc::channel();
-        let (stopped, finished) = mpsc::channel();
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let diagnostics = Diagnostics::with_writer(FailOnceWriter {
-            failed: false,
-            attempts: attempted,
-            stopped,
-            output: Arc::clone(&output),
-        })
-        .unwrap();
-        diagnostics.emit_administrative("authorization reload failed");
-        attempts.recv_timeout(Duration::from_secs(5)).unwrap();
-        // Re-emitting the same state while it is backing off must not create a
-        // second retained entry or reset the absolute retry deadline.
-        diagnostics.emit_administrative("authorization reload failed");
-        diagnostics.emit(|| "peer session failed".into());
-        assert_eq!(crate::sync::mutex(&diagnostics.administrative).len(), 1);
-        attempts.recv_timeout(Duration::from_secs(5)).unwrap();
-        attempts.recv_timeout(Duration::from_secs(5)).unwrap();
-        drop(diagnostics);
-        finished.recv_timeout(Duration::from_secs(5)).unwrap();
-        let written = String::from_utf8(crate::sync::mutex(&output).clone()).unwrap();
-        assert_eq!(
-            written,
-            "authorization reload failed\npeer session failed\n"
-        );
-    }
-
-    #[test]
-    fn retained_write_resumes_after_a_partial_line() {
-        struct PartialWriter {
-            call: usize,
-            attempts: mpsc::Sender<()>,
-            stopped: mpsc::Sender<()>,
-            output: Arc<Mutex<Vec<u8>>>,
-        }
-
-        impl Write for PartialWriter {
-            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-                self.attempts.send(()).unwrap();
-                self.call += 1;
-                if self.call == 1 {
-                    let count = buffer.len().saturating_sub(1);
-                    crate::sync::mutex(&self.output).extend_from_slice(
-                        buffer
-                            .get(..count)
-                            .ok_or_else(|| io::Error::other("invalid test write"))?,
-                    );
-                    return Ok(count);
-                }
-                if self.call == 2 {
-                    return Err(io::Error::other("newline write failed"));
-                }
-                crate::sync::mutex(&self.output).extend_from_slice(buffer);
-                Ok(buffer.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl Drop for PartialWriter {
-            fn drop(&mut self) {
-                let _ = self.stopped.send(());
-            }
-        }
-
-        let (attempted, attempts) = mpsc::channel();
-        let (stopped, finished) = mpsc::channel();
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let diagnostics = Diagnostics::with_writer(PartialWriter {
-            call: 0,
-            attempts: attempted,
-            stopped,
-            output: Arc::clone(&output),
-        })
-        .unwrap();
-        diagnostics.emit_administrative("authorization reload failed");
-        for _ in 0..3 {
-            attempts.recv_timeout(Duration::from_secs(5)).unwrap();
-        }
-        drop(diagnostics);
-        finished.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(
-            crate::sync::mutex(&output).as_slice(),
-            b"authorization reload failed\n"
-        );
-    }
-
-    #[test]
-    fn permanent_write_failure_backs_off_and_stops_on_disconnect() {
-        struct FailedWriter {
-            attempts: mpsc::Sender<()>,
-            stopped: mpsc::Sender<()>,
-        }
-
-        impl Write for FailedWriter {
-            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-                self.attempts.send(()).unwrap();
-                Err(io::Error::other("permanent diagnostic failure"))
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl Drop for FailedWriter {
-            fn drop(&mut self) {
-                let _ = self.stopped.send(());
-            }
-        }
-
-        let (attempted, attempts) = mpsc::channel();
-        let (stopped, finished) = mpsc::channel();
-        let diagnostics = Diagnostics::with_writer(FailedWriter {
-            attempts: attempted,
-            stopped,
-        })
-        .unwrap();
-        diagnostics.emit_administrative("authorization reload failed");
-        attempts.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(attempts.recv_timeout(ADMIN_RETRY_INTERVAL / 2).is_err());
-        drop(diagnostics);
-        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        // A full queue still never blocks the caller; the loss is counted.
+        diagnostics.record(|| "first".into());
+        diagnostics.record(|| "second".into());
+        diagnostics.record(|| "does not fit".into());
+        assert_eq!(diagnostics.suppressed.load(Ordering::Relaxed), 2);
     }
 
     #[test]

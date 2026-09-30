@@ -147,23 +147,16 @@ mod linux {
                 .write_all(b"1")
                 .with_context(|| format!("killing session cgroup {}", self.path.display()))
             {
-                self.report_kill_failure(&error);
+                // Surviving descendants are the one failure this policy exists
+                // to prevent, so log every failed attempt outside the peer budget.
+                match &self.diagnostics {
+                    Some(diagnostics) => diagnostics.record(|| format!("qsh-server: {error:#}")),
+                    None => eprintln!("qsh-server: {error:#}"),
+                }
                 return Err(error);
             }
             self.killed = true;
             Ok(())
-        }
-
-        fn report_kill_failure(&self, error: &anyhow::Error) {
-            if let Some(diagnostics) = &self.diagnostics {
-                diagnostics.emit_restricted_kill_failure(&format!(
-                    "qsh-server: one or more cgroup.kill attempts failed; restricted descendants \
-                     may remain if retries also fail; inspect qsh-restricted leaves; latest \
-                     failure: {error:#}"
-                ));
-            } else {
-                eprintln!("qsh-server: {error:#}");
-            }
         }
 
         /// Remove a killed leaf after its members have disappeared.
@@ -211,6 +204,7 @@ mod linux {
             // This path also runs on task cancellation. There is no async
             // cleanup available here; a leftover empty leaf is harmless, but
             // killing its members is mandatory.
+            // kill() logs its own failure.
             let _ = self.kill();
             self.procs.take();
             self.kill_fd.take();
@@ -364,36 +358,14 @@ mod linux {
     #[allow(clippy::unwrap_used, clippy::expect_used, reason = "test assertions")]
     mod tests {
         use super::*;
-        use std::sync::{mpsc, Arc, Mutex};
 
         #[test]
-        fn parses_only_one_absolute_unified_membership() {
-            assert_eq!(
-                parse_unified_membership("0::/system.slice/qsh.service\n").unwrap(),
-                PathBuf::from("system.slice/qsh.service")
-            );
-            assert!(parse_unified_membership("3:memory:/x\n").is_err());
-            assert!(parse_unified_membership("0::relative\n").is_err());
-            assert!(parse_unified_membership("0::/ok\n0::/bad\n").is_err());
-            assert!(parse_unified_membership("0::/../escape\n").is_err());
-        }
+        fn failed_kill_is_logged_even_when_peers_exhausted_the_budget() {
+            struct ChannelWriter(std::sync::mpsc::Sender<Vec<u8>>);
 
-        #[test]
-        fn cgroup_kill_failure_survives_peer_diagnostic_pressure() {
-            struct BlockedWriter {
-                started: Option<mpsc::Sender<()>>,
-                release: mpsc::Receiver<()>,
-                stopped: mpsc::Sender<()>,
-                output: Arc<Mutex<Vec<u8>>>,
-            }
-
-            impl Write for BlockedWriter {
+            impl Write for ChannelWriter {
                 fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-                    if let Some(started) = self.started.take() {
-                        started.send(()).unwrap();
-                        self.release.recv_timeout(Duration::from_secs(5)).unwrap();
-                    }
-                    crate::sync::mutex(&self.output).extend_from_slice(buffer);
+                    let _ = self.0.send(buffer.to_vec());
                     Ok(buffer.len())
                 }
 
@@ -402,27 +374,10 @@ mod linux {
                 }
             }
 
-            impl Drop for BlockedWriter {
-                fn drop(&mut self) {
-                    let _ = self.stopped.send(());
-                }
-            }
-
-            let (started, running) = mpsc::channel();
-            let (finish, release) = mpsc::channel();
-            let (stopped, finished) = mpsc::channel();
-            let output = Arc::new(Mutex::new(Vec::new()));
-            let diagnostics = Diagnostics::with_writer(BlockedWriter {
-                started: Some(started),
-                release,
-                stopped,
-                output: Arc::clone(&output),
-            })
-            .unwrap();
-            diagnostics.emit(|| "peer failure holding the writer".into());
-            running.recv_timeout(Duration::from_secs(5)).unwrap();
-            for _ in 0..10_000 {
-                diagnostics.emit(|| "peer diagnostic flood".into());
+            let (lines, written) = std::sync::mpsc::channel();
+            let diagnostics = Diagnostics::with_writer(ChannelWriter(lines)).unwrap();
+            for _ in 0..1_000 {
+                diagnostics.emit(|| "qsh-server: peer diagnostic flood".into());
             }
 
             let dir = tempfile::tempdir().unwrap();
@@ -434,18 +389,32 @@ mod linux {
                 kill_fd: Some(File::open(control).unwrap()),
                 killed: false,
                 removed: false,
-                diagnostics: Some(diagnostics.clone()),
+                diagnostics: Some(diagnostics),
             };
+            // Explicit teardown and the cancellation path in Drop both log.
             assert!(cgroup.kill().is_err());
-            cgroup.removed = true;
             drop(cgroup);
 
-            finish.send(()).unwrap();
-            drop(diagnostics);
-            finished.recv_timeout(Duration::from_secs(5)).unwrap();
-            let written = String::from_utf8(crate::sync::mutex(&output).clone()).unwrap();
-            assert!(written.contains("cgroup.kill attempts failed"), "{written}");
-            assert!(written.contains("fake-session"), "{written}");
+            let output: Vec<u8> = written.iter().flatten().collect();
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(
+                output.matches("killing session cgroup").count(),
+                2,
+                "{output}"
+            );
+            assert!(output.contains("fake-session"), "{output}");
+        }
+
+        #[test]
+        fn parses_only_one_absolute_unified_membership() {
+            assert_eq!(
+                parse_unified_membership("0::/system.slice/qsh.service\n").unwrap(),
+                PathBuf::from("system.slice/qsh.service")
+            );
+            assert!(parse_unified_membership("3:memory:/x\n").is_err());
+            assert!(parse_unified_membership("0::relative\n").is_err());
+            assert!(parse_unified_membership("0::/ok\n0::/bad\n").is_err());
+            assert!(parse_unified_membership("0::/../escape\n").is_err());
         }
     }
 }
