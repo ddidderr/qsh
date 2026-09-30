@@ -27,6 +27,45 @@ const CLIENT_BIN: &str = env!("CARGO_BIN_EXE_qsh");
 #[path = "security_regressions/mod.rs"]
 mod security_regressions;
 
+/// Allocate a test terminal whose descriptors are close-on-exec.
+///
+/// Plain `openpty` leaves both ends inheritable. Tests run in parallel, so
+/// every client, server, and remote session another test spawned meanwhile
+/// would inherit this terminal and keep it open. A reader waiting for the
+/// terminal to close (as `PtyClient::finish` does) then waits for an unrelated
+/// process, such as a deliberately detached `sleep 30`. Like `qsh::pty`, set
+/// the flag at creation on Linux, so there is no window to race.
+fn open_test_pty(
+    size: Option<qsh::proto::PtySize>,
+) -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let (master, slave) = {
+        use nix::fcntl::OFlag;
+        let flags = OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC;
+        let master = nix::pty::posix_openpt(flags).expect("allocating a pty");
+        nix::pty::grantpt(&master).unwrap();
+        nix::pty::unlockpt(&master).unwrap();
+        let name = nix::pty::ptsname_r(&master).unwrap();
+        let slave = nix::fcntl::open(name.as_str(), flags, nix::sys::stat::Mode::empty()).unwrap();
+        (std::os::fd::OwnedFd::from(master), slave)
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let (master, slave) = {
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+        // Best effort where no atomic variant exists: a concurrent spawn can
+        // still inherit these descriptors before the flags are set.
+        let pair = nix::pty::openpty(None, None).expect("allocating a pty");
+        fcntl(&pair.master, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).unwrap();
+        fcntl(&pair.slave, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).unwrap();
+        (pair.master, pair.slave)
+    };
+    if let Some(size) = size {
+        use std::os::fd::AsRawFd;
+        qsh::pty::set_size(master.as_raw_fd(), size).expect("setting the pty size");
+    }
+    (master, slave)
+}
+
 #[cfg(target_os = "linux")]
 fn process_running(pid: u32) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
@@ -1410,8 +1449,7 @@ impl PtyClient {
     fn start(f: &Fixture) -> Self {
         use std::os::fd::AsRawFd;
 
-        let pair = nix::pty::openpty(None, None).expect("allocating a pty");
-        let (master, slave) = (pair.master, pair.slave);
+        let (master, slave) = open_test_pty(None);
 
         let child = Command::new(CLIENT_BIN)
             .args([
@@ -2788,13 +2826,10 @@ fn forced_pty_with_piped_stdin_relays_sigint() {
 fn forced_pty_with_piped_stdin_uses_the_output_terminal_size() {
     let f = Fixture::start(&[]);
     let sizefile = f.tmp.path().join("terminal-size");
-    let size = nix::pty::Winsize {
-        ws_row: 45,
-        ws_col: 123,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let terminal = nix::pty::openpty(Some(&size), None).unwrap();
+    let (master, slave) = open_test_pty(Some(qsh::proto::PtySize {
+        cols: 123,
+        rows: 45,
+    }));
     let out = Command::new(CLIENT_BIN)
         .args([
             "-i",
@@ -2811,7 +2846,7 @@ fn forced_pty_with_piped_stdin_uses_the_output_terminal_size() {
             sizefile.to_str().unwrap(),
         ])
         .stdin(Stdio::null())
-        .stdout(Stdio::from(terminal.slave))
+        .stdout(Stdio::from(slave))
         .stderr(Stdio::piped())
         .output()
         .unwrap();
@@ -2821,5 +2856,5 @@ fn forced_pty_with_piped_stdin_uses_the_output_terminal_size() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(std::fs::read_to_string(sizefile).unwrap().trim(), "45 123");
-    drop(terminal.master);
+    drop(master);
 }
