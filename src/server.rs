@@ -373,8 +373,11 @@ struct ReloadDiagnostics {
 impl ReloadDiagnostics {
     fn reload(&mut self, store: &RwLock<AuthStore>, dir: &std::path::Path) -> Vec<String> {
         let mut warnings = Vec::new();
-        match AuthStore::load_with_warnings(dir, |warning| warnings.push(warning)) {
-            Ok(fresh) => {
+        match AuthStore::try_load_with_warnings(dir, |warning| warnings.push(warning)) {
+            // A management command is mid-mutation; keep the current state
+            // and look again on the next tick rather than block this worker.
+            Ok(None) => Vec::new(),
+            Ok(Some(fresh)) => {
                 *crate::sync::write(store) = fresh;
                 let mut messages: Vec<_> = warnings
                     .iter()
@@ -1768,6 +1771,36 @@ mod tests {
             ["qsh-server: authorization reload recovered"]
         );
         assert!(diagnostics.reload(&store, &authorized).is_empty());
+    }
+
+    #[test]
+    fn reload_skips_a_busy_directory_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let authorized = dir.path().join("authorized");
+        std::fs::create_dir(&authorized).unwrap();
+        let (pem, _) = crypto::generate_identity("client", &["client".into()], 30).unwrap();
+        let fingerprint = Fingerprint::of_cert(&crypto::cert_from_pem(&pem).unwrap()).unwrap();
+        std::fs::write(authorized.join("client.crt"), &pem).unwrap();
+        std::fs::write(
+            authorized.join("client.toml"),
+            format!("user = \"guest\"\nkey_fingerprint = \"{fingerprint}\"\n"),
+        )
+        .unwrap();
+        let store = RwLock::new(AuthStore::load(&authorized).unwrap());
+        let mut diagnostics = ReloadDiagnostics {
+            warnings: Vec::new(),
+            failure: None,
+        };
+
+        // A management command holds the lock while it revokes the key.
+        let writer = AuthStore::lock_directory(&authorized).unwrap();
+        std::fs::remove_file(authorized.join("client.crt")).unwrap();
+        assert!(diagnostics.reload(&store, &authorized).is_empty());
+        assert!(crate::sync::read(&store).lookup(&fingerprint).is_some());
+
+        drop(writer);
+        assert!(diagnostics.reload(&store, &authorized).is_empty());
+        assert!(crate::sync::read(&store).lookup(&fingerprint).is_none());
     }
 
     #[test]

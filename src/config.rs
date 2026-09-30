@@ -337,6 +337,21 @@ impl AuthStore {
         Self::load_unlocked(dir, warn)
     }
 
+    /// Like [`Self::load_with_warnings`], but returns `Ok(None)` instead of
+    /// waiting while a management command holds the directory lock. The
+    /// server's periodic reload runs on an async worker and simply retries on
+    /// its next tick.
+    pub(crate) fn try_load_with_warnings(
+        dir: &Path,
+        warn: impl FnMut(String),
+    ) -> Result<Option<Self>> {
+        let lock_path = authorization_lock_target(dir)?;
+        let Some(_lock) = FileLock::try_acquire_shared(&lock_path)? else {
+            return Ok(None);
+        };
+        Self::load_unlocked(dir, warn).map(Some)
+    }
+
     fn load_unlocked(dir: &Path, mut warn: impl FnMut(String)) -> Result<Self> {
         let mut entries = Vec::new();
         let mut names_by_fingerprint: BTreeMap<Fingerprint, Vec<String>> = BTreeMap::new();
@@ -658,6 +673,28 @@ struct FileLock {
 
 impl FileLock {
     fn acquire(path: &Path, operation: nix::fcntl::FlockArg) -> Result<Self> {
+        let (lock_path, file) = Self::open(path)?;
+        nix::fcntl::Flock::lock(file, operation)
+            .map(|flock| Self { _flock: flock })
+            .map_err(|(_, e)| anyhow!("locking {}: {e}", lock_path.display()))
+    }
+
+    /// Take a shared lock only if no writer holds it. `Ok(None)` means busy.
+    fn try_acquire_shared(path: &Path) -> Result<Option<Self>> {
+        let (lock_path, file) = Self::open(path)?;
+        match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockSharedNonblock) {
+            Ok(flock) => Ok(Some(Self { _flock: flock })),
+            Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(None),
+            Err((_, e)) => Err(anyhow!("locking {}: {e}", lock_path.display())),
+        }
+    }
+
+    /// `flock(2)` needs only a readable descriptor, so anyone who can open the
+    /// lock file can hold it and stall its owner. Keep it private to its owner,
+    /// including a file an older version created with the default mode.
+    fn open(path: &Path) -> Result<(PathBuf, fs::File)> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
         let lock_path = path.with_extension("lock");
         if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent)?;
@@ -666,11 +703,19 @@ impl FileLock {
             .create(true)
             .truncate(false)
             .write(true)
+            .mode(0o600)
             .open(&lock_path)
             .with_context(|| format!("opening {}", lock_path.display()))?;
-        nix::fcntl::Flock::lock(file, operation)
-            .map(|flock| Self { _flock: flock })
-            .map_err(|(_, e)| anyhow!("locking {}: {e}", lock_path.display()))
+        let mode = file
+            .metadata()
+            .with_context(|| format!("reading metadata for {}", lock_path.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("restricting {} to its owner", lock_path.display()))?;
+        }
+        Ok((lock_path, file))
     }
 }
 
@@ -1263,6 +1308,37 @@ mod tests {
             store.lookup(&fingerprint).map(|entry| entry.name.as_str()),
             Some("?")
         );
+    }
+
+    #[test]
+    fn lock_files_are_private_to_their_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let authorized = dir.path().join("authorized");
+        let lock_path = dir.path().join("authorized.lock");
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        drop(AuthStore::lock_directory(&authorized).unwrap());
+        assert_eq!(mode(&lock_path), 0o600);
+
+        // A lock file left world-readable by an earlier version is tightened.
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644)).unwrap();
+        AuthStore::load(&authorized).unwrap();
+        assert_eq!(mode(&lock_path), 0o600);
+    }
+
+    #[test]
+    fn busy_directory_lock_makes_try_load_return_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = AuthStore::lock_directory(dir.path()).unwrap();
+        assert!(AuthStore::try_load_with_warnings(dir.path(), |_| {})
+            .unwrap()
+            .is_none());
+        drop(writer);
+        assert!(AuthStore::try_load_with_warnings(dir.path(), |_| {})
+            .unwrap()
+            .is_some());
     }
 
     #[test]

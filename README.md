@@ -338,7 +338,10 @@ alias while management commands are serialized by an advisory lock. If a
 management process stops partway through, a denial marker keeps that key
 inactive. Revocation markers remain as tombstones; an explicit later
 `authorize` for the same key removes its marker only after the new pair is
-complete.
+complete. The lock file (`authorized.lock`, beside the directory) is kept
+mode 0600, because anyone who can open it could hold it. The running server
+never waits for it: while a management command holds it, the once-a-second
+reload is skipped and retried.
 
 Environment overrides for both binaries: `QSH_HOME` (client directory) and
 `QSH_SERVER_HOME` (server directory); `qsh-server --dir` and `qsh -i` do the
