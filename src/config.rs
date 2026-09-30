@@ -530,7 +530,7 @@ fn load_auth_entry(
     if meta.user.is_empty() {
         bail!("{} does not name a user", meta_path.display());
     }
-    if !meta.allowed_commands.is_empty() {
+    if meta.allow_exec && !meta.allowed_commands.is_empty() {
         warn(format!(
             "qsh-server: warning: authorization `{name}` uses an executable-name \
              filter; its arguments and subprocesses remain unrestricted"
@@ -1148,6 +1148,39 @@ mod tests {
                 && warning.contains("alpha")
                 && warning.contains("beta")
         }));
+    }
+
+    #[test]
+    fn inactive_executable_filter_does_not_claim_argument_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_pem, _) =
+            crate::crypto::generate_identity("laptop", &["laptop".into()], 30).unwrap();
+        let cert = crate::crypto::cert_from_pem(&cert_pem).unwrap();
+        let fingerprint = Fingerprint::of_cert(&cert).unwrap();
+        fs::write(dir.path().join("laptop.crt"), cert_pem).unwrap();
+        let policy = dir.path().join("laptop.toml");
+        let mut meta = AuthMeta {
+            user: "alice".into(),
+            allow_exec: false,
+            allowed_commands: vec!["/usr/bin/uptime".into()],
+            key_fingerprint: Some(fingerprint.to_string()),
+            ..Default::default()
+        };
+        fs::write(&policy, toml::to_string(&meta).unwrap()).unwrap();
+
+        let mut warnings = Vec::new();
+        AuthStore::load_with_warnings(dir.path(), |warning| warnings.push(warning)).unwrap();
+        assert!(!warnings
+            .iter()
+            .any(|warning| warning.contains("arguments and subprocesses")));
+
+        meta.allow_exec = true;
+        fs::write(&policy, toml::to_string(&meta).unwrap()).unwrap();
+        warnings.clear();
+        AuthStore::load_with_warnings(dir.path(), |warning| warnings.push(warning)).unwrap();
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("arguments and subprocesses")));
     }
 
     #[test]

@@ -336,7 +336,7 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
     if let Some(days) = args.expires_in_days {
         println!("Expires in {days} days; after that the key is refused.");
     }
-    if !meta.allowed_commands.is_empty() {
+    if meta.allow_exec && !meta.allowed_commands.is_empty() {
         println!(
             "Executable filter (arguments unrestricted): {}",
             meta.allowed_commands.join(", ")
