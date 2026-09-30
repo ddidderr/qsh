@@ -109,7 +109,10 @@ impl Diagnostics {
     pub(super) fn emit_administrative(&self, message: &str) {
         let message = bounded(message, MAX_MESSAGE_CHARS);
         let mut pending = crate::sync::mutex(&self.administrative);
-        if pending.iter().any(|old| old == &message) {
+        // Collapse only an immediate repeat. Dropping any earlier duplicate
+        // would reorder state changes: failure, recovered, failure would be
+        // written as failure, recovered, the opposite of the final state.
+        if pending.back() == Some(&message) {
             return;
         }
         if pending.len() == ADMIN_CAPACITY {
@@ -241,6 +244,28 @@ mod tests {
         };
         assert_eq!(message.chars().count(), MAX_MESSAGE_CHARS);
         assert!(!message.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn administrative_backlog_keeps_the_latest_state_last() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let diagnostics = Diagnostics {
+            sender,
+            administrative: Arc::new(Mutex::new(VecDeque::new())),
+            limit: Arc::new(Mutex::new(RateLimit {
+                start: Instant::now(),
+                remaining: MESSAGES_PER_SECOND,
+            })),
+            suppressed: Arc::new(AtomicU64::new(0)),
+        };
+        // No writer thread drains this queue, as if stderr were blocked.
+        for message in ["failure", "failure", "recovered", "failure"] {
+            diagnostics.emit_administrative(message);
+        }
+        assert_eq!(
+            *crate::sync::mutex(&diagnostics.administrative),
+            ["failure", "recovered", "failure"]
+        );
     }
 
     #[test]
