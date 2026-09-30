@@ -542,19 +542,23 @@ mod tests {
     #[tokio::test]
     async fn environment_is_scrubbed() {
         let user = current_user().unwrap();
-        let mut req = request(&["sh", "-c", "echo \"$LD_PRELOAD/$TERM/$LC_ALL\""], false);
+        // Inspect the environment directly: some shells initialize TERM=dumb
+        // themselves even when it was absent from their environment.
+        let mut req = request(&["env"], false);
         req.env = vec![
             ("LD_PRELOAD".into(), "/evil.so".into()),
             ("LC_ALL".into(), "C".into()),
         ];
-        req.pty = None;
         let mut sp = spawn(&user, &req).unwrap();
         let ChildIo::Pipes { stdout, .. } = &mut sp.io else {
             panic!("expected pipes");
         };
         let mut out = String::new();
         stdout.read_to_string(&mut out).await.unwrap();
-        assert_eq!(out.trim(), "//C");
+        assert!(sp.child.wait().await.unwrap().success());
+        assert!(!out.lines().any(|line| line.starts_with("LD_PRELOAD=")));
+        assert!(!out.lines().any(|line| line.starts_with("TERM=")));
+        assert!(out.lines().any(|line| line == "LC_ALL=C"));
     }
 
     #[tokio::test]
