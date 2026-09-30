@@ -145,6 +145,9 @@ qsh server sh -c 'echo hello > /tmp/out'
 There is no password authentication, no PKI, and no CA. Both sides hold a
 long-lived self-signed **Ed25519** certificate.
 
+[`THREAT_MODEL.md`](THREAT_MODEL.md) lists the attackers qsh defends
+against, the boundaries it promises, and the trade-offs already decided.
+
 | Direction | What is checked |
 |---|---|
 | Client → server | The server's public key must match the pinned fingerprint in `known_hosts`, and the certificate must be inside its validity window. |
