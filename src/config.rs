@@ -690,6 +690,7 @@ impl KnownHosts {
     /// Fails on a malformed entry or an unparseable fingerprint.
     pub fn load(path: &Path) -> Result<Self> {
         let mut entries: Vec<(String, Fingerprint)> = Vec::new();
+        let mut identities = Vec::new();
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -706,10 +707,12 @@ impl KnownHosts {
             };
             let fp = Fingerprint::parse(fp)
                 .with_context(|| format!("{}:{}", path.display(), lineno + 1))?;
+            let identity = host::canonical_identity_key(host)
+                .with_context(|| format!("{}:{}", path.display(), lineno + 1))?;
             let host = host::canonical_key(host)
                 .with_context(|| format!("{}:{}", path.display(), lineno + 1))?;
-            if let Some((_, old)) = entries.iter().find(|(name, _)| *name == host) {
-                if *old != fp {
+            if let Some(index) = identities.iter().position(|old| old == &identity) {
+                if entries.get(index).is_some_and(|(_, old)| *old != fp) {
                     bail!(
                         "{}:{}: conflicting pins for {host}",
                         path.display(),
@@ -718,6 +721,7 @@ impl KnownHosts {
                 }
             } else {
                 entries.push((host, fp));
+                identities.push(identity);
             }
         }
         Ok(Self {
@@ -728,10 +732,12 @@ impl KnownHosts {
 
     #[must_use]
     pub fn get(&self, host_key: &str) -> Option<Fingerprint> {
-        let host_key = host::canonical_key(host_key).ok()?;
+        let identity = host::canonical_identity_key(host_key).ok()?;
         self.entries
             .iter()
-            .find(|(h, _)| *h == host_key)
+            .find(|(host, _)| {
+                host::canonical_identity_key(host).is_ok_and(|stored| stored == identity)
+            })
             .map(|(_, fp)| *fp)
     }
 
@@ -759,6 +765,7 @@ impl KnownHosts {
 
     fn update(&mut self, host_key: &str, fp: Fingerprint, trust: Trust) -> Result<()> {
         let host_key = host::canonical_key(host_key)?;
+        let identity = host::canonical_identity_key(&host_key)?;
         // Everything from here to the rename happens under the lock, so a
         // concurrent client cannot read the old file, decide, and write back a
         // snapshot that drops what we just added.
@@ -775,7 +782,9 @@ impl KnownHosts {
                 return Ok(());
             }
         }
-        self.entries.retain(|(h, _)| *h != host_key);
+        self.entries.retain(|(stored, _)| {
+            host::canonical_identity_key(stored).is_ok_and(|old| old != identity)
+        });
         self.entries.push((host_key, fp));
         self.save()
     }
@@ -791,11 +800,13 @@ impl KnownHosts {
     /// # Errors
     /// Fails if the file cannot be written.
     pub fn remove(&mut self, host_key: &str) -> Result<usize> {
-        let host_key = host::canonical_key(host_key)?;
+        let identity = host::canonical_identity_key(host_key)?;
         let _lock = FileLock::acquire(&self.path, nix::fcntl::FlockArg::LockExclusive)?;
         self.refresh()?;
         let before = self.entries.len();
-        self.entries.retain(|(h, _)| *h != host_key);
+        self.entries.retain(|(stored, _)| {
+            host::canonical_identity_key(stored).is_ok_and(|old| old != identity)
+        });
         let removed = before - self.entries.len();
         if removed > 0 {
             self.save()?;
@@ -1013,17 +1024,51 @@ mod tests {
         let a = fp("a");
         fs::write(
             &path,
-            format!("EXAMPLE.com:02222 {a}\n2001:0DB8::1:2222 {a}\n"),
+            format!("EXAMPLE.com:02222 {a}\n2001:0DB8::1:2222 {a}\n[::1]:2222 {a}\n"),
         )
         .unwrap();
         let mut kh = KnownHosts::load(&path).unwrap();
         assert_eq!(kh.get("example.COM:2222"), Some(a));
         assert_eq!(kh.get("[2001:db8:0:0::1]:2222"), Some(a));
+        assert_eq!(kh.get("[::1%0]:2222"), Some(a));
         kh.set_if_new("Example.Com:2222", a).unwrap();
         assert!(kh.set_if_new("example.com:2222", fp("b")).is_err());
+        assert!(kh.set_if_new("[::1%000]:2222", fp("c")).is_err());
         assert_eq!(kh.remove("EXAMPLE.COM:2222").unwrap(), 1);
         assert_eq!(kh.remove("[2001:DB8::1]:2222").unwrap(), 1);
+        assert_eq!(kh.remove("[::1%0]:2222").unwrap(), 1);
         assert!(KnownHosts::load(&path).unwrap().entries().is_empty());
+    }
+
+    #[test]
+    fn named_scope_pin_stays_named_and_matches_its_numeric_alias() {
+        use std::net::{SocketAddr, ToSocketAddrs};
+
+        for interface in ["lo", "lo0"] {
+            let scoped = format!("fe80::1%{interface}");
+            let Ok(mut resolved) = (scoped.as_str(), 2222).to_socket_addrs() else {
+                continue;
+            };
+            let Some(SocketAddr::V6(socket)) = resolved.find(SocketAddr::is_ipv6) else {
+                continue;
+            };
+            if socket.scope_id() == 0 {
+                continue;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("known_hosts");
+            let named = format!("[{scoped}]:2222");
+            let numeric = format!("[fe80::1%{}]:2222", socket.scope_id());
+            let a = fp("named-scope");
+            let mut known = KnownHosts::load(&path).unwrap();
+            known.set_if_new(&named, a).unwrap();
+            assert_eq!(known.entries()[0].0, named);
+            assert_eq!(known.get(&numeric), Some(a));
+            assert!(known.set_if_new(&numeric, fp("changed-key")).is_err());
+            assert_eq!(known.remove(&numeric).unwrap(), 1);
+            return;
+        }
+        eprintln!("skipping named IPv6 pin test: no loopback interface name resolved");
     }
 
     #[test]
@@ -1037,6 +1082,7 @@ mod tests {
         for replacement in [
             format!("example.com:2222 {a}\nEXAMPLE.COM:2222 {b}\n"),
             format!("[2001:db8::1]:2222 {a}\n2001:0DB8::1:2222 {b}\n"),
+            format!("[::1]:2222 {a}\n[::1%0]:2222 {b}\n"),
             "malformed entry\n".to_owned(),
         ] {
             fs::write(&path, &replacement).unwrap();

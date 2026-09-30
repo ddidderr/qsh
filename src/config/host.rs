@@ -1,6 +1,6 @@
 //! Host spelling shared by connection setup and the known-hosts database.
 
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
 use anyhow::{bail, Context, Result};
 use rustls::pki_types::DnsName;
@@ -9,6 +9,7 @@ use rustls::pki_types::DnsName;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HostName {
     name: String,
+    identity: String,
     is_address: bool,
     is_ipv6: bool,
 }
@@ -17,7 +18,8 @@ impl HostName {
     /// Normalize only spellings that have the same resolver meaning.
     ///
     /// Absolute DNS names retain their final dot: removing it can enable the
-    /// resolver's search suffixes. IPv6 interface names retain their case.
+    /// resolver's search suffixes. Resolvable IPv6 interface names use the
+    /// numeric scope ID returned by the same platform resolver used to connect.
     ///
     /// # Errors
     /// Fails for malformed DNS names, IP addresses or IPv6 scope identifiers.
@@ -35,8 +37,10 @@ impl HostName {
             if bracketed && !ip.is_ipv6() {
                 bail!("brackets are only valid around an IPv6 address");
             }
+            let name = ip.to_string();
             return Ok(Self {
-                name: ip.to_string(),
+                identity: name.clone(),
+                name,
                 is_address: true,
                 is_ipv6: ip.is_ipv6(),
             });
@@ -50,16 +54,21 @@ impl HostName {
             {
                 bail!("invalid IPv6 scope identifier");
             }
-            let scope = if scope.bytes().all(|b| b.is_ascii_digit()) {
-                scope
-                    .parse::<u32>()
-                    .context("IPv6 scope is too large")?
-                    .to_string()
+            let (scope, identity_scope) = if scope.bytes().all(|b| b.is_ascii_digit()) {
+                let scope = scope.parse::<u32>().context("IPv6 scope is too large")?;
+                let scope = (scope != 0).then(|| scope.to_string());
+                (scope.clone(), scope)
             } else {
-                scope.to_owned()
+                let identity = match resolve_named_scope(address, scope) {
+                    ScopeResolution::Unresolved => Some(scope.to_owned()),
+                    ScopeResolution::Default => None,
+                    ScopeResolution::Index(scope) => Some(scope.to_string()),
+                };
+                (Some(scope.to_owned()), identity)
             };
             return Ok(Self {
-                name: format!("{address}%{scope}"),
+                name: scoped_address(address, scope.as_deref()),
+                identity: scoped_address(address, identity_scope.as_deref()),
                 is_address: true,
                 is_ipv6: true,
             });
@@ -82,8 +91,10 @@ impl HostName {
             bail!("use a canonical IPv4 address");
         }
         DnsName::try_from(host).context("invalid host name")?;
+        let name = host.to_ascii_lowercase();
         Ok(Self {
-            name: host.to_ascii_lowercase(),
+            identity: name.clone(),
+            name,
             is_address: false,
             is_ipv6: false,
         })
@@ -112,6 +123,49 @@ impl HostName {
             format!("{}:{port}", self.name)
         }
     }
+
+    #[must_use]
+    fn identity_key(&self, port: u16) -> String {
+        if self.is_ipv6 {
+            format!("[{}]:{port}", self.identity)
+        } else {
+            format!("{}:{port}", self.identity)
+        }
+    }
+}
+
+fn scoped_address(address: Ipv6Addr, scope: Option<&str>) -> String {
+    scope.map_or_else(|| address.to_string(), |scope| format!("{address}%{scope}"))
+}
+
+/// Resolve an interface name through the same platform path connection setup
+/// uses. This preserves platform acceptance rules while merging names and
+/// numeric indices that produce the same effective IPv6 socket scope.
+enum ScopeResolution {
+    Unresolved,
+    Default,
+    Index(u32),
+}
+
+fn resolve_named_scope(address: Ipv6Addr, scope: &str) -> ScopeResolution {
+    let scoped = format!("{address}%{scope}");
+    let Some(scope) = (scoped.as_str(), 0)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut sockets| {
+            sockets.find_map(|socket| match socket {
+                SocketAddr::V6(socket) if *socket.ip() == address => Some(socket.scope_id()),
+                _ => None,
+            })
+        })
+    else {
+        return ScopeResolution::Unresolved;
+    };
+    if scope == 0 {
+        ScopeResolution::Default
+    } else {
+        ScopeResolution::Index(scope)
+    }
 }
 
 /// Also accept the unbracketed IPv6 entries written by older qsh clients.
@@ -128,6 +182,19 @@ pub(super) fn canonical_key(input: &str) -> Result<String> {
     Ok(HostName::parse(host)?.key(port))
 }
 
+pub(super) fn canonical_identity_key(input: &str) -> Result<String> {
+    let (host, port) = input
+        .rsplit_once(':')
+        .context("known host must include a port: host:port or [IPv6]:port")?;
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("invalid known-host port");
+    }
+    let port = port
+        .parse::<u16>()
+        .context("known-host port is too large")?;
+    Ok(HostName::parse(host)?.identity_key(port))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "tests assert successful parsing")]
 mod tests {
@@ -142,6 +209,8 @@ mod tests {
             ("2001:DB8::1:2222", "[2001:db8::1]:2222"),
             ("[FE80::1%NetA]:2222", "[fe80::1%NetA]:2222"),
             ("fe80::1%002:2222", "[fe80::1%2]:2222"),
+            ("[::1%0]:2222", "[::1]:2222"),
+            ("::1%000:2222", "[::1]:2222"),
         ] {
             assert_eq!(canonical_key(input).unwrap(), expected);
         }
@@ -153,6 +222,36 @@ mod tests {
             canonical_key("fe80::1%NetA:1").unwrap(),
             canonical_key("fe80::1%neta:1").unwrap()
         );
+        assert_ne!(
+            canonical_key("fe80::1%1:1").unwrap(),
+            canonical_key("fe80::1%2:1").unwrap()
+        );
+    }
+
+    #[test]
+    fn resolver_equivalent_scopes_share_identity_but_preserve_the_name() {
+        for interface in ["lo", "lo0"] {
+            let named = format!("fe80::1%{interface}");
+            let Ok(mut resolved) = (named.as_str(), 0).to_socket_addrs() else {
+                continue;
+            };
+            let Some(SocketAddr::V6(socket)) = resolved.find(SocketAddr::is_ipv6) else {
+                continue;
+            };
+            if socket.scope_id() == 0 {
+                continue;
+            }
+            let named_host = HostName::parse(&named).unwrap();
+            assert_eq!(
+                named_host.identity_key(2222),
+                HostName::parse(&format!("fe80::1%{}", socket.scope_id()))
+                    .unwrap()
+                    .identity_key(2222)
+            );
+            assert_eq!(named_host.key(2222), format!("[{named}]:2222"));
+            return;
+        }
+        eprintln!("skipping named IPv6 scope test: no loopback interface name resolved");
     }
 
     #[test]
