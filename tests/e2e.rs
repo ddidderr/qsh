@@ -1626,7 +1626,11 @@ fn cgroup_policy_kills_detached_descendants_or_fails_before_exec() {
         let updated = if cgroup_available {
             code == 0 && output.trim() == target.uid.as_raw().to_string()
         } else {
-            code != 0 && (error.contains("session cgroup") || error.contains("restricted sessions"))
+            // The ordinary `id` succeeds, while a restricted session whose
+            // cgroup cannot be prepared receives the server's cannot-execute
+            // status. Match that protocol result rather than enumerating
+            // OS-dependent diagnostics (including read-only mounts).
+            code == 126
         };
         if updated {
             break;
@@ -1704,9 +1708,9 @@ fn cgroup_policy_kills_detached_descendants_or_fails_before_exec() {
                 .unwrap();
             });
     } else {
-        assert_ne!(
-            code, 0,
-            "a restricted session ran without usable cgroup support"
+        assert_eq!(
+            code, 126,
+            "restricted setup did not report a cannot-execute refusal: {error}"
         );
         assert!(
             !restricted_marker.exists(),
