@@ -256,7 +256,9 @@ long-lived self-signed **Ed25519** certificate.
   Live diagnostics use a bounded queue and a dedicated writer, with a global
   limit of 16 detailed messages per second and periodic suppression counts.
   Authorization-reload failures are retained separately and retried after
-  transient write errors. A full log pipe cannot block session handling or
+  transient write errors. Failed mandatory `cgroup.kill` attempts use their own
+  coalesced retained alert, so peer log pressure cannot hide them or evict an
+  authorization warning. A full log pipe cannot block session handling or
   authorization reload.
 
   This is a fairness reservation, not a rate limit: nothing is remembered
