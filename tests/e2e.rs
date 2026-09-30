@@ -2120,6 +2120,71 @@ fn a_revoked_key_loses_an_established_connection() {
 }
 
 #[test]
+fn revoking_an_idle_connection_is_logged() {
+    let f = Fixture::start(&[]);
+    let log = f.tmp.path().join("server.log");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let conn = raw_connect(&f.client_dir, f.port).await;
+        assert_eq!(raw_session(&conn, &["true"]).await, Some(0));
+
+        // The only authenticated connection in this fixture is ours. The log
+        // is written by a background thread, so wait for the line to land.
+        let peer = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let found = std::fs::read_to_string(&log)
+                    .unwrap()
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("qsh-server: ")?
+                            .split_once(" authenticated as ")
+                            .map(|(peer, _)| peer.to_owned())
+                    });
+                if let Some(peer) = found {
+                    break peer;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the login was not logged");
+
+        let dir = f.server_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            run(
+                SERVER_BIN,
+                &["--dir", dir.to_str().unwrap(), "revoke", "tester"],
+            );
+        })
+        .await
+        .unwrap();
+        // Open no further streams: the connection is idle, so only the
+        // server's periodic policy check can notice the revocation.
+        tokio::time::timeout(Duration::from_secs(10), conn.closed())
+            .await
+            .expect("the revoked idle connection was not closed");
+
+        let expected =
+            format!("qsh-server: {peer} is no longer authorized; closing the connection");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !std::fs::read_to_string(&log).unwrap().contains(&expected) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "no withdrawal line for {peer}: {}",
+                std::fs::read_to_string(&log).unwrap()
+            )
+        });
+    });
+}
+
+#[test]
 fn revocation_stops_a_running_session_on_an_established_connection() {
     let f = Fixture::start(&[]);
     let pidfile = f.tmp.path().join("revoked-live.pid");

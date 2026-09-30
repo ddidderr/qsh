@@ -538,6 +538,9 @@ async fn serve_connection_sessions(
                     .lookup(&fingerprint)
                     .is_none_or(|entry| entry.meta.is_expired(unix_now()))
                 {
+                    diagnostics.record(|| {
+                        format!("qsh-server: {peer} is no longer authorized; closing the connection")
+                    });
                     conn.close(1u32.into(), b"authorization withdrawn or expired");
                     break Ok(());
                 }
@@ -562,9 +565,9 @@ async fn serve_connection_sessions(
         drop(current);
         if !allowed {
             diagnostics.record(|| {
-                format!("qsh-server: {peer} is no longer authorized; dropping the connection")
+                format!("qsh-server: {peer} is no longer authorized; closing the connection")
             });
-            conn.close(1u32.into(), b"authorization withdrawn");
+            conn.close(1u32.into(), b"authorization withdrawn or expired");
             break Ok(());
         }
         // Admission precedes both body allocation and blocking preparation.
