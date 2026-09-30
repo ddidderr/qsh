@@ -86,8 +86,8 @@ struct Authorize {
     /// Refuse remote command execution for this key.
     #[arg(long)]
     no_exec: bool,
-    /// Restrict execution to these programs; repeatable. Without it, any
-    /// program is allowed.
+    /// Filter the executable name; repeatable. All arguments and subprocesses
+    /// remain allowed. Without it, any program is allowed.
     #[arg(long = "command", value_name = "PROGRAM")]
     commands: Vec<String>,
     /// Stop accepting this key after N days. The deadline is recorded here on
@@ -337,7 +337,10 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
         println!("Expires in {days} days; after that the key is refused.");
     }
     if !meta.allowed_commands.is_empty() {
-        println!("Restricted to: {}", meta.allowed_commands.join(", "));
+        println!(
+            "Executable filter (arguments unrestricted): {}",
+            meta.allowed_commands.join(", ")
+        );
     }
     if !meta.allow_shell {
         println!("Interactive shells are refused for this key.");

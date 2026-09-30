@@ -786,7 +786,7 @@ fn environment_is_controlled_by_the_server() {
 }
 
 #[test]
-fn a_restricted_key_can_only_run_what_it_was_given() {
+fn an_executable_filter_accepts_only_its_configured_argv0() {
     let f = Fixture::start(&["--no-shell", "--command", "echo"]);
     let (code, out, _) = f.exec(&["echo", "hello"]);
     assert_eq!(code, 0);

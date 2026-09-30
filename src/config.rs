@@ -212,6 +212,7 @@ pub struct AuthMeta {
     #[serde(default = "yes")]
     pub allow_exec: bool,
     /// If non-empty, only these exact `argv[0]` values may be executed.
+    /// Arguments and programs spawned by that executable are not inspected;
     /// `allow_shell` is governed separately.
     #[serde(default)]
     pub allowed_commands: Vec<String>,
@@ -262,13 +263,13 @@ impl AuthMeta {
     ///
     /// The comparison is against the whole of `argv[0]`, never its basename.
     /// Matching a basename would be a hole rather than a convenience: the
-    /// authorized account can write an executable to a path it controls — with
-    /// this very rsync-only key, no less — and then ask for `/tmp/rsync`, so a
-    /// key restricted to `rsync` could run anything.
+    /// authorized account can write an executable to a path it controls and
+    /// ask for `/tmp/tool`, bypassing an entry that names a trusted `tool`.
     ///
-    /// A bare name such as `rsync` therefore permits exactly `rsync`, which
-    /// the server resolves through its own fixed `PATH`. To allow a program
-    /// somewhere else, authorize its absolute path.
+    /// A bare name such as `tool` therefore permits that exact name, which the
+    /// server resolves through its own fixed `PATH`. It does not constrain the
+    /// tool's arguments or subprocesses. To allow a program elsewhere,
+    /// authorize its absolute path.
     #[must_use]
     pub fn command_allowed(&self, argv: &[String]) -> bool {
         if self.allowed_commands.is_empty() {
@@ -347,6 +348,12 @@ impl AuthStore {
                     .with_context(|| format!("parsing {}", meta_path.display()))?;
                 if meta.user.is_empty() {
                     bail!("{} does not name a user", meta_path.display());
+                }
+                if !meta.allowed_commands.is_empty() {
+                    warn(format!(
+                        "qsh-server: warning: authorization `{name}` uses an executable-name \
+                         filter; its arguments and subprocesses remain unrestricted"
+                    ));
                 }
                 // Refuse a policy that was written for a different key rather
                 // than applying it to this one.
@@ -635,8 +642,8 @@ mod tests {
 
     #[test]
     fn a_basename_match_cannot_smuggle_in_another_executable() {
-        // The whole point of an rsync-only key: the account can write files,
-        // so anything matched by basename alone would be arbitrary code.
+        // Exact argv[0] matching prevents a writable lookalike from satisfying
+        // an entry that names the trusted PATH-resolved executable.
         let meta = AuthMeta {
             user: "alice".into(),
             allowed_commands: vec!["rsync".into()],

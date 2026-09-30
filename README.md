@@ -90,8 +90,8 @@ That maps this key to the local account `alice`. It takes effect within a
 second — no restart. Useful variations:
 
 ```
-# rsync-only key: no interactive shell, no other programs
-sudo qsh-server authorize backup.crt --user backup --no-shell --command rsync
+# Status key: admit only this executable (all its options remain available)
+sudo qsh-server authorize status.crt --user monitor --no-shell --command /usr/bin/uptime
 
 # temporary login: kill this key's remaining session descendants at session end
 sudo qsh-server authorize guest.crt --user guest --kill-session-processes
@@ -173,10 +173,17 @@ long-lived self-signed **Ed25519** certificate.
   the server signals each session's initial process group. A PTY shell can put
   a foreground job in a different group; that job may survive if it ignores
   the terminal hangup.
+* `--command` filters the executable name, not its arguments, subprocesses,
+  filesystem access, or other capabilities. In particular, allowing `rsync`
+  does **not** create an rsync-only account: its `-e`/`--rsh` options can run
+  arbitrary programs. Editors, interpreters, and many other tools also have
+  command execution features. Use a dedicated constrained Unix account and an
+  administrator-maintained wrapper that validates the complete argument grammar
+  when application confinement is required. qsh does not supply that sandbox.
 * Command restrictions only protect the server's state when the authorized
   account cannot write that state. If a non-root server and a remote session
-  run as the same Unix user, even an rsync-only session can rewrite its
-  `authorized/` entries or host key. For restricted keys, keep the server's
+  run as the same Unix user, even a session admitted only to rsync can rewrite
+  its `authorized/` entries or host key. For restricted keys, keep the server's
   state root-owned and authorize a different, non-root target account. A key
   authorized to log in as root has administrator access by design.
 * Private keys are written 0600 and refused at load time if they are group- or
@@ -185,8 +192,8 @@ long-lived self-signed **Ed25519** certificate.
   are made to complete a QUIC retry before the server does any work for them.
 * A key restricted with `--command` is matched against the whole of `argv[0]`,
   never its basename: the authorized account can write files, so permitting
-  `/tmp/rsync` because it ends in `rsync` would make an rsync-only key a
-  general-purpose one. A bare name is resolved through the server's own fixed
+  `/tmp/tool` because it ends in `tool` would permit a replacement executable.
+  A bare name is resolved through the server's own fixed
   `PATH`; to allow a program elsewhere, authorize its absolute path.
 * A session is torn down with its connection. If the client is killed, the
   server notices when the QUIC idle timeout expires (60s by default, with
@@ -238,9 +245,17 @@ long-lived self-signed **Ed25519** certificate.
   locking out everyone else — separate budgets alone would not do that.
   After authentication, one client key may hold at most 32 established
   connections, leaving room for other authorized keys.
+  Independently, at most 128 sessions in total and 32 per key can be preparing,
+  running, or cleaning up. A session holds its budget until its blocking work,
+  child, I/O tasks, and cleanup have ended; reconnecting does not reset it.
+  Excess streams are reset promptly. Output queues hold at most eight 64 KiB
+  chunks per session, with separate QUIC transport buffers.
   Over-limit connections are dropped silently rather than answered, and
   failures before authentication are counted and reported in batches rather
   than logged one line per attempt.
+  Live diagnostics use a bounded queue and a dedicated writer, with a global
+  limit of 16 detailed messages per second and periodic suppression counts.
+  A full log pipe cannot block session handling or authorization reload.
 
   This is a fairness reservation, not a rate limit: nothing is remembered
   after an attempt ends, so there is no per-address table to grow or expire.
@@ -257,6 +272,13 @@ long-lived self-signed **Ed25519** certificate.
   The supplementary groups are resolved *before* the fork: looking them up
   afterwards would mean calling NSS in a forked child, which is not
   async-signal-safe and deadlocks under LDAP or SSSD.
+  Linux ambient capabilities are cleared for every child, including when a
+  non-root daemon already has the requested UID. Ordinary sessions can still
+  use the account's setuid and file-capability programs; `no_new_privs` remains
+  specific to `--kill-session-processes`.
+  A non-root daemon inherits its account's supplementary groups at startup and
+  cannot reset them. Restart it after removing group membership, and do not
+  grant service-specific supplementary groups that remote sessions should lack.
 
 What 1.0 does **not** have, on purpose: port forwarding, agent forwarding, X11
 forwarding, `sftp`, jump hosts, certificate authorities, host key rotation
@@ -287,7 +309,7 @@ Keep-alives keep a reachable, otherwise quiet session active.
 user = "alice"
 allow_shell = true
 allow_exec = true
-allowed_commands = []       # empty means "any program"; entries match argv[0] exactly
+allowed_commands = []       # empty: any executable; entries match argv[0], not arguments
 kill_session_processes = false # true: cgroup cleanup for each session
 key_fingerprint = "sha256:…" # the key this policy was written for
 # expires_at_unix = 1793491200   # optional; set by --expires-in-days
@@ -297,6 +319,9 @@ An authorization is two files — `<name>.crt` and `<name>.toml` — and each is
 written atomically. `key_fingerprint` ties them together: if a crash or a
 half-finished edit ever left a certificate paired with a policy written for a
 different key, the entry is refused rather than applied.
+`authorize` publishes only the parsed certificate it fingerprinted; embedded
+private keys, unrelated text, and later changes to the submitted path are not
+copied into the authorization store.
 
 Environment overrides for both binaries: `QSH_HOME` (client directory) and
 `QSH_SERVER_HOME` (server directory); `qsh-server --dir` and `qsh -i` do the
@@ -324,14 +349,26 @@ qsh [options] [user@]host [command [args...]]
 
 Subcommands: `qsh keygen`, `qsh fingerprint`, `qsh known-hosts list|add|remove`.
 
-A host name that resolves to several addresses is tried in turn, IPv6 first,
-each with its own connect timeout — so a dual-stack name still works when only
-one family is reachable.
+A host name that resolves to several addresses is tried with a 250 ms stagger,
+at most two attempts at once, and an interleaved IPv6/IPv4 order. Each address
+gets its own connect timeout, so a dual-stack name still works when only one
+family is reachable.
 
-In an interactive session, `~.` at the start of a line hangs up (the remote
-session gets `SIGHUP`, so it exits `129` rather than being orphaned), and `~~`
+Host pins normalize DNS case, IP address spelling, and numeric ports. Existing
+equivalent entries with conflicting keys fail closed. A DNS name ending in `.`
+remains distinct: its absolute lookup must not be confused with resolver search
+domain behavior. DNS aliases are not merged.
+
+In an interactive session, `~.` at the start of a line disconnects locally and
+restores the terminal immediately, with exit status `255`; it does not wait for
+the remote process or server to cooperate. The server observes the disconnect
+and performs its usual cleanup. `~~`
 sends a literal tilde — as in ssh. The escape is disabled whenever there is no
 terminal, so binary streams are never interpreted.
+During terminal backpressure the client keeps reading escapes with a bounded
+4 MiB pending-input buffer. If it fills, the session fails explicitly rather
+than silently dropping input or blocking local escape. Piped input uses normal
+backpressure.
 
 `qsh -t host cat < file` works: a terminal has no half to close, so end of
 input is delivered as the line discipline's EOF character — twice, because the
@@ -396,6 +433,14 @@ One QUIC bidirectional stream per session. Frames are
 Structured payloads use [postcard](https://docs.rs/postcard); the three data
 kinds carry raw bytes. ALPN is `qsh/1`.
 
+Request metadata is limited to 64 KiB, 1,024 arguments, and 64 environment
+entries. Arguments and environment values may each contain at most 16 KiB;
+user names, environment names, and terminal types at most 256 bytes. Collection
+and string limits are enforced during decoding, before allocation. Data frames
+retain their 1 MiB limit. The first frame must be a Request; its kind and length
+are checked before accepting its payload. Invalid frames are rejected rather
+than truncated.
+
 ## Development
 
 ```
@@ -436,8 +481,9 @@ cannot lock every future session out.
 ioctls, raw-fd reads and writes, `kill(2)`, and the `pre_exec` hook that runs
 `setsid` plus `setgroups`/`setgid`/`setuid` between fork and exec have no safe
 equivalents — so each of the eleven exceptions carries its own
-`#[allow(unsafe_code, reason = ...)]`. They live in exactly two modules, `pty`
-and `child`, and `just audit-unsafe` prints every one of them:
+`#[allow(unsafe_code, reason = ...)]`. They are confined to small syscall
+boundaries in `pty`, `child`, `cgroup`, and `server`; `just audit-unsafe` prints
+the current reasons and per-file counts:
 
 ```
 $ just audit-unsafe
@@ -446,9 +492,9 @@ unsafe_code is denied crate-wide; every exception is justified:
   - kill(2) has no safe wrapper; pid comes from our own child
   - pre_exec is inherently unsafe: its closure runs between fork and exec
   ...
-unsafe blocks per file:
-src/pty.rs:8
-src/child.rs:4
+  - statfs is needed to verify the kernel cgroup v2 filesystem
+  - waitid with WNOWAIT preserves the child PID until cleanup
+  ...
 ```
 
 ## License
