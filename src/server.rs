@@ -826,9 +826,9 @@ impl ProcessGroupGuard {
         let Some(pid) = self.pid else { return };
         child::signal_process_group(pid, libc::SIGHUP);
         // Keep the leader waitable so its PID/PGID cannot be reused. Its exit
-        // does not prove that the rest of the group has exited: a descendant
-        // may still need time to handle SIGTERM and clean up.
-        let _ = tokio::time::timeout(TERMINATE_GRACE, wait_for_leader_exit(Some(pid))).await;
+        // does not prove that the rest of the group has exited: descendants
+        // need the full grace period to handle each signal and clean up.
+        tokio::time::sleep(TERMINATE_GRACE).await;
         child::signal_process_group(pid, libc::SIGTERM);
         tokio::time::sleep(TERMINATE_GRACE).await;
         child::signal_process_group(pid, libc::SIGKILL);
@@ -1736,70 +1736,83 @@ mod tests {
         let _ = child.wait().await;
         assert!(!child::process_group_alive(pid));
         // It should have taken both grace periods to get there.
-        assert!(started.elapsed() >= TERMINATE_GRACE);
+        assert!(started.elapsed() >= TERMINATE_GRACE * 2);
     }
 
     #[tokio::test]
-    async fn terminate_gives_descendants_time_after_the_leader_exits() {
-        // The leader exits on HUP, but a member of the same group ignores HUP
-        // and writes a cleanup marker when TERM arrives. An immediate KILL
-        // after observing leader exit would prevent that cleanup.
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c").arg(
-            "trap 'exit 0' HUP; \
-             sh -c 'trap \"\" HUP; trap \"echo cleaned; exit 0\" TERM; \
-             echo child-ready; while :; do sleep 60; done' & \
+    async fn terminate_gives_descendants_each_signal_grace_after_the_leader_exits() {
+        // The leader exits on HUP. Its descendant must still get time to
+        // clean up for either HUP or TERM, even though the leader is gone.
+        // Read on inherited stdin: an external sleeping child could be forked
+        // after readiness and miss HUP, delaying the shell trap until its exit.
+        for traps in [
+            "trap \"sleep 0.3; echo cleaned; exit 0\" HUP;",
+            "trap \"\" HUP; trap \"echo cleaned; exit 0\" TERM;",
+        ] {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c").arg(format!(
+                "exec 3<&0; trap 'exit 0' HUP; \
+             sh -c '{traps} echo child-ready; read line' <&3 & \
              echo parent-ready; read line",
-        );
-        cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
-        // SAFETY: setsid is async-signal-safe; mirrors what child::spawn does.
-        #[allow(unsafe_code, reason = "the test needs its own process group")]
-        unsafe {
-            cmd.as_std_mut().pre_exec(|| {
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = cmd.spawn().unwrap();
-        let pid = child.id().unwrap();
-        let _stdin = child.stdin.take().unwrap();
-        let mut stdout = child.stdout.take().unwrap();
-        let mut output = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !output
-                .windows(b"parent-ready".len())
-                .any(|w| w == b"parent-ready")
-                || !output
-                    .windows(b"child-ready".len())
-                    .any(|w| w == b"child-ready")
-            {
-                let mut buf = [0u8; 64];
-                let n = stdout.read(&mut buf).await.unwrap();
-                assert!(n > 0, "the test job closed stdout before it was ready");
-                output.extend_from_slice(&buf[..n]);
+            ));
+            cmd.stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            // SAFETY: signal and setsid are async-signal-safe in this child.
+            #[allow(unsafe_code, reason = "the test needs its own process group")]
+            unsafe {
+                cmd.as_std_mut().pre_exec(|| {
+                    // Noninteractive shells preserve an inherited ignored HUP.
+                    // Restore the default so both test traps can be installed.
+                    if libc::signal(libc::SIGHUP, libc::SIG_DFL) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
             }
-        })
-        .await
-        .expect("the test job did not become ready");
-
-        let mut guard = ProcessGroupGuard::new(Some(pid));
-        let started = tokio::time::Instant::now();
-        guard.terminate().await.unwrap();
-        let _ = child.wait().await;
-        tokio::time::timeout(Duration::from_secs(5), stdout.read_to_end(&mut output))
+            let mut child = cmd.spawn().unwrap();
+            let pid = child.id().unwrap();
+            let _stdin = child.stdin.take().unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            let mut output = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !output
+                    .windows(b"parent-ready".len())
+                    .any(|w| w == b"parent-ready")
+                    || !output
+                        .windows(b"child-ready".len())
+                        .any(|w| w == b"child-ready")
+                {
+                    let mut buf = [0u8; 64];
+                    let n = stdout.read(&mut buf).await.unwrap();
+                    assert!(n > 0, "the test job closed stdout before it was ready");
+                    output.extend_from_slice(&buf[..n]);
+                }
+            })
             .await
-            .expect("the process group kept stdout open")
-            .unwrap();
-        assert!(
-            output.windows(b"cleaned".len()).any(|w| w == b"cleaned"),
-            "the descendant got no TERM cleanup time: {}",
-            String::from_utf8_lossy(&output)
-        );
-        assert!(started.elapsed() >= TERMINATE_GRACE);
+            .expect("the test job did not become ready");
+
+            let mut guard = ProcessGroupGuard::new(Some(pid));
+            let started = tokio::time::Instant::now();
+            guard.terminate().await.unwrap();
+            assert!(
+                child.wait().await.unwrap().success(),
+                "the leader did not exit on HUP"
+            );
+            tokio::time::timeout(Duration::from_secs(5), stdout.read_to_end(&mut output))
+                .await
+                .expect("the process group kept stdout open")
+                .unwrap();
+            assert!(
+                output.windows(b"cleaned".len()).any(|w| w == b"cleaned"),
+                "the descendant got no signal cleanup time ({traps}): {}",
+                String::from_utf8_lossy(&output)
+            );
+            assert!(started.elapsed() >= TERMINATE_GRACE);
+        }
     }
 
     #[test]
