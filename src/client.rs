@@ -11,8 +11,9 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
+use crate::config::host::HostName;
 use crate::config::{ClientPaths, KnownHosts};
 use crate::crypto::{self, Fingerprint, PinnedServerVerifier};
 use crate::net::transport_config;
@@ -104,10 +105,6 @@ impl Options {
             |dir| format!("qsh known-hosts -i {}", shell_quote(&dir.to_string_lossy())),
         )
     }
-
-    fn host_key(&self) -> String {
-        format!("{}:{}", self.host, self.port)
-    }
 }
 
 // Commands in diagnostics must preserve spaces and apostrophes in identity paths.
@@ -191,7 +188,9 @@ impl ServerCertVerifier for CaptureVerifier {
 /// Fails if the identity is missing, the host key is unknown and not
 /// accepted, the connection cannot be established, or the session ends
 /// without an exit status.
-pub async fn run(opts: Options) -> Result<i32> {
+pub async fn run(mut opts: Options) -> Result<i32> {
+    let host = HostName::parse(&opts.host)?;
+    opts.host = host.as_str().to_owned();
     let paths = match &opts.paths_dir {
         Some(dir) => ClientPaths::new(dir.clone()),
         None => ClientPaths::discover()?,
@@ -203,7 +202,7 @@ pub async fn run(opts: Options) -> Result<i32> {
         )
     })?;
 
-    let host_key = opts.host_key();
+    let host_key = host.key(opts.port);
     let mut known = KnownHosts::load(&paths.known_hosts())?;
     let addrs = resolve(&opts.host, opts.port, opts.family)?;
     let pinned = if let Some(fp) = known.get(&host_key) {
@@ -369,6 +368,7 @@ async fn connect_one(
     client_config: &quinn::ClientConfig,
     opts: &Options,
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
+    let host = HostName::parse(&opts.host)?;
     let bind = SocketAddr::new(
         if addr.is_ipv6() {
             IpAddr::V6(Ipv6Addr::UNSPECIFIED)
@@ -380,14 +380,14 @@ async fn connect_one(
     let mut endpoint = quinn::Endpoint::client(bind).context("opening a local UDP socket")?;
     endpoint.set_default_client_config(client_config.clone());
     let connecting = endpoint
-        .connect(addr, sni_name(&opts.host))
+        .connect(addr, host.server_name())
         .context("starting the QUIC handshake")?;
     match tokio::time::timeout(Duration::from_secs(opts.connect_timeout_secs), connecting).await {
         Ok(Ok(conn)) => Ok((endpoint, conn)),
         Ok(Err(error)) => {
             let fatal = matches!(&error, quinn::ConnectionError::TransportError(te)
                 if te.to_string().contains("HostKeyMismatch"));
-            let error = connect_error(&error, opts, addr);
+            let error = connect_error(&error, opts, addr, &host.key(opts.port));
             if fatal {
                 Err(error.context(HostKeyRejected))
             } else {
@@ -403,7 +403,12 @@ async fn connect_one(
 }
 
 /// Turn a connection failure into a message that says what to do next.
-fn connect_error(e: &quinn::ConnectionError, opts: &Options, addr: SocketAddr) -> anyhow::Error {
+fn connect_error(
+    e: &quinn::ConnectionError,
+    opts: &Options,
+    addr: SocketAddr,
+    host_key: &str,
+) -> anyhow::Error {
     let base = anyhow!("cannot connect to {} ({addr}): {e}", opts.host);
     match e {
         quinn::ConnectionError::TransportError(te)
@@ -414,9 +419,9 @@ fn connect_error(e: &quinn::ConnectionError, opts: &Options, addr: SocketAddr) -
                  entry with `{} remove {}`; otherwise someone may be \
                  impersonating the server.",
                 te,
-                opts.host_key(),
+                host_key,
                 opts.known_hosts_command(),
-                opts.host_key()
+                host_key
             )
         }
         quinn::ConnectionError::TimedOut => anyhow!(
@@ -428,26 +433,16 @@ fn connect_error(e: &quinn::ConnectionError, opts: &Options, addr: SocketAddr) -
     }
 }
 
-fn sni_name(host: &str) -> &str {
-    // The certificate is pinned by public key, so the SNI value is cosmetic;
-    // it just has to be a syntactically valid DNS name.
-    if host.parse::<std::net::IpAddr>().is_ok() || host.is_empty() {
-        "qsh"
-    } else {
-        host
-    }
-}
-
 /// Every address the host resolves to, filtered by the requested family.
 ///
 /// Returning only the first result would make a perfectly reachable host fail
 /// on resolver order alone — `localhost` yielding `::1` first while the server
 /// listens on `0.0.0.0` is the everyday case.
 fn resolve(host: &str, port: u16, family: AddressFamily) -> Result<Vec<SocketAddr>> {
-    let trimmed = host.trim_start_matches('[').trim_end_matches(']');
-    let mut addrs: Vec<SocketAddr> = (trimmed, port)
+    let host = HostName::parse(host)?;
+    let mut addrs: Vec<SocketAddr> = (host.as_str(), port)
         .to_socket_addrs()
-        .with_context(|| format!("resolving `{host}`"))?
+        .with_context(|| format!("resolving `{}`", host.as_str()))?
         .filter(|a| family.accepts(a))
         .collect();
     // Interleave the families so an IPv4 fallback is the second attempt,
@@ -461,7 +456,10 @@ fn resolve(host: &str, port: u16, family: AddressFamily) -> Result<Vec<SocketAdd
         addrs.extend(v4.get(i));
     }
     if addrs.is_empty() {
-        bail!("`{host}` did not resolve to any {family} address");
+        bail!(
+            "`{}` did not resolve to any {family} address",
+            host.as_str()
+        );
     }
     Ok(addrs)
 }
@@ -575,6 +573,9 @@ async fn session(conn: &quinn::Connection, opts: &Options) -> Result<i32> {
         // no line editing, and no obvious way back.
         let signals = FatalSignals::install()?;
         let guard = RawMode::enable(stdin_fd).context("switching the terminal to raw mode")?;
+        // Tokio installs a process-wide signal disposition that is not restored
+        // when a Signal stream is dropped. Keep this watcher for the process
+        // lifetime so an embedding process still terminates on a later signal.
         tokio::spawn(signals.restore_on_fire(stdin_fd, guard.saved()));
         Some(guard)
     } else {
@@ -591,9 +592,8 @@ type Outbound = mpsc::Sender<Frame>;
 
 /// Drive the session to completion.
 ///
-/// Reading and writing each live in their own task. Frame codecs are not
-/// cancellation-safe, so they must never sit in a `select!` arm — a cancelled
-/// half-read would desynchronise the stream.
+/// A cancelled codec must never resume on a partially consumed stream. Local
+/// cancellation abandons the entire receive loop and shuts down every task.
 async fn pump(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
@@ -601,8 +601,11 @@ async fn pump(
     no_stdin: bool,
 ) -> Result<i32> {
     let (tx, mut rx) = mpsc::channel::<Frame>(64);
+    let (disconnect, disconnected) = oneshot::channel();
+    // JoinSet aborts its tasks even if this future is cancelled or errors.
+    let mut tasks = tokio::task::JoinSet::new();
 
-    let writer = tokio::spawn(async move {
+    tasks.spawn(async move {
         while let Some(frame) = rx.recv().await {
             if write_frame(&mut send, &frame).await.is_err() {
                 break;
@@ -612,52 +615,73 @@ async fn pump(
     });
 
     let terminal_input = use_pty && !no_stdin && std::io::stdin().is_terminal();
-    let stdin_task = if no_stdin {
+    if no_stdin {
         let _ = tx.send(Frame::StdinEof).await;
-        None
     } else {
-        Some(tokio::spawn(forward_stdin(tx.clone(), terminal_input)))
-    };
-    let winch_task = use_pty.then(|| tokio::spawn(forward_winch(tx.clone())));
-    let signal_task = (!terminal_input).then(|| tokio::spawn(forward_signals(tx.clone())));
+        tasks.spawn(forward_stdin(
+            tokio::io::stdin(),
+            tx.clone(),
+            terminal_input,
+            disconnect,
+        ));
+    }
+    if use_pty {
+        tasks.spawn(forward_winch(tx.clone()));
+    }
+    if !terminal_input {
+        tasks.spawn(forward_signals(tx.clone()));
+    }
     drop(tx);
 
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
-    let mut exit: Option<ExitStatus> = None;
+    let result = until_disconnect(
+        receive_output(&mut recv, &mut stdout, &mut stderr),
+        disconnected,
+    )
+    .await;
+    tasks.shutdown().await;
+    let _ = recv.stop(0u32.into());
+    result
+}
 
-    while let Some(frame) = read_frame(&mut recv).await? {
-        if let Some(status) = apply(frame, &mut stdout, &mut stderr).await? {
-            exit = Some(status);
-            break;
+/// Local escape works even while a server frame or local output is stalled.
+async fn until_disconnect(
+    remote: impl std::future::Future<Output = Result<i32>>,
+    disconnected: oneshot::Receiver<Result<i32>>,
+) -> Result<i32> {
+    let requested = async {
+        match disconnected.await {
+            Ok(result) => result,
+            // Ordinary stdin EOF is not a request to disconnect.
+            Err(_) => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        result = requested => result,
+        result = remote => result,
+    }
+}
+
+async fn receive_output(
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
+    stdout: &mut (impl tokio::io::AsyncWrite + Unpin),
+    stderr: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> Result<i32> {
+    while let Some(frame) = read_frame(recv).await? {
+        if let Some(status) = apply(frame, stdout, stderr).await? {
+            return Ok(status.wait_status());
         }
     }
-
-    if let Some(t) = stdin_task {
-        t.abort();
-    }
-    if let Some(t) = winch_task {
-        t.abort();
-    }
-    if let Some(t) = signal_task {
-        t.abort();
-    }
-    writer.abort();
-    stdout.flush().await.ok();
-    stderr.flush().await.ok();
-
-    // No exit status means the stream ended early — never report that as a
-    // successful run.
-    exit.map(|s| s.wait_status()).ok_or_else(|| {
-        anyhow!("the connection closed before the remote process reported an exit status")
-    })
+    bail!("the connection closed before the remote process reported an exit status")
 }
 
 /// Apply one server frame; returns the exit status once the session ends.
 async fn apply(
     frame: Frame,
-    stdout: &mut tokio::io::Stdout,
-    stderr: &mut tokio::io::Stderr,
+    stdout: &mut (impl tokio::io::AsyncWrite + Unpin),
+    stderr: &mut (impl tokio::io::AsyncWrite + Unpin),
 ) -> Result<Option<ExitStatus>> {
     match frame {
         Frame::Stdout(data) => {
@@ -668,7 +692,10 @@ async fn apply(
             stderr.write_all(&data).await?;
             stderr.flush().await?;
         }
-        Frame::Error(msg) => eprintln!("qsh: {msg}"),
+        Frame::Error(msg) => {
+            stderr.write_all(format!("qsh: {msg}\n").as_bytes()).await?;
+            stderr.flush().await?;
+        }
         Frame::Exit(status) => return Ok(Some(status)),
         _ => {}
     }
@@ -676,28 +703,90 @@ async fn apply(
 }
 
 /// Read local stdin and forward it, honouring the `~.` escape on a terminal.
-async fn forward_stdin(tx: Outbound, terminal_input: bool) {
-    let mut stdin = tokio::io::stdin();
-    let mut buf = vec![0u8; CHUNK];
-    let mut escape = EscapeState::new(terminal_input);
+async fn forward_stdin(
+    mut stdin: impl tokio::io::AsyncRead + Unpin,
+    tx: Outbound,
+    terminal_input: bool,
+    disconnect: oneshot::Sender<Result<i32>>,
+) {
+    if terminal_input {
+        match forward_terminal_input(&mut stdin, &tx).await {
+            Ok(Some(status)) => {
+                let _ = disconnect.send(Ok(status));
+            }
+            Err(error) => {
+                let _ = disconnect.send(Err(error));
+            }
+            Ok(None) => {}
+        }
+        return;
+    }
 
+    // Binary/piped input retains ordinary backpressure and is never interpreted.
+    let mut buf = vec![0u8; CHUNK];
     loop {
         match stdin.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 let Some(chunk) = buf.get(..n) else { break };
-                let (data, disconnect) = escape.filter(chunk);
-                if !data.is_empty() && tx.send(Frame::Stdin(data)).await.is_err() {
-                    break;
-                }
-                if disconnect {
-                    let _ = tx.send(Frame::Signal("HUP".into())).await;
+                if tx.send(Frame::Stdin(chunk.to_vec())).await.is_err() {
                     break;
                 }
             }
         }
     }
     let _ = tx.send(Frame::StdinEof).await;
+}
+
+/// Read escape keys even when the server has stopped consuming earlier input.
+/// A bounded backlog preserves input ordering without unlimited buffering; an
+/// overflow ends the session with an explicit local error instead of losing data.
+async fn forward_terminal_input(
+    stdin: &mut (impl tokio::io::AsyncRead + Unpin),
+    tx: &Outbound,
+) -> Result<Option<i32>> {
+    const MAX_PENDING: usize = 4 * 1024 * 1024;
+    let mut pending = std::collections::VecDeque::new();
+    let mut buf = vec![0u8; CHUNK];
+    let mut escape = EscapeState::new(true);
+    let mut input_open = true;
+    let mut output_open = true;
+    while input_open || !pending.is_empty() {
+        tokio::select! {
+            biased;
+            permit = tx.reserve(), if output_open && !pending.is_empty() => {
+                let Ok(permit) = permit else {
+                    // A process may close stdin before it finishes producing
+                    // output. Continue reading local escape keys until Exit.
+                    output_open = false;
+                    pending.clear();
+                    continue;
+                };
+                let count = pending.len().min(CHUNK);
+                permit.send(Frame::Stdin(pending.drain(..count).collect()));
+            }
+            read = stdin.read(&mut buf), if input_open => {
+                let n = read.context("reading the local terminal")?;
+                if n == 0 {
+                    input_open = false;
+                    continue;
+                }
+                let Some(chunk) = buf.get(..n) else { break };
+                let (data, requested) = escape.filter(chunk);
+                if requested {
+                    return Ok(Some(255));
+                }
+                if output_open {
+                    if data.len() > MAX_PENDING.saturating_sub(pending.len()) {
+                        bail!("terminal input backlog exceeded 4 MiB; closing the stalled session");
+                    }
+                    pending.extend(data);
+                }
+            }
+        }
+    }
+    let _ = tx.send(Frame::StdinEof).await;
+    Ok(None)
 }
 
 /// The `~.` escape sequence, recognised only at the start of a line.
@@ -893,6 +982,151 @@ mod tests {
         let (out, disconnect) = st.filter(&payload);
         assert_eq!(out, payload);
         assert!(!disconnect);
+    }
+
+    #[tokio::test]
+    async fn escape_abandons_a_partial_frame_even_with_a_full_outbound_queue() {
+        let (mut peer, mut recv) = tokio::io::duplex(32);
+        let (mut terminal, input) = tokio::io::duplex(32);
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(Frame::Stdin(vec![1])).await.unwrap();
+        let (disconnect, disconnected) = oneshot::channel();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(forward_stdin(input, tx, true, disconnect));
+        // A frame header is five bytes; the peer deliberately stops mid-header.
+        peer.write_all(&[0, 0]).await.unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let receiving = Arc::clone(&started);
+        let session = tokio::spawn(async move {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            until_disconnect(
+                async {
+                    receiving.notify_one();
+                    receive_output(&mut recv, &mut stdout, &mut stderr).await
+                },
+                disconnected,
+            )
+            .await
+        });
+        started.notified().await;
+        terminal.write_all(b"ignored\n").await.unwrap();
+        // Let the prior input encounter the already full outbound queue.
+        tokio::task::yield_now().await;
+        terminal.write_all(b"~.").await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), session)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            255
+        );
+        tasks.shutdown().await;
+        assert!(matches!(rx.recv().await, Some(Frame::Stdin(data)) if data == [1]));
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ordinary_stdin_eof_still_waits_for_remote_output_and_exit() {
+        let (mut peer, mut recv) = tokio::io::duplex(256);
+        let (tx, mut rx) = mpsc::channel(2);
+        let (disconnect, disconnected) = oneshot::channel();
+        forward_stdin(&b"hello"[..], tx, true, disconnect).await;
+        assert!(matches!(rx.recv().await, Some(Frame::Stdin(data)) if data == b"hello"));
+        assert!(matches!(rx.recv().await, Some(Frame::StdinEof)));
+        write_frame(&mut peer, &Frame::Stdout(b"result".to_vec()))
+            .await
+            .unwrap();
+        write_frame(
+            &mut peer,
+            &Frame::Exit(ExitStatus {
+                code: 7,
+                signal: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(
+            until_disconnect(
+                receive_output(&mut recv, &mut stdout, &mut stderr),
+                disconnected
+            )
+            .await
+            .unwrap(),
+            7
+        );
+        assert_eq!(stdout, b"result");
+    }
+
+    #[tokio::test]
+    async fn excessive_terminal_backlog_fails_without_dropping_input_silently() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send(Frame::Stdin(vec![1])).await.unwrap();
+        let (disconnect, disconnected) = oneshot::channel();
+        let pasted = vec![b'a'; 4 * 1024 * 1024 + 1];
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            forward_stdin(pasted.as_slice(), tx, true, disconnect),
+        )
+        .await
+        .unwrap();
+        let error = disconnected.await.unwrap().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("terminal input backlog exceeded"));
+    }
+
+    #[tokio::test]
+    async fn remote_closed_stdin_does_not_disable_local_escape() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let (mut terminal, input) = tokio::io::duplex(32);
+        let (disconnect, disconnected) = oneshot::channel();
+        let task = tokio::spawn(forward_stdin(input, tx, true, disconnect));
+        terminal.write_all(b"ordinary input\n").await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        terminal.write_all(b"~.").await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), disconnected)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            255
+        );
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_escape_also_cancels_a_server_error_to_stalled_stderr() {
+        let (mut peer, mut recv) = tokio::io::duplex(256);
+        write_frame(&mut peer, &Frame::Error("remote error".into()))
+            .await
+            .unwrap();
+        let (mut stderr, mut reader) = tokio::io::duplex(1);
+        let (disconnect, disconnected) = oneshot::channel();
+        let session = tokio::spawn(async move {
+            let mut stdout = Vec::new();
+            until_disconnect(
+                receive_output(&mut recv, &mut stdout, &mut stderr),
+                disconnected,
+            )
+            .await
+        });
+        assert_eq!(reader.read_u8().await.unwrap(), b'q');
+        disconnect.send(Ok(255)).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), session)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            255
+        );
     }
 
     fn verify(pem: &str) -> std::result::Result<ServerCertVerified, TlsError> {
@@ -1170,12 +1404,6 @@ mod tests {
                 assert_eq!(addr.port(), 2222);
             }
         }
-    }
-
-    #[test]
-    fn sni_falls_back_for_addresses() {
-        assert_eq!(sni_name("192.0.2.1"), "qsh");
-        assert_eq!(sni_name("example.com"), "example.com");
     }
 
     #[test]

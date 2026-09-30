@@ -439,6 +439,8 @@ impl FileLock {
     }
 }
 
+pub(crate) mod host;
+
 /// A `known_hosts` file: `host:port sha256:<hex>`, one per line.
 #[derive(Debug, Default)]
 pub struct KnownHosts {
@@ -452,22 +454,35 @@ impl KnownHosts {
     /// # Errors
     /// Fails on a malformed entry or an unparseable fingerprint.
     pub fn load(path: &Path) -> Result<Self> {
-        let mut entries = Vec::new();
-        if path.exists() {
-            let text =
-                fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-            for (lineno, line) in text.lines().enumerate() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
+        let mut entries: Vec<(String, Fingerprint)> = Vec::new();
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+        };
+        for (lineno, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let (Some(host), Some(fp)) = (parts.next(), parts.next()) else {
+                bail!("{}:{}: malformed entry", path.display(), lineno + 1);
+            };
+            let fp = Fingerprint::parse(fp)
+                .with_context(|| format!("{}:{}", path.display(), lineno + 1))?;
+            let host = host::canonical_key(host)
+                .with_context(|| format!("{}:{}", path.display(), lineno + 1))?;
+            if let Some((_, old)) = entries.iter().find(|(name, _)| *name == host) {
+                if *old != fp {
+                    bail!(
+                        "{}:{}: conflicting pins for {host}",
+                        path.display(),
+                        lineno + 1
+                    );
                 }
-                let mut parts = line.split_whitespace();
-                let (Some(host), Some(fp)) = (parts.next(), parts.next()) else {
-                    bail!("{}:{}: malformed entry", path.display(), lineno + 1);
-                };
-                let fp = Fingerprint::parse(fp)
-                    .with_context(|| format!("{}:{}", path.display(), lineno + 1))?;
-                entries.push((host.to_string(), fp));
+            } else {
+                entries.push((host, fp));
             }
         }
         Ok(Self {
@@ -478,9 +493,10 @@ impl KnownHosts {
 
     #[must_use]
     pub fn get(&self, host_key: &str) -> Option<Fingerprint> {
+        let host_key = host::canonical_key(host_key).ok()?;
         self.entries
             .iter()
-            .find(|(h, _)| h == host_key)
+            .find(|(h, _)| *h == host_key)
             .map(|(_, fp)| *fp)
     }
 
@@ -507,13 +523,14 @@ impl KnownHosts {
     }
 
     fn update(&mut self, host_key: &str, fp: Fingerprint, trust: Trust) -> Result<()> {
+        let host_key = host::canonical_key(host_key)?;
         // Everything from here to the rename happens under the lock, so a
         // concurrent client cannot read the old file, decide, and write back a
         // snapshot that drops what we just added.
         let _lock = FileLock::acquire(&self.path)?;
-        self.refresh();
+        self.refresh()?;
         if trust == Trust::OnlyIfAbsentOrEqual {
-            if let Some(existing) = self.get(host_key) {
+            if let Some(existing) = self.get(&host_key) {
                 if existing != fp {
                     bail!(
                         "{host_key} was pinned to {existing} while we were connecting, \
@@ -523,16 +540,15 @@ impl KnownHosts {
                 return Ok(());
             }
         }
-        self.entries.retain(|(h, _)| h != host_key);
-        self.entries.push((host_key.to_string(), fp));
+        self.entries.retain(|(h, _)| *h != host_key);
+        self.entries.push((host_key, fp));
         self.save()
     }
 
-    /// Re-read the file, keeping the in-memory copy if it cannot be read.
-    fn refresh(&mut self) {
-        if let Ok(fresh) = Self::load(&self.path) {
-            self.entries = fresh.entries;
-        }
+    /// Refuse to overwrite a file that became unreadable or has conflicting pins.
+    fn refresh(&mut self) -> Result<()> {
+        self.entries = Self::load(&self.path)?.entries;
+        Ok(())
     }
 
     /// Remove every entry for `host_key`. Returns how many were removed.
@@ -540,10 +556,11 @@ impl KnownHosts {
     /// # Errors
     /// Fails if the file cannot be written.
     pub fn remove(&mut self, host_key: &str) -> Result<usize> {
+        let host_key = host::canonical_key(host_key)?;
         let _lock = FileLock::acquire(&self.path)?;
-        self.refresh();
+        self.refresh()?;
         let before = self.entries.len();
-        self.entries.retain(|(h, _)| h != host_key);
+        self.entries.retain(|(h, _)| *h != host_key);
         let removed = before - self.entries.len();
         if removed > 0 {
             self.save()?;
@@ -752,6 +769,55 @@ mod tests {
         let path = dir.path().join("known_hosts");
         fs::write(&path, "host sha256:not-hex\n").unwrap();
         assert!(KnownHosts::load(&path).is_err());
+    }
+
+    #[test]
+    fn legacy_pins_are_canonicalized_at_every_entry_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let a = fp("a");
+        fs::write(
+            &path,
+            format!("EXAMPLE.com:02222 {a}\n2001:0DB8::1:2222 {a}\n"),
+        )
+        .unwrap();
+        let mut kh = KnownHosts::load(&path).unwrap();
+        assert_eq!(kh.get("example.COM:2222"), Some(a));
+        assert_eq!(kh.get("[2001:db8:0:0::1]:2222"), Some(a));
+        kh.set_if_new("Example.Com:2222", a).unwrap();
+        assert!(kh.set_if_new("example.com:2222", fp("b")).is_err());
+        assert_eq!(kh.remove("EXAMPLE.COM:2222").unwrap(), 1);
+        assert_eq!(kh.remove("[2001:DB8::1]:2222").unwrap(), 1);
+        assert!(KnownHosts::load(&path).unwrap().entries().is_empty());
+    }
+
+    #[test]
+    fn conflicting_aliases_and_refresh_errors_never_overwrite_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let (a, b) = (fp("a"), fp("b"));
+        let mut stale = KnownHosts::load(&path).unwrap();
+        stale.set("example.com:2222", a).unwrap();
+
+        for replacement in [
+            format!("example.com:2222 {a}\nEXAMPLE.COM:2222 {b}\n"),
+            format!("[2001:db8::1]:2222 {a}\n2001:0DB8::1:2222 {b}\n"),
+            "malformed entry\n".to_owned(),
+        ] {
+            fs::write(&path, &replacement).unwrap();
+            assert!(KnownHosts::load(&path).is_err());
+            assert!(stale.set_if_new("example.com:2222", a).is_err());
+            assert!(stale.set("example.com:2222", b).is_err());
+            assert!(stale.remove("example.com:2222").is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), replacement);
+        }
+
+        fs::write(
+            &path,
+            format!("example.com:2222 {a}\nEXAMPLE.COM:2222 {a}\n"),
+        )
+        .unwrap();
+        assert_eq!(KnownHosts::load(&path).unwrap().entries().len(), 1);
     }
 
     #[test]

@@ -986,15 +986,7 @@ fn a_changed_host_key_is_refused() {
 
     // Pin a different key for the same host, as a MITM would present.
     let known_hosts = f.client_dir.join("known_hosts");
-    let text = std::fs::read_to_string(&known_hosts).unwrap();
-    let tampered = text.replace("sha256:0", "sha256:1").replace(
-        &text
-            .lines()
-            .find(|l| l.contains("sha256:"))
-            .unwrap()
-            .to_string(),
-        &format!("127.0.0.1:{} sha256:{}", f.port, "ab".repeat(32)),
-    );
+    let tampered = format!("127.0.0.1:{} sha256:{}\n", f.port, "ab".repeat(32));
     std::fs::write(&known_hosts, tampered).unwrap();
 
     let out = Command::new(CLIENT_BIN)
