@@ -154,6 +154,12 @@ changes the analysis.
 - Revocation latency is about two seconds, not immediate. A management
   command holding the authorization lock delays the reload until it
   finishes.
+- Lock files that pre-release builds created with the default mode are
+  tightened to 0600 on next use, but a descriptor opened before that keeps
+  working. No release ever shipped the default mode.
+- `authorize --force` and `revoke` cannot repair duplicate entries whose file
+  names are not valid UTF-8 or not valid entry names. The key stays denied
+  until a trusted state-directory writer removes the files by hand.
 
 ## Rules for reviews
 
