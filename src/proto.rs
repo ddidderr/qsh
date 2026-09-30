@@ -13,6 +13,8 @@ use std::{borrow::Cow, io};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+mod bounded;
+
 /// ALPN protocol identifier negotiated during the QUIC/TLS handshake.
 pub const ALPN: &[u8] = b"qsh/1";
 
@@ -21,6 +23,21 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Largest accepted frame payload. Data frames are chunked well below this.
 pub const MAX_FRAME: usize = 1024 * 1024;
+
+/// Request payload budget, including postcard's length prefixes.
+pub const MAX_REQUEST: usize = 64 * 1024;
+
+/// Enough for ordinary commands and multi-source rsync, with bounded metadata.
+pub const MAX_ARGS: usize = 1024;
+
+/// Environment entries accepted in a request.
+pub const MAX_ENV: usize = 64;
+
+/// Maximum bytes in an argument or environment value.
+pub const MAX_VALUE_BYTES: usize = 16 * 1024;
+
+/// Maximum bytes in a username, terminal type, or environment variable name.
+pub const MAX_NAME_BYTES: usize = 256;
 
 /// Chunk size used when forwarding byte streams.
 pub const CHUNK: usize = 64 * 1024;
@@ -63,6 +80,7 @@ impl Default for PtySize {
 /// Request for a pseudo terminal on the remote side.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PtyRequest {
+    #[serde(deserialize_with = "bounded::name")]
     pub term: String,
     pub size: PtySize,
 }
@@ -74,10 +92,37 @@ pub struct Request {
     pub version: u32,
     /// Account the client believes it is logging in as (`qsh -l alice host`).
     /// Purely a cross-check: the authoritative mapping lives on the server.
+    #[serde(deserialize_with = "bounded::optional_name")]
     pub user: Option<String>,
+    #[serde(deserialize_with = "bounded::command")]
     pub command: Option<Vec<String>>,
     pub pty: Option<PtyRequest>,
+    #[serde(deserialize_with = "bounded::environment")]
     pub env: Vec<(String, String)>,
+}
+
+impl Request {
+    /// Apply the same field limits to locally constructed outgoing requests.
+    fn validate(&self) -> io::Result<()> {
+        if let Some(user) = &self.user {
+            check_size(user.len(), MAX_NAME_BYTES, "username")?;
+        }
+        if let Some(command) = &self.command {
+            check_size(command.len(), MAX_ARGS, "argument count")?;
+            for argument in command {
+                check_size(argument.len(), MAX_VALUE_BYTES, "argument")?;
+            }
+        }
+        if let Some(pty) = &self.pty {
+            check_size(pty.term.len(), MAX_NAME_BYTES, "terminal type")?;
+        }
+        check_size(self.env.len(), MAX_ENV, "environment count")?;
+        for (name, value) in &self.env {
+            check_size(name.len(), MAX_NAME_BYTES, "environment name")?;
+            check_size(value.len(), MAX_VALUE_BYTES, "environment value")?;
+        }
+        Ok(())
+    }
 }
 
 /// How the remote process terminated.
@@ -120,6 +165,48 @@ fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
+fn check_size(length: usize, limit: usize, what: &str) -> io::Result<()> {
+    if length > limit {
+        return Err(invalid(format!("{what} of {length} exceeds limit {limit}")));
+    }
+    Ok(())
+}
+
+/// Control frames have much smaller budgets than byte streams. Check these
+/// against the header before allocating or waiting for the advertised body.
+fn payload_limit(kind: u8) -> io::Result<usize> {
+    match kind {
+        kind::REQUEST => Ok(MAX_REQUEST),
+        kind::STDIN | kind::STDOUT | kind::STDERR => Ok(MAX_FRAME),
+        kind::STARTED | kind::STDIN_EOF => Ok(0),
+        kind::RESIZE => Ok(6), // Two postcard u16 varints, at most three bytes each.
+        kind::EXIT => Ok(11),  // Two i32 varints and an Option discriminant.
+        kind::SIGNAL => Ok(16),
+        kind::ERROR => Ok(4096),
+        other => Err(invalid(format!("unknown frame kind {other}"))),
+    }
+}
+
+fn encode_control<T: Serialize>(value: &T, limit: usize) -> io::Result<Vec<u8>> {
+    // A bounded output buffer also prevents oversized local requests from
+    // causing an unbounded temporary allocation before write_frame rejects it.
+    let mut buffer = vec![0; limit];
+    let length = postcard::to_slice(value, &mut buffer)
+        .map_err(|error| invalid(error.to_string()))?
+        .len();
+    buffer.truncate(length);
+    Ok(buffer)
+}
+
+fn decode_control<T: serde::de::DeserializeOwned>(payload: &[u8]) -> io::Result<T> {
+    let (value, trailing) =
+        postcard::take_from_bytes(payload).map_err(|error| invalid(error.to_string()))?;
+    if !trailing.is_empty() {
+        return Err(invalid("trailing bytes after control payload"));
+    }
+    Ok(value)
+}
+
 impl Frame {
     fn kind(&self) -> u8 {
         match self {
@@ -137,47 +224,38 @@ impl Frame {
     }
 
     fn payload(&self) -> io::Result<Cow<'_, [u8]>> {
+        let limit = payload_limit(self.kind())?;
         let out = match self {
             Frame::Request(r) => {
-                Cow::Owned(postcard::to_stdvec(r).map_err(|e| invalid(e.to_string()))?)
+                r.validate()?;
+                Cow::Owned(encode_control(r, limit)?)
             }
-            Frame::Resize(s) => {
-                Cow::Owned(postcard::to_stdvec(s).map_err(|e| invalid(e.to_string()))?)
-            }
-            Frame::Exit(s) => {
-                Cow::Owned(postcard::to_stdvec(s).map_err(|e| invalid(e.to_string()))?)
-            }
+            Frame::Resize(s) => Cow::Owned(encode_control(s, limit)?),
+            Frame::Exit(s) => Cow::Owned(encode_control(s, limit)?),
             Frame::Signal(s) | Frame::Error(s) => Cow::Borrowed(s.as_bytes()),
             Frame::Stdin(b) | Frame::Stdout(b) | Frame::Stderr(b) => Cow::Borrowed(b.as_slice()),
             Frame::Started | Frame::StdinEof => Cow::Borrowed(&[][..]),
         };
-        if out.len() > MAX_FRAME {
-            return Err(invalid("frame payload too large"));
-        }
+        check_size(out.len(), limit, "frame payload")?;
         Ok(out)
     }
 
     fn decode(kind: u8, payload: Vec<u8>) -> io::Result<Frame> {
-        let de = |b: &[u8]| -> io::Result<String> {
-            String::from_utf8(b.to_vec()).map_err(|_| invalid("payload is not valid UTF-8"))
+        check_size(payload.len(), payload_limit(kind)?, "frame payload")?;
+        let de = |bytes: Vec<u8>| -> io::Result<String> {
+            String::from_utf8(bytes).map_err(|_| invalid("payload is not valid UTF-8"))
         };
         Ok(match kind {
-            kind::REQUEST => {
-                Frame::Request(postcard::from_bytes(&payload).map_err(|e| invalid(e.to_string()))?)
-            }
+            kind::REQUEST => Frame::Request(decode_control(&payload)?),
             kind::STARTED => Frame::Started,
             kind::STDIN => Frame::Stdin(payload),
             kind::STDOUT => Frame::Stdout(payload),
             kind::STDERR => Frame::Stderr(payload),
             kind::STDIN_EOF => Frame::StdinEof,
-            kind::RESIZE => {
-                Frame::Resize(postcard::from_bytes(&payload).map_err(|e| invalid(e.to_string()))?)
-            }
-            kind::SIGNAL => Frame::Signal(de(&payload)?),
-            kind::EXIT => {
-                Frame::Exit(postcard::from_bytes(&payload).map_err(|e| invalid(e.to_string()))?)
-            }
-            kind::ERROR => Frame::Error(de(&payload)?),
+            kind::RESIZE => Frame::Resize(decode_control(&payload)?),
+            kind::SIGNAL => Frame::Signal(de(payload)?),
+            kind::EXIT => Frame::Exit(decode_control(&payload)?),
+            kind::ERROR => Frame::Error(de(payload)?),
             other => return Err(invalid(format!("unknown frame kind {other}"))),
         })
     }
@@ -207,21 +285,46 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> io:
 /// Fails on a malformed header, an over-long or undecodable payload, or an
 /// I/O error on the stream.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Frame>> {
-    let mut header = [0u8; 5];
-    match r.read_exact(&mut header).await {
-        Ok(_) => {}
+    let Some((kind, len)) = read_header(r).await? else {
+        return Ok(None);
+    };
+    Frame::decode(kind, read_payload(r, len).await?).map(Some)
+}
+
+/// Read the first frame of a session, which must be a [`Request`].
+///
+/// A wrong kind or oversized request is rejected using only the header. This
+/// prevents a peer from reserving a data-frame buffer before authorization.
+/// Returns `Ok(None)` only when no bytes remain before a new frame.
+///
+/// # Errors
+/// Fails on a non-Request frame, a malformed or oversized request, or an I/O
+/// error. A partial header or payload is an error, not a clean end of stream.
+pub async fn read_request<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Request>> {
+    let Some((kind, len)) = read_header(r).await? else {
+        return Ok(None);
+    };
+    if kind != kind::REQUEST {
+        return Err(invalid("first frame must be a Request"));
+    }
+    decode_control(&read_payload(r, len).await?).map(Some)
+}
+
+async fn read_header<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<(u8, usize)>> {
+    let kind = match r.read_u8().await {
+        Ok(kind) => kind,
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
-    }
-    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
-    if len > MAX_FRAME {
-        return Err(invalid(format!("frame of {len} bytes exceeds limit")));
-    }
+    };
+    let len = r.read_u32().await? as usize;
+    check_size(len, payload_limit(kind)?, "frame payload")?;
+    Ok(Some((kind, len)))
+}
+
+async fn read_payload<R: AsyncRead + Unpin>(r: &mut R, len: usize) -> io::Result<Vec<u8>> {
     let mut payload = vec![0u8; len];
-    if len > 0 {
-        r.read_exact(&mut payload).await?;
-    }
-    Frame::decode(header[0], payload).map(Some)
+    r.read_exact(&mut payload).await?;
+    Ok(payload)
 }
 
 /// Map a signal name (with or without `SIG` prefix) to its number.
@@ -259,116 +362,4 @@ pub fn signal_number(name: &str) -> Option<i32> {
     clippy::cast_possible_truncation,
     reason = "a failing assertion should panic loudly; that is the point of a test"
 )]
-mod tests {
-    use super::*;
-
-    async fn roundtrip(frame: Frame) -> Frame {
-        let mut buf = Vec::new();
-        write_frame(&mut buf, &frame).await.unwrap();
-        let mut cursor = std::io::Cursor::new(buf);
-        read_frame(&mut cursor).await.unwrap().unwrap()
-    }
-
-    #[tokio::test]
-    async fn binary_data_survives_untouched() {
-        // Everything a naive line-oriented transport would mangle.
-        let payload: Vec<u8> = (0u8..=255).chain([b'\r', b'\n', 0]).collect();
-        match roundtrip(Frame::Stdout(payload.clone())).await {
-            Frame::Stdout(got) => assert_eq!(got, payload),
-            other => panic!("wrong frame: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn raw_payloads_keep_the_wire_format_and_size_limit() {
-        for (tag, frame, payload) in [
-            (kind::STDIN, Frame::Stdin(vec![0, 255]), vec![0, 255]),
-            (kind::STDOUT, Frame::Stdout(vec![0, 255]), vec![0, 255]),
-            (kind::STDERR, Frame::Stderr(vec![0, 255]), vec![0, 255]),
-            (kind::SIGNAL, Frame::Signal("INT".into()), b"INT".to_vec()),
-            (kind::ERROR, Frame::Error("oops".into()), b"oops".to_vec()),
-            (kind::STARTED, Frame::Started, Vec::new()),
-            (kind::STDIN_EOF, Frame::StdinEof, Vec::new()),
-        ] {
-            let mut encoded = Vec::new();
-            write_frame(&mut encoded, &frame).await.unwrap();
-            let mut expected = vec![tag];
-            expected.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-            expected.extend_from_slice(&payload);
-            assert_eq!(encoded, expected);
-        }
-        let mut encoded = Vec::new();
-        write_frame(&mut encoded, &Frame::Stdout(vec![0; MAX_FRAME]))
-            .await
-            .unwrap();
-        assert_eq!(encoded.len(), MAX_FRAME + 5);
-        for frame in [
-            Frame::Stdin(vec![0; MAX_FRAME + 1]),
-            Frame::Stdout(vec![0; MAX_FRAME + 1]),
-            Frame::Stderr(vec![0; MAX_FRAME + 1]),
-            Frame::Error("x".repeat(MAX_FRAME + 1)),
-        ] {
-            let mut encoded = Vec::new();
-            assert!(write_frame(&mut encoded, &frame).await.is_err());
-            assert!(encoded.is_empty());
-        }
-    }
-
-    #[tokio::test]
-    async fn request_roundtrips() {
-        let req = Request {
-            version: PROTOCOL_VERSION,
-            user: Some("alice".into()),
-            command: Some(vec![
-                "rsync".into(),
-                "--server".into(),
-                "-vlogDtpre.iLsfxC".into(),
-            ]),
-            pty: None,
-            env: vec![("LANG".into(), "C.UTF-8".into())],
-        };
-        match roundtrip(Frame::Request(req)).await {
-            Frame::Request(got) => {
-                assert_eq!(got.user.as_deref(), Some("alice"));
-                assert_eq!(got.command.unwrap()[2], "-vlogDtpre.iLsfxC");
-                assert!(got.pty.is_none());
-            }
-            other => panic!("wrong frame: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn exit_status_roundtrips() {
-        match roundtrip(Frame::Exit(ExitStatus {
-            code: 0,
-            signal: Some(libc::SIGINT),
-        }))
-        .await
-        {
-            Frame::Exit(s) => assert_eq!(s.wait_status(), 130),
-            other => panic!("wrong frame: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn clean_eof_is_none() {
-        let mut empty = std::io::Cursor::new(Vec::new());
-        assert!(read_frame(&mut empty).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn oversized_frame_is_rejected() {
-        let mut buf = Vec::new();
-        buf.push(kind::STDOUT);
-        buf.extend_from_slice(&(MAX_FRAME as u32 + 1).to_be_bytes());
-        let mut cursor = std::io::Cursor::new(buf);
-        assert!(read_frame(&mut cursor).await.is_err());
-    }
-
-    #[test]
-    fn signal_names_parse_with_and_without_prefix() {
-        assert_eq!(signal_number("INT"), Some(libc::SIGINT));
-        assert_eq!(signal_number("SIGTERM"), Some(libc::SIGTERM));
-        assert_eq!(signal_number("nope"), None);
-    }
-}
+mod tests;

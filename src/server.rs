@@ -1,6 +1,9 @@
 //! The qsh server: accept QUIC connections, authenticate them against the
 //! authorisation store and run one process per session stream.
 
+mod admission;
+pub(crate) mod diagnostics;
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -15,6 +18,10 @@ use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
+
+use admission::{SessionBudget, SessionLease};
+use diagnostics::Diagnostics;
 
 use crate::cgroup::SessionCgroup;
 use crate::child::{self, ChildIo, Spawned};
@@ -22,8 +29,8 @@ use crate::config::{AuthEntry, AuthStore, ServerConfig, ServerPaths};
 use crate::crypto::{self, AuthorizedClientVerifier, Fingerprint};
 use crate::net::transport_config;
 use crate::proto::{
-    read_frame, signal_number, write_frame, ExitStatus, Frame, PtySize, Request, CHUNK,
-    PROTOCOL_VERSION, RESET_ABANDONED,
+    read_frame, read_request, signal_number, write_frame, ExitStatus, Frame, PtySize, Request,
+    CHUNK, PROTOCOL_VERSION, RESET_ABANDONED,
 };
 use crate::pty;
 
@@ -85,6 +92,10 @@ const HANDSHAKE_GRACE: Duration = Duration::from_secs(5);
 /// How long an opened session stream may take to say what it wants.
 const FIRST_FRAME_GRACE: Duration = Duration::from_secs(10);
 
+/// Eight 64 KiB chunks buffer a short burst without letting slow readers hold
+/// four MiB per session. Backpressure continues through the child's pipes.
+const OUTPUT_QUEUE_FRAMES: usize = 8;
+
 /// Run the server until the process is stopped.
 ///
 /// # Errors
@@ -117,36 +128,13 @@ pub async fn serve(
         );
     }
 
-    let verifier = {
-        let store = Arc::clone(&store);
-        AuthorizedClientVerifier::new(Arc::new(move |fp: &Fingerprint| {
-            crate::sync::read(&store).lookup(fp).is_some()
-        }))
-    };
-
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .context("configuring TLS 1.3")?
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(vec![identity.cert.clone()], identity.key.clone_key())
-        .context("installing the server certificate")?;
-    tls.alpn_protocols = vec![crate::proto::ALPN.to_vec()];
-
-    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
-        QuicServerConfig::try_from(tls).context("building the QUIC crypto configuration")?,
-    ));
-    server_config.transport_config(Arc::new(transport_config(
-        Duration::from_secs(cfg.idle_timeout_secs),
-        Duration::from_secs(cfg.keepalive_secs),
-    )?));
-
     let addr = match listen_override {
         Some(a) => a,
         None => cfg.listen_addr()?,
     };
-    let endpoint = quinn::Endpoint::server(server_config, addr)
-        .with_context(|| format!("binding UDP {addr}"))?;
+    let endpoint =
+        quinn::Endpoint::server(server_config(&identity, cfg, Arc::clone(&store))?, addr)
+            .with_context(|| format!("binding UDP {addr}"))?;
 
     eprintln!(
         "qsh-server: listening on {} ({} authorized client(s))",
@@ -154,12 +142,14 @@ pub async fn serve(
         crate::sync::read(&store).entries().count()
     );
 
+    let diagnostics = Diagnostics::stderr().context("starting the diagnostic writer")?;
     let counters = Arc::new(AdmissionCounters::default());
     let refresher = spawn_store_refresher(
         Arc::clone(&store),
         paths.authorized(),
         warnings,
         Arc::clone(&counters),
+        diagnostics.clone(),
     );
 
     // Everything below runs before any client has authenticated, so all of it
@@ -168,6 +158,7 @@ pub async fn serve(
     let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_HANDSHAKES));
     let per_source = Arc::new(PerSourceHandshakes::default());
     let per_key = Arc::new(PerKeyConnections::default());
+    let sessions = SessionBudget::new();
 
     while let Some(incoming) = endpoint.accept().await {
         // Make the peer prove it can receive at its claimed address before we
@@ -196,23 +187,63 @@ pub async fn serve(
         let store = Arc::clone(&store);
         let counters = Arc::clone(&counters);
         let per_key = Arc::clone(&per_key);
+        let sessions = Arc::clone(&sessions);
+        let diagnostics = diagnostics.clone();
         tokio::spawn(async move {
-            // The permit lives as long as the connection does.
+            // Connection and key permits cover teardown of all its sessions.
             let _permit = permit;
-            let outcome =
-                handle_connection(incoming, store, per_key, (handshake_permit, source_slot)).await;
-            record_connection_outcome(&counters, outcome);
+            let outcome = handle_connection(
+                incoming,
+                store,
+                per_key,
+                sessions,
+                &diagnostics,
+                (handshake_permit, source_slot),
+            )
+            .await;
+            record_connection_outcome(&counters, &diagnostics, outcome);
         });
     }
     refresher.abort();
     Ok(())
 }
 
-fn record_connection_outcome(counters: &AdmissionCounters, outcome: Result<Authenticated>) {
+fn server_config(
+    identity: &crypto::Identity,
+    cfg: &ServerConfig,
+    store: Arc<RwLock<AuthStore>>,
+) -> Result<quinn::ServerConfig> {
+    let verifier = AuthorizedClientVerifier::new(Arc::new(move |fp: &Fingerprint| {
+        crate::sync::read(&store).lookup(fp).is_some()
+    }));
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .context("configuring TLS 1.3")?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(vec![identity.cert.clone()], identity.key.clone_key())
+        .context("installing the server certificate")?;
+    tls.alpn_protocols = vec![crate::proto::ALPN.to_vec()];
+
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(
+        QuicServerConfig::try_from(tls).context("building the QUIC crypto configuration")?,
+    ));
+    config.transport_config(Arc::new(transport_config(
+        Duration::from_secs(cfg.idle_timeout_secs),
+        Duration::from_secs(cfg.keepalive_secs),
+    )?));
+    Ok(config)
+}
+
+fn record_connection_outcome(
+    counters: &AdmissionCounters,
+    diagnostics: &Diagnostics,
+    outcome: Result<Authenticated>,
+) {
     match outcome {
         // Only reachable once a client has authenticated; anyone can provoke
         // pre-authentication failures, so count those instead of logging each.
-        Err(e) => eprintln!("qsh-server: {}", bounded_diagnostic(&e)),
+        Err(e) => diagnostics.emit(|| format!("qsh-server: {}", bounded_diagnostic(&e))),
         Ok(Authenticated::No) => {
             counters
                 .unauthenticated
@@ -316,16 +347,19 @@ struct AdmissionCounters {
 
 impl AdmissionCounters {
     /// Batch reports independently of incoming traffic, including after a flood stops.
-    fn report(&self) {
+    fn report(&self, diagnostics: &Diagnostics) {
         use std::sync::atomic::Ordering;
 
         let rejected = self.rejected.swap(0, Ordering::Relaxed);
         if rejected > 0 {
-            eprintln!("qsh-server: refused {rejected} connection(s) over the concurrency limit");
+            diagnostics.emit(|| {
+                format!("qsh-server: refused {rejected} connection(s) over the concurrency limit")
+            });
         }
         let failed = self.unauthenticated.swap(0, Ordering::Relaxed);
         if failed > 0 {
-            eprintln!("qsh-server: {failed} connection(s) failed to authenticate");
+            diagnostics
+                .emit(|| format!("qsh-server: {failed} connection(s) failed to authenticate"));
         }
     }
 }
@@ -378,9 +412,10 @@ fn spawn_store_refresher(
     dir: std::path::PathBuf,
     warnings: Vec<String>,
     counters: Arc<AdmissionCounters>,
+    diagnostics: Diagnostics,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut diagnostics = ReloadDiagnostics {
+        let mut reload_diagnostics = ReloadDiagnostics {
             warnings,
             failure: None,
         };
@@ -388,9 +423,10 @@ fn spawn_store_refresher(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            counters.report();
-            for message in diagnostics.reload(&store, &dir) {
-                eprintln!("{message}");
+            counters.report(&diagnostics);
+            diagnostics.report_suppressed();
+            for message in reload_diagnostics.reload(&store, &dir) {
+                diagnostics.emit_administrative(&message);
             }
         }
     })
@@ -430,6 +466,8 @@ async fn handle_connection(
     incoming: quinn::Incoming,
     store: Arc<RwLock<AuthStore>>,
     per_key: Arc<PerKeyConnections>,
+    session_budget: Arc<SessionBudget>,
+    diagnostics: &Diagnostics,
     handshake_permit: (tokio::sync::OwnedSemaphorePermit, SourceSlot),
 ) -> Result<Authenticated> {
     // An unauthenticated peer must not be able to sit on an admission slot.
@@ -459,15 +497,36 @@ async fn handle_connection(
         conn.close(1u32.into(), b"key connection limit reached");
         return Ok(Authenticated::OverLimit);
     };
-    eprintln!(
-        "qsh-server: {peer} authenticated as `{}` (key `{}`)",
-        entry.meta.user, entry.name
-    );
+    diagnostics.emit(|| {
+        format!(
+            "qsh-server: {peer} authenticated as `{}` (key `{}`)",
+            entry.meta.user, entry.name
+        )
+    });
 
+    serve_connection_sessions(&conn, store, fingerprint, &session_budget, diagnostics).await?;
+    Ok(Authenticated::Yes)
+}
+
+/// Keep every session attached to its connection until cleanup finishes. A
+/// closed connection stops admission, but does not release its quota early.
+async fn serve_connection_sessions(
+    conn: &quinn::Connection,
+    store: Arc<RwLock<AuthStore>>,
+    fingerprint: Fingerprint,
+    budget: &Arc<SessionBudget>,
+    diagnostics: &Diagnostics,
+) -> Result<()> {
+    let peer = conn.remote_address();
+    let mut sessions = JoinSet::new();
     let mut policy_tick = tokio::time::interval(RELOAD_INTERVAL);
     policy_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
+    let outcome = loop {
         let stream = match tokio::select! {
+            finished = sessions.join_next(), if !sessions.is_empty() => {
+                report_session_join(finished, diagnostics);
+                continue;
+            }
             _ = policy_tick.tick() => {
                 let current = crate::sync::read(&store);
                 if current
@@ -475,7 +534,7 @@ async fn handle_connection(
                     .is_none_or(|entry| entry.meta.is_expired(unix_now()))
                 {
                     conn.close(1u32.into(), b"authorization withdrawn or expired");
-                    return Ok(Authenticated::Yes);
+                    break Ok(());
                 }
                 continue;
             }
@@ -486,8 +545,8 @@ async fn handle_connection(
                 quinn::ConnectionError::ApplicationClosed(_)
                 | quinn::ConnectionError::ConnectionClosed(_)
                 | quinn::ConnectionError::LocallyClosed,
-            ) => return Ok(Authenticated::Yes),
-            Err(e) => return Err(e).context("accepting a session stream"),
+            ) => break Ok(()),
+            Err(e) => break Err(e).context("accepting a session stream"),
         };
         // Refuse a withdrawn key promptly; handle_session checks again after
         // its request arrives so a pending first frame cannot keep old rights.
@@ -497,23 +556,61 @@ async fn handle_connection(
             .is_some_and(|entry| !entry.meta.is_expired(unix_now()));
         drop(current);
         if !allowed {
-            eprintln!("qsh-server: {peer} is no longer authorized; dropping the connection");
+            diagnostics.emit(|| {
+                format!("qsh-server: {peer} is no longer authorized; dropping the connection")
+            });
             conn.close(1u32.into(), b"authorization withdrawn");
-            return Ok(Authenticated::Yes);
+            break Ok(());
         }
+        // Admission precedes both body allocation and blocking preparation.
+        // A refused stream is reset immediately; it never joins a wait queue.
+        let Some(lease) = budget.try_acquire(fingerprint) else {
+            let (mut send, mut recv) = stream;
+            let _ = send.reset(RESET_ABANDONED.into());
+            let _ = recv.stop(RESET_ABANDONED.into());
+            diagnostics
+                .emit(|| format!("qsh-server: session from {peer} refused: session limit reached"));
+            continue;
+        };
         let session_store = Arc::clone(&store);
         let session_conn = conn.clone();
-        tokio::spawn(async move {
+        let diagnostics = diagnostics.clone();
+        sessions.spawn(async move {
             let (send, recv) = stream;
-            if let Err(e) =
-                handle_session(send, recv, session_conn, session_store, fingerprint).await
+            if let Err(e) = handle_session(
+                send,
+                recv,
+                session_conn,
+                session_store,
+                fingerprint,
+                lease,
+                &diagnostics,
+            )
+            .await
             {
-                eprintln!(
-                    "qsh-server: session from {peer} ended: {}",
-                    bounded_diagnostic(&e)
-                );
+                diagnostics.emit(|| {
+                    format!(
+                        "qsh-server: session from {peer} ended: {}",
+                        bounded_diagnostic(&e)
+                    )
+                });
             }
         });
+    };
+    // Session owners observe conn.closed() and perform their normal async
+    // cleanup. Aborting them here would release accounting before reaping.
+    while let Some(finished) = sessions.join_next().await {
+        report_session_join(Some(finished), diagnostics);
+    }
+    outcome
+}
+
+fn report_session_join(
+    finished: Option<std::result::Result<(), tokio::task::JoinError>>,
+    diagnostics: &Diagnostics,
+) {
+    if let Some(Err(error)) = finished {
+        diagnostics.emit(|| format!("qsh-server: session task failed: {error}"));
     }
 }
 
@@ -574,22 +671,22 @@ fn authorize_request(entry: &AuthEntry, req: &Request, now_unix: i64) -> Result<
 }
 
 async fn handle_session(
-    mut send: quinn::SendStream,
+    send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     conn: quinn::Connection,
     store: Arc<RwLock<AuthStore>>,
     fingerprint: Fingerprint,
+    lease: SessionLease,
+    diagnostics: &Diagnostics,
 ) -> Result<()> {
     // A stream that never says what it wants must not hold resources open.
     // Only the first frame is on a clock; `control_loop` has to stay
     // deadline-free or an idle interactive shell would be cut off.
-    let first = tokio::time::timeout(FIRST_FRAME_GRACE, read_frame(&mut recv))
+    let first = tokio::time::timeout(FIRST_FRAME_GRACE, read_request(&mut recv))
         .await
         .map_err(|_| anyhow!("client opened a session but sent no request"))?;
-    let req = match first? {
-        Some(Frame::Request(r)) => r,
-        Some(_) => bail!("expected a request frame first"),
-        None => return Ok(()),
+    let Some(req) = first? else {
+        return Ok(());
     };
 
     let start = async {
@@ -606,15 +703,24 @@ async fn handle_session(
         // Account/group lookups and cgroup setup can block. No authorization
         // lock or Tokio worker waits on them, and no child is spawned inside
         // this cancellation-prone blocking task.
-        let (user, identity, cgroup) = tokio::task::spawn_blocking(move || {
+        let blocking_lease = lease.retain();
+        let diagnostics = diagnostics.clone();
+        let preparation = tokio::task::spawn_blocking(move || {
+            let lease = blocking_lease;
             let user = child::resolve_user(&lookup_name)?;
             let identity = child::prepare_identity(&user)?;
-            let cgroup = restricted
+            let mut cgroup = restricted
                 .then(|| SessionCgroup::create(&user))
                 .transpose()?;
-            Ok::<_, anyhow::Error>((user, identity, cgroup))
-        })
-        .await
+            if let Some(cgroup) = &mut cgroup {
+                cgroup.set_diagnostics(diagnostics);
+            }
+            Ok::<_, anyhow::Error>((user, identity, cgroup, lease))
+        });
+        let (user, identity, cgroup, _prepared_lease) = tokio::select! {
+            _ = conn.closed() => return Err(anyhow!("connection closed during session preparation")),
+            prepared = preparation => prepared,
+        }
         .context("preparing the authorized local account and session cgroup")??;
 
         // Recheck after slow preparation. A changed user or cleanup policy
@@ -631,6 +737,10 @@ async fn handle_session(
             bail!("client authorization changed its session cleanup policy");
         }
         drop(current);
+
+        if conn.close_reason().is_some() {
+            bail!("connection closed before starting the remote process");
+        }
 
         // The periodic session check handles a policy change racing this
         // final check. Do not hold the shared store lock over fork/exec.
@@ -649,16 +759,18 @@ async fn handle_session(
         Err(e) => {
             // Report the refusal in-band so the client can print it, then end
             // the session with a shell-like "cannot execute" status.
-            let _ = write_frame(&mut send, &Frame::Error(bounded_diagnostic(&e))).await;
-            let _ = write_frame(
-                &mut send,
-                &Frame::Exit(ExitStatus {
-                    code: 126,
-                    signal: None,
-                }),
-            )
+            let mut stream = SessionStream::new(send);
+            let _ = tokio::time::timeout(SHUTDOWN_GRACE, async {
+                let _ = stream.write(&Frame::Error(bounded_diagnostic(&e))).await;
+                let _ = stream
+                    .write(&Frame::Exit(ExitStatus {
+                        code: 126,
+                        signal: None,
+                    }))
+                    .await;
+                stream.finish().await;
+            })
             .await;
-            let _ = send.finish();
             return Err(e);
         }
     };
@@ -675,7 +787,18 @@ async fn handle_session(
         authorized_user,
         restricted,
     };
-    run_session(send, recv, conn, authorization, spawned, cgroup).await
+    let result = run_session(
+        send,
+        recv,
+        conn,
+        authorization,
+        spawned,
+        cgroup,
+        diagnostics,
+    )
+    .await;
+    drop(lease);
+    result
 }
 
 /// Diagnostics can contain client-supplied request fields. Keep each message
@@ -887,17 +1010,18 @@ async fn run_session(
     authorization: LiveAuthorization,
     spawned: Spawned,
     cgroup: Option<SessionCgroup>,
+    diagnostics: &Diagnostics,
 ) -> Result<()> {
     let Spawned { mut child, io } = spawned;
     let pid = child.id();
     // Armed before anything that can fail, so no error path can leak the job.
     let mut guard = ProcessGroupGuard::with_cgroup(pid, cgroup);
 
-    let (tx, mut rx) = mpsc::channel::<Frame>(64);
+    let (tx, mut rx) = mpsc::channel::<Frame>(OUTPUT_QUEUE_FRAMES);
 
     // Single writer for the stream: stdout, stderr and the exit status all
     // funnel through here, so frames never interleave.
-    let mut writer = AbortOnDrop(tokio::spawn(async move {
+    let mut writer = AbortOnDrop::new(tokio::spawn(async move {
         let mut stream = SessionStream::new(send);
         while let Some(frame) = rx.recv().await {
             if stream.write(&frame).await.is_err() {
@@ -908,6 +1032,7 @@ async fn run_session(
     }));
 
     if tx.send(Frame::Started).await.is_err() {
+        writer.stop().await;
         let stopped = guard.terminate().await;
         let _ = child.wait().await;
         stopped?;
@@ -924,7 +1049,7 @@ async fn run_session(
             pty_fd = match master.try_clone_fd() {
                 Ok(fd) => Some(fd),
                 Err(e) => {
-                    writer.abort();
+                    writer.stop().await;
                     let stopped = guard.terminate().await;
                     let _ = child.wait().await;
                     stopped?;
@@ -952,7 +1077,7 @@ async fn run_session(
     // changes are watched independently, even if control blocks on child stdin.
     let is_pty = pty_fd.is_some();
     let (events_tx, mut events_rx) = mpsc::channel::<ControlEvent>(32);
-    let mut control = AbortOnDrop(tokio::spawn(control_loop(
+    let mut control = AbortOnDrop::new(tokio::spawn(control_loop(
         recv, stdin_sink, is_pty, events_tx,
     )));
     let mut policy_tick = tokio::time::interval(RELOAD_INTERVAL);
@@ -964,7 +1089,7 @@ async fn run_session(
         tokio::select! {
             exited = wait_for_leader_exit(pid) => {
                 if let Err(error) = exited {
-                    eprintln!("qsh-server: could not observe child exit: {error:#}");
+                    diagnostics.emit(|| format!("qsh-server: could not observe child exit: {error:#}"));
                     break None;
                 }
                 break Some(());
@@ -986,10 +1111,8 @@ async fn run_session(
         }
     };
     if leader_exited.is_none() {
-        control.abort();
-        let _ = control.await;
-        writer.abort();
-        let _ = writer.await;
+        control.stop().await;
+        writer.stop().await;
         return abandon(&mut guard, &mut child, outputs).await;
     }
 
@@ -997,8 +1120,12 @@ async fn run_session(
     // Waiting for pipe EOF first would hang forever if a detached descendant
     // keeps stdout open, and would never reach the cgroup cleanup below.
     if let Err(error) = guard.kill_restricted() {
+        control.stop().await;
+        writer.stop().await;
+        stop_outputs(outputs).await;
         let _ = guard.terminate().await;
         let _ = child.wait().await;
+        let _ = guard.clean_cgroup().await;
         return Err(error);
     }
 
@@ -1029,14 +1156,11 @@ async fn run_session(
         }
     };
     let Some(drained) = drained else {
-        control.abort();
-        let _ = control.await;
-        writer.abort();
-        let _ = writer.await;
+        control.stop().await;
+        writer.stop().await;
         return abandon(&mut guard, &mut child, outputs).await;
     };
-    control.abort();
-    let _ = control.await;
+    control.stop().await;
 
     let exit = match drained {
         Drained::Fully => {
@@ -1044,12 +1168,24 @@ async fn run_session(
             // sessions permit deliberately detached work; restricted sessions
             // have already killed their cgroup before output drain.
             if let Err(error) = guard.complete() {
+                writer.stop().await;
                 let _ = guard.terminate().await;
                 let _ = child.wait().await;
+                let _ = guard.clean_cgroup().await;
                 return Err(error);
             }
-            let status = child.wait().await.context("reaping the remote process")?;
-            guard.clean_cgroup().await?;
+            let status = match child.wait().await.context("reaping the remote process") {
+                Ok(status) => status,
+                Err(error) => {
+                    writer.stop().await;
+                    let _ = guard.clean_cgroup().await;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = guard.clean_cgroup().await {
+                writer.stop().await;
+                return Err(error);
+            }
             ExitStatus {
                 code: status.code().unwrap_or(0),
                 signal: status.signal(),
@@ -1077,8 +1213,11 @@ async fn run_session(
     if matches!(drained, Drained::Incomplete(_)) {
         let stopped = guard.terminate().await;
         let _ = child.wait().await;
-        stopped?;
-        guard.clean_cgroup().await?;
+        let cleaned = guard.clean_cgroup().await;
+        if let Err(error) = stopped.and(cleaned) {
+            writer.stop().await;
+            return Err(error);
+        }
     }
 
     let _ = tokio::time::timeout(SHUTDOWN_GRACE, tx.send(Frame::Exit(exit))).await;
@@ -1094,8 +1233,7 @@ async fn run_session(
         .await
         .is_err()
     {
-        writer.abort();
-        let _ = writer.await;
+        writer.stop().await;
     }
     Ok(())
 }
@@ -1108,9 +1246,7 @@ async fn abandon(
     child: &mut tokio::process::Child,
     outputs: Vec<Pump>,
 ) -> Result<()> {
-    for pump in &outputs {
-        pump.task.abort();
-    }
+    stop_outputs(outputs).await;
     // Reap only after the last signal; otherwise this PID can be recycled
     // while a descendant still holds output or the guard is escalating.
     let stopped = guard.terminate().await;
@@ -1118,6 +1254,15 @@ async fn abandon(
     stopped?;
     guard.clean_cgroup().await?;
     Ok(())
+}
+
+async fn stop_outputs(outputs: Vec<Pump>) {
+    for pump in &outputs {
+        pump.task.abort();
+    }
+    for pump in outputs {
+        pump.task.stop().await;
+    }
 }
 
 /// Did every byte of the child's output make it onto the wire?
@@ -1256,11 +1401,30 @@ struct Pump {
 /// Spawned session tasks must stop when their parent is canceled. A bare
 /// `JoinHandle` detaches on drop and could keep I/O alive after cleanup.
 #[derive(Debug)]
-struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+struct AbortOnDrop<T> {
+    task: tokio::task::JoinHandle<T>,
+    joined: bool,
+}
 
 impl<T> AbortOnDrop<T> {
+    fn new(task: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            task,
+            joined: false,
+        }
+    }
+
     fn abort(&self) {
-        self.0.abort();
+        self.task.abort();
+    }
+
+    /// A select branch may already have consumed the task's result. Awaiting
+    /// that completed `JoinHandle` again would panic instead of cleaning up.
+    async fn stop(self) {
+        self.abort();
+        if !self.joined {
+            let _ = self.await;
+        }
     }
 }
 
@@ -1268,13 +1432,17 @@ impl<T> Future for AbortOnDrop<T> {
     type Output = std::result::Result<T, tokio::task::JoinError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.0).poll(cx)
+        let result = Pin::new(&mut self.task).poll(cx);
+        if result.is_ready() {
+            self.joined = true;
+        }
+        result
     }
 }
 
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
-        self.0.abort();
+        self.task.abort();
     }
 }
 
@@ -1286,7 +1454,7 @@ fn spawn_pump<R: AsyncRead + Unpin + Send + 'static>(
 ) -> Pump {
     let (cancel, cancelled) = tokio::sync::oneshot::channel();
     Pump {
-        task: AbortOnDrop(tokio::spawn(pump(src, tx, wrap, cancelled))),
+        task: AbortOnDrop::new(tokio::spawn(pump(src, tx, wrap, cancelled))),
         cancel: Some(cancel),
     }
 }
@@ -1494,6 +1662,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stopping_a_joined_task_does_not_poll_its_result_twice() {
+        let mut task = AbortOnDrop::new(tokio::spawn(async {}));
+        (&mut task).await.unwrap();
+        task.stop().await;
+    }
+
+    #[tokio::test]
+    async fn stopping_a_task_waits_for_its_owned_resources() {
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (released, dropped) = tokio::sync::oneshot::channel::<()>();
+        let task = AbortOnDrop::new(tokio::spawn(async move {
+            let _resource = released;
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }));
+        running.await.unwrap();
+        task.stop().await;
+        // The sender is dropped by actual task cancellation, rather than a
+        // detached task merely having received its abort request.
+        assert!(dropped.await.is_err());
+    }
+
+    #[tokio::test]
     async fn observing_leader_exit_keeps_it_waitable() {
         let mut child = tokio::process::Command::new("sh")
             .args(["-c", "exit 7"])
@@ -1569,6 +1760,7 @@ mod tests {
             dir.path().to_owned(),
             Vec::new(),
             Arc::clone(&counters),
+            Diagnostics::with_writer(std::io::sink()).unwrap(),
         );
         counters.rejected.store(12, Ordering::Relaxed);
         counters.unauthenticated.store(3, Ordering::Relaxed);

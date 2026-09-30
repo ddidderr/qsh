@@ -20,6 +20,8 @@ mod linux {
     use anyhow::{anyhow, bail, Context, Result};
     use nix::unistd::{Uid, User};
 
+    use crate::server::diagnostics::Diagnostics;
+
     static SESSION_NUMBER: AtomicU64 = AtomicU64::new(0);
     const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
     const PRIVATE_ROOT: &str = "qsh-restricted";
@@ -32,6 +34,7 @@ mod linux {
         kill_fd: Option<File>,
         killed: bool,
         removed: bool,
+        diagnostics: Option<Diagnostics>,
     }
 
     impl SessionCgroup {
@@ -102,12 +105,17 @@ mod linux {
                     kill_fd: Some(kill_fd),
                     killed: false,
                     removed: false,
+                    diagnostics: None,
                 }),
                 Err(error) => {
                     let _ = fs::remove_dir(&path);
                     Err(error)
                 }
             }
+        }
+
+        pub(crate) fn set_diagnostics(&mut self, diagnostics: Diagnostics) {
+            self.diagnostics = Some(diagnostics);
         }
 
         /// Duplicate the process-attachment control for the pre-exec hook.
@@ -187,7 +195,11 @@ mod linux {
             // cleanup available here; a leftover empty leaf is harmless, but
             // killing its members is mandatory.
             if let Err(error) = self.kill() {
-                eprintln!("qsh-server: {error:#}");
+                if let Some(diagnostics) = &self.diagnostics {
+                    diagnostics.emit(|| format!("qsh-server: {error:#}"));
+                } else {
+                    eprintln!("qsh-server: {error:#}");
+                }
             }
             self.procs.take();
             self.kill_fd.take();
@@ -373,6 +385,12 @@ mod unsupported {
     pub struct SessionCgroup;
 
     impl SessionCgroup {
+        pub(crate) fn set_diagnostics(
+            &mut self,
+            _diagnostics: crate::server::diagnostics::Diagnostics,
+        ) {
+        }
+
         /// # Errors
         /// Restricted sessions require Linux cgroup v2.
         pub fn create(_target: &User) -> Result<Self> {

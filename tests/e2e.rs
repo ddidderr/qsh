@@ -832,18 +832,14 @@ fn an_invalid_first_frame_cannot_expand_into_a_large_log_line() {
         let conn = raw_connect(&f.client_dir, f.port).await;
         let before = std::fs::metadata(&log).unwrap().len() as usize;
         let (mut send, _recv) = conn.open_bi().await.unwrap();
-        qsh::proto::write_frame(
-            &mut send,
-            &qsh::proto::Frame::Stdin(vec![b'x'; qsh::proto::MAX_FRAME]),
-        )
-        .await
-        .unwrap();
-        send.finish().unwrap();
+        // A wrong first-frame kind must be rejected from the header, without
+        // accepting or allocating the declared large payload.
+        send.write_all(&[2, 0, 16, 0, 0]).await.unwrap();
 
         // Wait for the newline, not just the start of the message: the old
         // Debug formatting wrote several MiB of decimal payload bytes after
         // this text, and sampling mid-write would miss the amplification.
-        let marker = b"expected a request frame first";
+        let marker = b"first frame must be a Request";
         let logged_tail = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let contents = std::fs::read(&log).unwrap();
@@ -896,13 +892,17 @@ fn a_disallowed_large_request_cannot_expand_into_a_large_log_line() {
         .expect("the connection was not authenticated");
         let before = std::fs::metadata(&log).unwrap().len() as usize;
 
-        // A valid Request can be almost as large as MAX_FRAME while asking
-        // for an account this key is not allowed to use. The server must deny
-        // it without copying that attacker-controlled value into its log.
+        // A request within the metadata limits can still ask for a different
+        // account and carry a sizeable argument list. Its refusal stays small.
         let request = qsh::proto::Request {
             version: qsh::proto::PROTOCOL_VERSION,
-            user: Some("x".repeat(qsh::proto::MAX_FRAME - 1024)),
-            command: Some(vec!["true".into()]),
+            user: Some("x".repeat(128)),
+            command: Some(vec![
+                "true".into(),
+                "a".repeat(16_384),
+                "b".repeat(16_384),
+                "c".repeat(16_384),
+            ]),
             pty: None,
             env: Vec::new(),
         };
