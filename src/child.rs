@@ -258,6 +258,7 @@ pub(crate) fn spawn_prepared(
     // SAFETY: only async-signal-safe libc calls between fork and exec.
     unsafe {
         cmd.as_std_mut().pre_exec(move || {
+            clear_ambient_capabilities()?;
             if let Some(procs) = &cgroup_procs {
                 cgroup::join_pre_exec(procs.as_raw_fd())?;
                 #[cfg(target_os = "linux")]
@@ -265,15 +266,7 @@ pub(crate) fn spawn_prepared(
                     // An opted-in account must not use a setuid binary or
                     // file capability to gain the right to migrate itself
                     // out of the root-owned session cgroup.
-                    if libc::prctl(
-                        libc::PR_CAP_AMBIENT,
-                        libc::PR_CAP_AMBIENT_CLEAR_ALL,
-                        0,
-                        0,
-                        0,
-                    ) != 0
-                        || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
-                    {
+                    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                         return Err(std::io::Error::last_os_error());
                     }
                 }
@@ -305,6 +298,44 @@ pub(crate) fn spawn_prepared(
         }
     };
     Ok(Spawned { child, io })
+}
+
+/// Service-specific ambient capabilities must not reach remote commands, even
+/// when a non-root daemon already has the requested UID. This does not prevent
+/// ordinary sessions from using their account's setuid or file-capability tools.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code, reason = "prctl is an async-signal-safe pre-exec syscall")]
+fn clear_ambient_capabilities() -> std::io::Result<()> {
+    // SAFETY: this operation takes integer arguments and no pointers.
+    if unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    } == 0
+    {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    // Kernels predating ambient capabilities reject this operation with EINVAL;
+    // they cannot carry the authority we are clearing.
+    if error.raw_os_error() == Some(libc::EINVAL) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "same pre-exec contract on every Unix platform"
+)]
+fn clear_ambient_capabilities() -> std::io::Result<()> {
+    Ok(())
 }
 
 fn describe(command: Option<&Vec<String>>, shell: &Path) -> String {
@@ -643,6 +674,80 @@ mod tests {
             panic!("expected the spawn to be refused")
         };
         assert!(err.to_string().contains("not running as root"), "{err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn same_user_sessions_do_not_inherit_ambient_capabilities() {
+        const MARKER: &str = "QSH_TEST_AMBIENT_CAPABILITIES";
+        if let Ok(case) = std::env::var(MARKER) {
+            let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+            let ambient = status
+                .lines()
+                .find(|line| line.starts_with("CapAmb:"))
+                .unwrap();
+            assert!(ambient.ends_with("0000000000000400"), "{ambient}");
+            if case == "direct" {
+                clear_ambient_capabilities().unwrap();
+                let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+                let ambient = status
+                    .lines()
+                    .find(|line| line.starts_with("CapAmb:"))
+                    .unwrap();
+                assert!(ambient.ends_with("0000000000000000"), "{ambient}");
+                return;
+            }
+            assert_eq!(case, "child");
+            let user = current_user().unwrap();
+            assert!(!user.uid.is_root());
+            let mut spawned = spawn(&user, &request(&["cat", "/proc/self/status"], false)).unwrap();
+            let ChildIo::Pipes { stdout, .. } = &mut spawned.io else {
+                panic!("expected pipes");
+            };
+            let mut child_status = String::new();
+            stdout.read_to_string(&mut child_status).await.unwrap();
+            assert!(spawned.child.wait().await.unwrap().success());
+            for field in ["CapAmb:", "CapPrm:", "CapEff:"] {
+                let line = child_status
+                    .lines()
+                    .find(|line| line.starts_with(field))
+                    .unwrap();
+                assert!(line.ends_with("0000000000000000"), "{line}");
+            }
+            // Ordinary sessions can still use normal setuid/file-capability
+            // programs; this fix removes inherited service authority only.
+            assert!(child_status.lines().any(|line| line == "NoNewPrivs:\t0"));
+            return;
+        }
+        if !Uid::effective().is_root() {
+            eprintln!("skipping ambient capability integration: requires root and setpriv");
+            return;
+        }
+        let user = resolve_user("nobody").unwrap();
+        let output = std::process::Command::new("setpriv")
+            .args([
+                "--reuid",
+                &user.uid.as_raw().to_string(),
+                "--regid",
+                &user.gid.as_raw().to_string(),
+                "--clear-groups",
+                "--inh-caps=+net_bind_service",
+                "--ambient-caps=+net_bind_service",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "child::tests::same_user_sessions_do_not_inherit_ambient_capabilities",
+            ])
+            .env(MARKER, "child")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {} stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -104,6 +104,8 @@ jobs:
         run: sudo -E env "PATH=$PATH" cargo test --locked --test e2e
       - name: Check mixed real, effective and saved credentials as root
         run: sudo -E env "PATH=$PATH" cargo test --locked --lib child::tests::mixed_credentials_cannot_reach_remote_exec
+      - name: Check ambient capabilities are cleared as root
+        run: sudo -E env "PATH=$PATH" cargo test --locked --lib child::tests::same_user_sessions_do_not_inherit_ambient_capabilities
       # A plain hosted-runner shell may lack cgroup delegation. Run this one
       # test in a transient root scope that delegates a cgroup v2 subtree and
       # require the real success path, rather than accepting a fail-closed-only
