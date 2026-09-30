@@ -322,7 +322,10 @@ key_fingerprint = "sha256:…" # the key this policy was written for
 An authorization is two files — `<name>.crt` and `<name>.toml` — and each is
 written atomically. `key_fingerprint` ties them together: if a crash or a
 half-finished edit ever left a certificate paired with a policy written for a
-different key, the entry is refused rather than applied.
+different key, a current entry is refused rather than applied. Policies created
+before `key_fingerprint` existed remain accepted with a warning for upgrade
+compatibility; re-run `qsh-server authorize` for each legacy name to bind it to
+its key.
 `authorize` publishes only the parsed certificate it fingerprinted; embedded
 private keys, unrelated text, and later changes to the submitted path are not
 copied into the authorization store.
