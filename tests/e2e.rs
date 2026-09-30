@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 
 const SERVER_BIN: &str = env!("CARGO_BIN_EXE_qsh-server");
 const CLIENT_BIN: &str = env!("CARGO_BIN_EXE_qsh");
@@ -636,6 +637,70 @@ fn binary_data_survives_a_round_trip() {
 }
 
 #[test]
+fn child_stdin_closing_does_not_discard_output_or_exit_status() {
+    let f = Fixture::start(&[]);
+    let ready = f.tmp.path().join("child-closed-stdin");
+    let script = "trap 'printf after-broken-pipe; printf stderr-marker >&2; exit 42' USR1; \
+                  exec 0<&-; printf ready > \"$1\"; sleep 8; exit 99";
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let conn = raw_connect(&f.client_dir, f.port).await;
+        let (mut send, mut recv) = raw_request(
+            &conn,
+            &["sh", "-c", script, "sh", ready.to_str().unwrap()],
+            false,
+        )
+        .await
+        .expect("opening the session");
+        wait_for_started(&mut recv).await;
+
+        // The marker is written only after the child closes fd 0. Sending a
+        // Stdin frame after this point guarantees a broken child pipe, then
+        // the Signal frame tests that control input is still handled.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the child never closed stdin");
+        qsh::proto::write_frame(&mut send, &qsh::proto::Frame::Stdin(vec![b'x'; 64 * 1024]))
+            .await
+            .unwrap();
+        qsh::proto::write_frame(&mut send, &qsh::proto::Frame::Signal("USR1".into()))
+            .await
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match qsh::proto::read_frame(&mut recv).await {
+                    Ok(Some(qsh::proto::Frame::Stdout(bytes))) => stdout.extend(bytes),
+                    Ok(Some(qsh::proto::Frame::Stderr(bytes))) => stderr.extend(bytes),
+                    Ok(Some(qsh::proto::Frame::Exit(exit))) => break exit.wait_status(),
+                    Ok(Some(qsh::proto::Frame::Error(error))) => panic!("{error}"),
+                    Ok(Some(other)) => panic!("unexpected frame: {other:?}"),
+                    Ok(None) | Err(_) => panic!("session ended without an exit status"),
+                }
+            }
+        })
+        .await
+        .expect("closed child stdin stopped the control stream");
+
+        assert_eq!(status, 42, "the signal was not delivered after EPIPE");
+        assert_eq!(stdout, b"after-broken-pipe");
+        // The shell may also report that its `sleep` child received USR1;
+        // the trap's output must still arrive after the broken stdin write.
+        assert!(stderr.ends_with(b"stderr-marker"), "{stderr:?}");
+    });
+}
+
+#[test]
 fn environment_is_controlled_by_the_server() {
     let f = Fixture::start(&[]);
     let (_, out, _) = f.exec(&["sh", "-c", "echo \"${LD_PRELOAD:-none}\""]);
@@ -698,6 +763,150 @@ fn an_unauthorized_key_is_refused() {
         .output()
         .unwrap();
     assert!(!out.status.success());
+}
+
+#[test]
+fn an_invalid_first_frame_cannot_expand_into_a_large_log_line() {
+    let f = Fixture::start(&[]);
+    let log = f.tmp.path().join("server.log");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let conn = raw_connect(&f.client_dir, f.port).await;
+        let before = std::fs::metadata(&log).unwrap().len() as usize;
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        qsh::proto::write_frame(
+            &mut send,
+            &qsh::proto::Frame::Stdin(vec![b'x'; qsh::proto::MAX_FRAME]),
+        )
+        .await
+        .unwrap();
+        send.finish().unwrap();
+
+        // Wait for the newline, not just the start of the message: the old
+        // Debug formatting wrote several MiB of decimal payload bytes after
+        // this text, and sampling mid-write would miss the amplification.
+        let marker = b"expected a request frame first";
+        let logged_tail = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let contents = std::fs::read(&log).unwrap();
+                let complete = contents.get(before..).and_then(|after| {
+                    let start = after
+                        .windows(marker.len())
+                        .position(|window| window == marker.as_slice())?;
+                    after.get(start..)?.iter().position(|byte| *byte == b'\n')
+                });
+                if let Some(end) = complete {
+                    break end;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the server did not report the invalid first frame");
+        assert!(
+            logged_tail < 4 * 1024,
+            "one invalid frame expanded into a {logged_tail}-byte log line"
+        );
+    });
+}
+
+#[test]
+fn a_disallowed_large_request_cannot_expand_into_a_large_log_line() {
+    let f = Fixture::start(&[]);
+    let log = f.tmp.path().join("server.log");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let conn = raw_connect(&f.client_dir, f.port).await;
+        // Wait for the authenticated-connection diagnostic before measuring
+        // what the rejected request itself adds to the log.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if std::fs::read_to_string(&log)
+                    .unwrap()
+                    .contains("authenticated as")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the connection was not authenticated");
+        let before = std::fs::metadata(&log).unwrap().len() as usize;
+
+        // A valid Request can be almost as large as MAX_FRAME while asking
+        // for an account this key is not allowed to use. The server must deny
+        // it without copying that attacker-controlled value into its log.
+        let request = qsh::proto::Request {
+            version: qsh::proto::PROTOCOL_VERSION,
+            user: Some("x".repeat(qsh::proto::MAX_FRAME - 1024)),
+            command: Some(vec!["true".into()]),
+            pty: None,
+            env: Vec::new(),
+        };
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        qsh::proto::write_frame(&mut send, &qsh::proto::Frame::Request(request))
+            .await
+            .unwrap();
+        send.finish().unwrap();
+
+        let (saw_error, exit) = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut saw_error = false;
+            loop {
+                match qsh::proto::read_frame(&mut recv).await {
+                    Ok(Some(qsh::proto::Frame::Error(_))) => saw_error = true,
+                    Ok(Some(qsh::proto::Frame::Exit(status))) => {
+                        break (saw_error, status.wait_status());
+                    }
+                    Ok(Some(qsh::proto::Frame::Started)) => {
+                        panic!("a disallowed account started a process")
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => panic!("the invalid request did not receive a refusal"),
+                }
+            }
+        })
+        .await
+        .expect("the disallowed request was not answered");
+        assert!(saw_error, "the client received no refusal diagnostic");
+        assert_eq!(exit, 126);
+
+        let marker = b"session from";
+        let line_len = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let contents = std::fs::read(&log).unwrap();
+                let complete = contents.get(before..).and_then(|after| {
+                    after
+                        .split_inclusive(|byte| *byte == b'\n')
+                        .find(|line| {
+                            line.ends_with(b"\n")
+                                && line
+                                    .windows(marker.len())
+                                    .any(|window| window == marker.as_slice())
+                        })
+                        .map(<[u8]>::len)
+                });
+                if let Some(len) = complete {
+                    break len;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the server did not log the refused request");
+        assert!(
+            line_len < 4 * 1024,
+            "one disallowed request expanded into a {line_len}-byte log line"
+        );
+    });
 }
 
 #[test]
@@ -841,6 +1050,92 @@ fn wait_for_pid(marker: &Path) -> i32 {
         assert!(Instant::now() < deadline, "remote command never started");
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[test]
+fn disconnect_is_observed_while_child_stdin_is_blocked() {
+    let f = Fixture::start(&[]);
+    let pidfile = f.tmp.path().join("blocked-stdin.pid");
+    let marker = f.tmp.path().join("blocked-stdin-job");
+    let script = idle_job_script(&pidfile, &marker);
+    let marker = marker.to_string_lossy().into_owned();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let conn = raw_connect(&f.client_dir, f.port).await;
+        let (mut send, mut recv) = raw_request(&conn, &["sh", "-c", &script], false)
+            .await
+            .expect("opening the stdin session");
+        wait_for_started(&mut recv).await;
+        let pid = tokio::task::block_in_place(|| wait_for_pid(&pidfile));
+        tokio::task::block_in_place(|| wait_for_running_marker(pid, &marker));
+
+        // The child never reads stdin. Two maximal frames exceed a Linux pipe
+        // by a wide margin, leaving the server's stdin writer backpressured.
+        let input = qsh::proto::Frame::Stdin(vec![b'x'; qsh::proto::MAX_FRAME]);
+        for _ in 0..2 {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                qsh::proto::write_frame(&mut send, &input),
+            )
+            .await
+            .expect("sending stdin exceeded the QUIC flow-control window")
+            .expect("sending stdin failed");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(running_with_marker(pid, &marker));
+        conn.close(0u32.into(), b"disconnect while stdin is blocked");
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while running_with_marker(pid, &marker) {
+            assert!(
+                Instant::now() < deadline,
+                "blocked child stdin hid the disconnect; process {pid} survived"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+}
+
+async fn wait_for_started(recv: &mut quinn::RecvStream) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match qsh::proto::read_frame(recv).await {
+                Ok(Some(qsh::proto::Frame::Started)) => return,
+                Ok(Some(qsh::proto::Frame::Error(error))) => {
+                    panic!("session was refused before starting: {error}")
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => panic!("session ended before starting"),
+            }
+        }
+    })
+    .await
+    .expect("session did not start in time");
+}
+
+/// Wait until the recorded process has exec'd the command unique to this test.
+fn wait_for_running_marker(pid: i32, marker: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !running_with_marker(pid, marker) {
+        assert!(
+            Instant::now() < deadline,
+            "remote command {pid} never started"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// An idle job that keeps the session alive without reading stdin.
+fn idle_job_script(pidfile: &Path, marker: &Path) -> String {
+    format!(
+        "echo $$ > {}; exec sh -c 'while :; do sleep 300; done' {}",
+        pidfile.display(),
+        marker.display()
+    )
 }
 
 #[test]
@@ -1573,6 +1868,141 @@ fn a_revoked_key_loses_an_established_connection() {
 }
 
 #[test]
+fn revocation_stops_a_running_session_on_an_established_connection() {
+    let f = Fixture::start(&[]);
+    let pidfile = f.tmp.path().join("revoked-live.pid");
+    let marker = f.tmp.path().join("revoked-live-job");
+    let script = idle_job_script(&pidfile, &marker);
+    let marker = marker.to_string_lossy().into_owned();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let conn = raw_connect(&f.client_dir, f.port).await;
+        let (_send, mut recv) = raw_request(&conn, &["sh", "-c", &script], false)
+            .await
+            .expect("opening the live session");
+        wait_for_started(&mut recv).await;
+        let pid = tokio::task::block_in_place(|| wait_for_pid(&pidfile));
+        tokio::task::block_in_place(|| wait_for_running_marker(pid, &marker));
+
+        let server_dir = f.server_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            run(
+                SERVER_BIN,
+                &["--dir", server_dir.to_str().unwrap(), "revoke", "tester"],
+            );
+        })
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(8), conn.closed())
+            .await
+            .expect("revocation did not close the established connection");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while running_with_marker(pid, &marker) {
+            assert!(
+                Instant::now() < deadline,
+                "the revoked session's process survived (pid {pid})"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+}
+
+#[test]
+fn a_preopened_stream_uses_the_policy_when_its_request_arrives() {
+    let f = Fixture::start(&[]);
+    let ran = f.tmp.path().join("staged-request-ran");
+    let script = format!("echo ran > {}", ran.display());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let conn = raw_connect(&f.client_dir, f.port).await;
+        assert_eq!(raw_session(&conn, &["true"]).await, Some(0));
+
+        // Send only the Request kind. The server can accept this stream, but
+        // cannot finish decoding its first frame until the policy changes.
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(&[1]).await.unwrap();
+        send.flush().await.unwrap();
+        assert_eq!(
+            raw_session(&conn, &["true"]).await,
+            Some(0),
+            "the server did not accept a later stream while this one was staged"
+        );
+
+        let policy_path = f.server_dir.join("authorized/tester.toml");
+        let policy = std::fs::read_to_string(&policy_path).unwrap();
+        assert!(policy.contains("allow_exec = true"), "{policy}");
+        std::fs::write(
+            &policy_path,
+            policy.replace("allow_exec = true", "allow_exec = false"),
+        )
+        .unwrap();
+
+        // A fresh request is a reload barrier, so the staged request is not
+        // completed against a policy the server has not read yet.
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            let (code, _, error) = tokio::task::block_in_place(|| f.exec(&["true"]));
+            if code == 126 {
+                assert!(error.contains("may not execute"), "{error}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "server did not load the narrower policy"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let request = qsh::proto::Request {
+            version: qsh::proto::PROTOCOL_VERSION,
+            user: None,
+            command: Some(vec!["sh".into(), "-c".into(), script]),
+            pty: None,
+            env: Vec::new(),
+        };
+        let payload = postcard::to_stdvec(&request).unwrap();
+        send.write_all(&u32::try_from(payload.len()).unwrap().to_be_bytes())
+            .await
+            .unwrap();
+        send.write_all(&payload).await.unwrap();
+        send.flush().await.unwrap();
+
+        // Closing the connection or refusing in-band are both safe outcomes.
+        // Starting the command is not, even if the connection closes later.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match qsh::proto::read_frame(&mut recv).await {
+                    Ok(Some(qsh::proto::Frame::Started)) => {
+                        panic!("the staged request started under its old policy")
+                    }
+                    Ok(Some(qsh::proto::Frame::Exit(status))) => {
+                        assert_ne!(status.wait_status(), 0);
+                        break;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        })
+        .await
+        .expect("the staged request was never rejected");
+        assert!(
+            !ran.exists(),
+            "the staged request ran after exec was forbidden"
+        );
+    });
+}
+
+#[test]
 fn a_session_runs_as_the_authorized_account() {
     // Only meaningful as root, where the server actually switches user.
     if !nix::unistd::Uid::effective().is_root() {
@@ -1712,6 +2142,70 @@ fn an_expired_authorization_stops_working() {
 }
 
 #[test]
+fn an_expired_key_cannot_keep_or_open_an_idle_connection() {
+    let f = Fixture::start(&["--expires-in-days", "30"]);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        // No session stream is opened: request-time expiry checks cannot make
+        // this pass. The already admitted connection must release its slot.
+        let conn = raw_connect(&f.client_dir, f.port).await;
+        let log = f.tmp.path().join("server.log");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if std::fs::read_to_string(&log)
+                    .unwrap()
+                    .contains("authenticated as")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the idle connection was not admitted before expiry");
+        let policy_path = f.server_dir.join("authorized/tester.toml");
+        let policy = std::fs::read_to_string(&policy_path).unwrap();
+        assert!(policy.contains("expires_at_unix"), "{policy}");
+        let expired = policy
+            .lines()
+            .map(|line| {
+                if line.starts_with("expires_at_unix") {
+                    "expires_at_unix = 1"
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&policy_path, expired).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(8), conn.closed())
+            .await
+            .expect("an expired key kept its already admitted idle connection");
+
+        // A new expired-key connection may be rejected during TLS or closed
+        // just after the handshake. It must not remain idle and admitted.
+        let endpoint = raw_endpoint(&f.client_dir, "0.0.0.0:0", Arc::new(AcceptAnyServer));
+        let connecting = endpoint
+            .connect(std::net::SocketAddr::from(([127, 0, 0, 1], f.port)), "qsh")
+            .unwrap();
+        if let Ok(new_conn) = tokio::time::timeout(Duration::from_secs(5), connecting)
+            .await
+            .expect("expired-key admission did not finish")
+        {
+            tokio::time::timeout(Duration::from_secs(5), new_conn.closed())
+                .await
+                .expect("an expired key kept a new idle connection");
+        }
+        // TLS may also refuse the expired key before the handshake completes.
+    });
+}
+
+#[test]
 fn revoke_cannot_escape_the_authorized_directory() {
     let f = Fixture::start(&[]);
     let host_key = f.server_dir.join("server.crt");
@@ -1802,6 +2296,91 @@ fn several_sessions_share_one_server() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+#[test]
+fn one_key_cannot_occupy_every_established_connection_slot() {
+    const KEY_LIMIT: usize = 32;
+
+    let f = Fixture::start(&[]);
+    let other = f.tmp.path().join("other-client");
+    run(
+        CLIENT_BIN,
+        &["keygen", "--identity", other.to_str().unwrap()],
+    );
+    run(
+        SERVER_BIN,
+        &[
+            "--dir",
+            f.server_dir.to_str().unwrap(),
+            "authorize",
+            other.join("id.crt").to_str().unwrap(),
+            "--user",
+            &current_user(),
+            "--name",
+            "other",
+        ],
+    );
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while f.exec_as(&other, &["true"]).0 != 0 {
+        assert!(Instant::now() < deadline, "the second key was never loaded");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], f.port));
+        let endpoint = raw_endpoint(&f.client_dir, "0.0.0.0:0", Arc::new(AcceptAnyServer));
+        let mut held = Vec::new();
+        for _ in 0..KEY_LIMIT {
+            let conn = tokio::time::timeout(
+                Duration::from_secs(5),
+                endpoint.connect(addr, "qsh").unwrap(),
+            )
+            .await
+            .expect("an allowed connection timed out")
+            .expect("an allowed connection was refused");
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), raw_session(&conn, &["true"]))
+                    .await
+                    .expect("an allowed session timed out"),
+                Some(0),
+                "a connection within the per-key limit was refused"
+            );
+            held.push(conn);
+        }
+
+        let excess = tokio::time::timeout(
+            Duration::from_secs(5),
+            endpoint.connect(addr, "qsh").unwrap(),
+        )
+        .await
+        .expect("the over-limit handshake did not finish");
+        if let Ok(conn) = excess {
+            assert_ne!(
+                tokio::time::timeout(Duration::from_secs(5), raw_session(&conn, &["true"]))
+                    .await
+                    .expect("the over-limit connection stayed open"),
+                Some(0),
+                "one key exceeded its established-connection limit"
+            );
+        }
+
+        let other_conn = raw_connect(&other, f.port).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), raw_session(&other_conn, &["true"]))
+                .await
+                .expect("the other key's session timed out"),
+            Some(0),
+            "one key's quota prevented a different key from connecting"
+        );
+        for conn in held {
+            conn.close(0u32.into(), b"test complete");
+        }
+    });
 }
 
 #[test]

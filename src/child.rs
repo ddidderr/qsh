@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
-use nix::sys::signal::{kill, killpg, Signal};
+use nix::sys::signal::{killpg, Signal};
 use nix::unistd::{Gid, Pid, Uid, User};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 
@@ -41,8 +41,8 @@ pub struct Spawned {
 ///
 /// The child called `setsid`, so it leads its own process group and the
 /// negative pid reaches every process in it — the same reach a terminal has
-/// when you press Ctrl-C. If the group is already gone, fall back to the
-/// process itself.
+/// when you press Ctrl-C. If the group is gone, do not signal that numeric pid:
+/// it may already belong to an unrelated process.
 ///
 /// This is the only place in the crate that signals anything.
 pub fn signal_process_group(pid: u32, sig: i32) {
@@ -53,9 +53,7 @@ pub fn signal_process_group(pid: u32, sig: i32) {
         return;
     }
     let pid = Pid::from_raw(pid);
-    if killpg(pid, sig).is_err() {
-        let _ = kill(pid, sig);
-    }
+    let _ = killpg(pid, sig);
 }
 
 /// Does the process group still have any member left?
@@ -107,6 +105,69 @@ fn shell_of(user: &User) -> PathBuf {
     }
 }
 
+/// Decide before forking whether the target needs fresh supplementary groups.
+#[allow(unsafe_code, reason = "issetugid has no safe wrapper")]
+fn needs_identity_switch(user: &User) -> Result<bool> {
+    let running_as_root = Uid::effective().is_root();
+    let must_switch = user.uid != Uid::current()
+        || user.uid != Uid::effective()
+        || user.gid != Gid::current()
+        || user.gid != Gid::effective();
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd"
+    ))]
+    let must_switch = {
+        let uids = nix::unistd::getresuid().context("reading server user IDs")?;
+        let gids = nix::unistd::getresgid().context("reading server group IDs")?;
+        must_switch || user.uid != uids.saved || user.gid != gids.saved
+    };
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "netbsd"))]
+    if !running_as_root && unsafe { libc::issetugid() } != 0 {
+        bail!(
+            "cannot run as `{}`: qsh-server has changed credentials",
+            user.name
+        );
+    }
+    if must_switch && !running_as_root {
+        bail!(
+            "cannot run as `{}`: qsh-server is not running as root",
+            user.name
+        );
+    }
+    Ok(must_switch)
+}
+
+/// The identity information that may require NSS lookups. Resolve this before
+/// taking the server's short-lived authorization lock for the final check.
+#[derive(Debug)]
+pub(crate) struct PreparedIdentity {
+    switch: bool,
+    groups: Vec<libc::gid_t>,
+}
+
+/// Resolve the target's supplementary groups before spawning a child.
+///
+/// # Errors
+/// Fails if the daemon cannot assume the target identity or group lookup fails.
+pub(crate) fn prepare_identity(user: &User) -> Result<PreparedIdentity> {
+    let switch = needs_identity_switch(user)?;
+    let username = CString::new(user.name.as_str()).context("user name contains a NUL byte")?;
+    let groups = if switch {
+        nix::unistd::getgrouplist(&username, user.gid)
+            .with_context(|| format!("looking up the groups of `{}`", user.name))?
+            .into_iter()
+            .map(Gid::as_raw)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(PreparedIdentity { switch, groups })
+}
+
 /// Start the process described by `req` as `user`.
 ///
 /// When the server does not run as root, `user` must be the account the
@@ -115,19 +176,22 @@ fn shell_of(user: &User) -> PathBuf {
 /// # Errors
 /// Fails if the target user cannot be assumed, a PTY cannot be allocated, or
 /// the program cannot be executed.
-#[allow(
-    unsafe_code,
-    reason = "pre_exec is inherently unsafe: its closure runs between fork and exec"
-)]
 pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
-    let running_as_root = Uid::effective().is_root();
-    let must_switch = user.uid != Uid::current() || user.gid != Gid::current();
-    if must_switch && !running_as_root {
-        bail!(
-            "cannot run as `{}`: qsh-server is not running as root",
-            user.name
-        );
-    }
+    spawn_prepared(user, req, prepare_identity(user)?)
+}
+
+/// Spawn using identity data that was resolved before the final authorization
+/// check. The caller must not use this for another account.
+///
+/// # Errors
+/// Fails if a PTY cannot be allocated or the program cannot be executed.
+#[allow(unsafe_code, reason = "pre_exec runs between fork and exec")]
+pub(crate) fn spawn_prepared(
+    user: &User,
+    req: &Request,
+    identity: PreparedIdentity,
+) -> Result<Spawned> {
+    let PreparedIdentity { switch, groups } = identity;
 
     let home = home_of(user);
     let shell = shell_of(user);
@@ -167,28 +231,10 @@ pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
         }
     }
 
-    // Everything the pre-exec hook needs, resolved *before* the fork.
-    //
-    // The supplementary groups in particular: `initgroups` goes through NSS,
-    // which may load modules, allocate and take locks — none of it
-    // async-signal-safe. In a forked child of a multi-threaded process (which
-    // a tokio server always is) a lock held by another thread at fork time
-    // stays locked forever, so calling it after the fork can hang logins
-    // outright on an LDAP or SSSD host. Resolve the list here and apply the
-    // finished numbers with a bare `setgroups` in the child.
-    let username = CString::new(user.name.as_str()).context("user name contains a NUL byte")?;
+    // All NSS/group lookups have already finished before the fork. In the
+    // child the pre-exec hook only applies the resolved numeric identities.
     let uid = user.uid.as_raw();
     let gid = user.gid.as_raw();
-    let switch = must_switch;
-    let groups: Vec<libc::gid_t> = if must_switch {
-        nix::unistd::getgrouplist(&username, user.gid)
-            .with_context(|| format!("looking up the groups of `{}`", user.name))?
-            .into_iter()
-            .map(Gid::as_raw)
-            .collect()
-    } else {
-        Vec::new()
-    };
 
     let master = if let Some(p) = &req.pty {
         let (master, slave) = pty::open(p.size)?;
@@ -250,7 +296,7 @@ fn describe(command: Option<&Vec<String>>, shell: &Path) -> String {
 /// precisely so that no NSS lookup happens on this side of it.
 #[allow(
     unsafe_code,
-    reason = "setuid/setgid/setgroups have no safe wrappers and must run here"
+    reason = "credential and group syscalls must run between fork and exec"
 )]
 fn drop_privileges(
     switch: bool,
@@ -258,24 +304,89 @@ fn drop_privileges(
     uid: libc::uid_t,
     gid: libc::gid_t,
 ) -> std::io::Result<()> {
-    if !switch {
-        return Ok(());
-    }
     // SAFETY: async-signal-safe syscalls only. `groups` is owned by the
     // closure, so the slice stays valid across the fork.
     unsafe {
-        if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
+        if switch && libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        if libc::setgid(gid) != 0 {
-            return Err(std::io::Error::last_os_error());
+        // Always normalize all three IDs, even when the visible real and
+        // effective IDs already match. A saved ID can otherwise survive exec
+        // and let the remote program regain a different identity.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "openbsd"
+        ))]
+        {
+            if libc::setresgid(gid, gid, gid) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setresuid(uid, uid, uid) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let (mut group_real, mut group_effective, mut group_saved) = (0, 0, 0);
+            if libc::getresgid(
+                &raw mut group_real,
+                &raw mut group_effective,
+                &raw mut group_saved,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let (mut user_real, mut user_effective, mut user_saved) = (0, 0, 0);
+            if libc::getresuid(
+                &raw mut user_real,
+                &raw mut user_effective,
+                &raw mut user_saved,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if [group_real, group_effective, group_saved] != [gid; 3]
+                || [user_real, user_effective, user_saved] != [uid; 3]
+            {
+                return Err(std::io::Error::other("failed to drop privileges"));
+            }
         }
-        if libc::setuid(uid) != 0 {
-            return Err(std::io::Error::last_os_error());
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "netbsd"))]
+        {
+            // Privileged calls reset saved IDs. NetBSD also does so for the
+            // current real ID; on macOS, the issetugid check above rejects
+            // unprivileged processes whose IDs changed since exec.
+            if libc::setgid(gid) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setuid(uid) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "openbsd",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "netbsd"
+        )))]
+        {
+            return Err(std::io::Error::other(
+                "cannot safely normalize saved user and group IDs on this platform",
+            ));
         }
         // Refuse to exec if the identity change did not stick, and make sure
         // it cannot be undone.
-        if libc::getuid() != uid || libc::geteuid() != uid || (uid != 0 && libc::setuid(0) == 0) {
+        if libc::getuid() != uid
+            || libc::geteuid() != uid
+            || libc::getgid() != gid
+            || libc::getegid() != gid
+            || (uid != 0 && libc::setuid(0) == 0)
+            || (uid != 0 && gid != 0 && libc::setgid(0) == 0)
+        {
             return Err(std::io::Error::other("failed to drop privileges"));
         }
     }
@@ -504,5 +615,104 @@ mod tests {
             panic!("expected the spawn to be refused")
         };
         assert!(err.to_string().contains("not running as root"), "{err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[allow(
+        unsafe_code,
+        reason = "construct mixed credentials in a test subprocess"
+    )]
+    async fn mixed_credentials_cannot_reach_remote_exec() {
+        use std::os::unix::process::CommandExt as _;
+
+        const MARKER: &str = "QSH_TEST_MIXED_CREDENTIALS";
+        let user = ["nobody", "daemon"].into_iter().find_map(|name| {
+            User::from_name(name)
+                .unwrap()
+                .filter(|user| !user.uid.is_root() && user.gid.as_raw() != 0)
+        });
+        let Some(user) = user else {
+            return;
+        };
+
+        if let Ok(case) = std::env::var(MARKER) {
+            if case == "saved-root" {
+                // Exec copies the effective ID into the saved slot, so create
+                // this state after the isolated test subprocess has started.
+                // SAFETY: only this subprocess changes credentials; both calls
+                // use fixed numeric IDs and run before starting a remote child.
+                unsafe {
+                    assert_eq!(libc::setresgid(user.gid.as_raw(), user.gid.as_raw(), 0), 0);
+                    assert_eq!(libc::setresuid(user.uid.as_raw(), user.uid.as_raw(), 0), 0);
+                }
+            }
+            assert_eq!(Uid::current(), user.uid);
+            assert_eq!(Gid::current(), user.gid);
+            if case == "effective-root" {
+                assert!(Uid::effective().is_root());
+                let mut spawned =
+                    spawn(&user, &request(&["cat", "/proc/self/status"], false)).unwrap();
+                let ChildIo::Pipes { stdout, .. } = &mut spawned.io else {
+                    panic!("expected pipes");
+                };
+                let mut status = String::new();
+                stdout.read_to_string(&mut status).await.unwrap();
+                assert!(spawned.child.wait().await.unwrap().success());
+                for (field, id) in [("Uid:", user.uid.as_raw()), ("Gid:", user.gid.as_raw())] {
+                    let line = status.lines().find(|line| line.starts_with(field)).unwrap();
+                    let ids: Vec<_> = line.split_whitespace().skip(1).collect();
+                    assert_eq!(ids, vec![id.to_string(); 4], "{line}");
+                }
+                let groups = status
+                    .lines()
+                    .find(|line| line.starts_with("Groups:"))
+                    .unwrap();
+                assert!(!groups.split_whitespace().skip(1).any(|id| id == "0"));
+            } else {
+                assert_eq!(case, "saved-root");
+                assert_eq!(Uid::effective(), user.uid);
+                let error = spawn(&user, &request(&["true"], false)).unwrap_err();
+                assert!(error.to_string().contains("not running as root"), "{error}");
+            }
+            return;
+        }
+        if !Uid::effective().is_root() {
+            return;
+        }
+
+        for case in ["effective-root", "saved-root"] {
+            let uid = user.uid.as_raw();
+            let gid = user.gid.as_raw();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "child::tests::mixed_credentials_cannot_reach_remote_exec",
+                ])
+                .env(MARKER, case);
+            if case == "effective-root" {
+                // SAFETY: the subprocess changes only its own IDs before exec,
+                // using async-signal-safe syscalls and no shared memory.
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::setresgid(gid, 0, 0) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if libc::setresuid(uid, 0, 0) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: stdout: {} stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }

@@ -165,7 +165,17 @@ long-lived self-signed **Ed25519** certificate.
   independently of whatever certificate the client presents. `qsh-server list`
   shows the remaining time.
 * Deleting `authorized/<name>.crt` (or `qsh-server revoke <name>`) takes
-  effect within a second, without a restart.
+  effect after the next reload and policy check, normally within two seconds,
+  without a restart. The key's connections close and
+  the server signals each session's initial process group. A PTY shell can put
+  a foreground job in a different group; that job may survive if it ignores
+  the terminal hangup.
+* Command restrictions only protect the server's state when the authorized
+  account cannot write that state. If a non-root server and a remote session
+  run as the same Unix user, even an rsync-only session can rewrite its
+  `authorized/` entries or host key. For restricted keys, keep the server's
+  state root-owned and authorize a different, non-root target account. A key
+  authorized to log in as root has administrator access by design.
 * Private keys are written 0600 and refused at load time if they are group- or
   world-readable.
 * Client authentication is mandatory; TLS 1.3 only. Unvalidated peer addresses
@@ -182,14 +192,12 @@ long-lived self-signed **Ed25519** certificate.
   including while the last of the output is still draining, so a descendant
   that outlives the command it was started from is cleaned up too.
 
-  What this does **not** reach is a process that has left the session's process
-  group — one you backgrounded with `&` in an interactive shell (job control
-  gives it a group of its own), or that called `setsid` itself, or that you
-  started under `nohup`. Those survive the session, exactly as they do under
-  ssh, and deliberately: leaving a long job running after you log out is a
-  thing people do on purpose. If you want the stricter behaviour, that is what
-  a session cgroup is for — `systemd-logind`'s `KillUserProcesses=yes` — and
-  it is off by default there for the same reason it is not qsh's default.
+  What this does **not** reliably reach is a process in another process group:
+  a PTY shell may move foreground and background jobs there through job
+  control, and a program may call `setsid` itself. Closing the PTY sends a
+  hangup to its foreground group, but a process can ignore that signal.
+  Fully containing those jobs would require a session cgroup or a different
+  job-control policy.
 * Work is bounded before anyone has authenticated: peers must complete a QUIC
   retry to prove their address, a handshake has 5 seconds to finish, and a
   session stream has 10 seconds to say what it wants. Handshakes in flight
@@ -198,6 +206,8 @@ long-lived self-signed **Ed25519** certificate.
   Within the handshake budget, no single source address may hold more than 4
   slots at once, which is what keeps one address from filling the pool and
   locking out everyone else — separate budgets alone would not do that.
+  After authentication, one client key may hold at most 32 established
+  connections, leaving room for other authorized keys.
   Over-limit connections are dropped silently rather than answered, and
   failures before authentication are counted and reported in batches rather
   than logged one line per attempt.
@@ -213,7 +223,7 @@ long-lived self-signed **Ed25519** certificate.
 * The client cannot set arbitrary environment variables. Only `TERM`, `LANG`,
   `COLORTERM`, `LC_*` and `QSH_*` survive; `PATH` is fixed by the server. The
   remote process gets a fresh session (`setsid`) and, when root, a full
-  privilege drop with `setgroups`/`setgid`/`setuid`, verified before `exec`.
+  privilege drop of real, effective and saved IDs, verified before `exec`.
   The supplementary groups are resolved *before* the fork: looking them up
   afterwards would mean calling NSS in a forked child, which is not
   async-signal-safe and deadlocks under LDAP or SSSD.
