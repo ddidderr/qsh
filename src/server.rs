@@ -30,7 +30,8 @@ use crate::crypto::{self, AuthorizedClientVerifier, Fingerprint};
 use crate::net::transport_config;
 use crate::proto::{
     read_frame, read_request, signal_number, write_frame, ExitStatus, Frame, PtySize, Request,
-    CHUNK, PROTOCOL_VERSION, RESET_ABANDONED,
+    CHUNK, MAX_ARGS, MAX_ENV, MAX_NAME_BYTES, MAX_REQUEST, MAX_VALUE_BYTES, PROTOCOL_VERSION,
+    RESET_ABANDONED,
 };
 use crate::pty;
 
@@ -682,11 +683,19 @@ async fn handle_session(
     // A stream that never says what it wants must not hold resources open.
     // Only the first frame is on a clock; `control_loop` has to stay
     // deadline-free or an idle interactive shell would be cut off.
-    let first = tokio::time::timeout(FIRST_FRAME_GRACE, read_request(&mut recv))
-        .await
-        .map_err(|_| anyhow!("client opened a session but sent no request"))?;
-    let Some(req) = first? else {
-        return Ok(());
+    let req = match tokio::time::timeout(FIRST_FRAME_GRACE, read_request(&mut recv)).await {
+        Ok(Ok(Some(request))) => request,
+        Ok(Ok(None)) => return Ok(()),
+        Ok(Err(error)) => {
+            let error = anyhow!(error).context("reading the qsh/1 session request");
+            refuse_session(send, invalid_request_diagnostic(&error)).await;
+            return Err(error);
+        }
+        Err(_) => {
+            let error = anyhow!("client opened a session but sent no request within 10 seconds");
+            refuse_session(send, invalid_request_diagnostic(&error)).await;
+            return Err(error);
+        }
     };
 
     let start = async {
@@ -759,18 +768,7 @@ async fn handle_session(
         Err(e) => {
             // Report the refusal in-band so the client can print it, then end
             // the session with a shell-like "cannot execute" status.
-            let mut stream = SessionStream::new(send);
-            let _ = tokio::time::timeout(SHUTDOWN_GRACE, async {
-                let _ = stream.write(&Frame::Error(bounded_diagnostic(&e))).await;
-                let _ = stream
-                    .write(&Frame::Exit(ExitStatus {
-                        code: 126,
-                        signal: None,
-                    }))
-                    .await;
-                stream.finish().await;
-            })
-            .await;
+            refuse_session(send, bounded_diagnostic(&e)).await;
             return Err(e);
         }
     };
@@ -799,6 +797,29 @@ async fn handle_session(
     .await;
     drop(lease);
     result
+}
+
+async fn refuse_session(send: quinn::SendStream, message: String) {
+    let mut stream = SessionStream::new(send);
+    let _ = tokio::time::timeout(SHUTDOWN_GRACE, async {
+        let _ = stream.write(&Frame::Error(message)).await;
+        let _ = stream
+            .write(&Frame::Exit(ExitStatus {
+                code: 126,
+                signal: None,
+            }))
+            .await;
+        stream.finish().await;
+    })
+    .await;
+}
+
+fn invalid_request_diagnostic(error: &anyhow::Error) -> String {
+    bounded_diagnostic(&anyhow!(
+        "invalid qsh/1 session request: {error:#}; limits: {MAX_REQUEST} request bytes, \
+         {MAX_ARGS} arguments, {MAX_ENV} environment entries, {MAX_VALUE_BYTES} bytes per \
+         argument or environment value, and {MAX_NAME_BYTES} bytes per name"
+    ))
 }
 
 /// Diagnostics can contain client-supplied request fields. Keep each message

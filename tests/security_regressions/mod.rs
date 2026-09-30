@@ -9,8 +9,32 @@ fn runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
+async fn expect_request_limit_refusal(recv: &mut quinn::RecvStream) {
+    let error = tokio::time::timeout(Duration::from_secs(3), qsh::proto::read_frame(recv))
+        .await
+        .expect("invalid request did not receive a prompt refusal")
+        .unwrap()
+        .expect("server closed without a refusal");
+    let qsh::proto::Frame::Error(message) = error else {
+        panic!("expected refusal diagnostic, got {error:?}");
+    };
+    assert!(
+        message.contains("invalid qsh/1 session request"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("{} request bytes", qsh::proto::MAX_REQUEST)),
+        "{message}"
+    );
+    let exit = qsh::proto::read_frame(recv).await.unwrap().unwrap();
+    assert!(
+        matches!(exit, qsh::proto::Frame::Exit(status) if status.wait_status() == 126),
+        "unexpected refusal status: {exit:?}"
+    );
+}
+
 #[test]
-fn dense_requests_fail_before_spawn_and_leave_the_connection_usable() {
+fn legacy_v1_limit_refusals_leave_the_connection_usable() {
     let fixture = Fixture::start(&["--no-shell", "--command", "true"]);
     runtime().block_on(async {
         let conn = raw_connect(&fixture.client_dir, fixture.port).await;
@@ -32,13 +56,44 @@ fn dense_requests_fail_before_spawn_and_leave_the_connection_usable() {
         frame.extend_from_slice(&payload);
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
         send.write_all(&frame).await.unwrap();
-        let reply = tokio::time::timeout(Duration::from_secs(3), qsh::proto::read_frame(&mut recv))
+        expect_request_limit_refusal(&mut recv).await;
+        assert_eq!(raw_session(&conn, &["true"]).await, Some(0));
+
+        // Model the baseline writer, which sends the complete formerly valid
+        // request before it starts reading the server's reply.
+        let request = qsh::proto::Request {
+            version: qsh::proto::PROTOCOL_VERSION,
+            user: Some("u".repeat(qsh::proto::MAX_REQUEST + 1)),
+            command: Some(vec!["true".into()]),
+            pty: None,
+            env: Vec::new(),
+        };
+        let payload = postcard::to_stdvec(&request).unwrap();
+        assert!(payload.len() > qsh::proto::MAX_REQUEST);
+        assert!(payload.len() < qsh::proto::MAX_FRAME);
+        let mut frame = vec![1];
+        frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+        frame.extend_from_slice(&payload);
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), send.write_all(&frame))
             .await
-            .expect("malformed request did not terminate promptly");
-        assert!(
-            matches!(reply, Ok(None) | Err(_)),
-            "unexpected reply: {reply:?}"
+            .expect("baseline request writer blocked before reading the refusal")
+            .unwrap();
+        expect_request_limit_refusal(&mut recv).await;
+        assert_eq!(raw_session(&conn, &["true"]).await, Some(0));
+
+        // A baseline qsh/1 peer can advertise the old one-MiB frame ceiling.
+        // Reject the new request ceiling from the header without waiting for or
+        // allocating its body, but still explain the rolling-upgrade failure.
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let mut header = vec![1];
+        header.extend_from_slice(
+            &u32::try_from(qsh::proto::MAX_REQUEST + 1)
+                .unwrap()
+                .to_be_bytes(),
         );
+        send.write_all(&header).await.unwrap();
+        expect_request_limit_refusal(&mut recv).await;
         assert_eq!(raw_session(&conn, &["true"]).await, Some(0));
     });
 }

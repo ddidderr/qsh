@@ -455,7 +455,9 @@ user names, environment names, and terminal types at most 256 bytes. Collection
 and string limits are enforced during decoding, before allocation. Data frames
 retain their 1 MiB limit. The first frame must be a Request; its kind and length
 are checked before accepting its payload. Invalid frames are rejected rather
-than truncated.
+than truncated. An authenticated qsh/1 peer whose request exceeds these limits
+receives a bounded `Error` followed by exit status 126; the connection remains
+usable for later valid session streams.
 
 ## Development
 
