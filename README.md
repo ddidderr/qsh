@@ -498,7 +498,7 @@ cannot lock every future session out.
 `unsafe_code` is denied crate-wide. It cannot be avoided altogether — PTY
 ioctls, raw-fd reads and writes, `kill(2)`, and the `pre_exec` hook that runs
 `setsid` plus `setgroups`/`setgid`/`setuid` between fork and exec have no safe
-equivalents — so each of the eleven exceptions carries its own
+equivalents — so every exception carries its own
 `#[allow(unsafe_code, reason = ...)]`. They are confined to small syscall
 boundaries in `pty`, `child`, `cgroup`, and `server`; `just audit-unsafe` prints
 the current reasons and per-file counts:
