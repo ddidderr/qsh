@@ -696,6 +696,7 @@ dependencies = [
  "dirs",
  "libc",
  "nix",
+ "pem",
  "postcard",
  "quinn",
  "rcgen",

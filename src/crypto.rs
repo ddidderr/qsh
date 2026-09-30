@@ -12,7 +12,7 @@
 
 use std::fmt::Debug;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
@@ -37,8 +37,7 @@ impl Fingerprint {
     /// # Errors
     /// Fails if the bytes are not a parseable X.509 certificate.
     pub fn of_cert(der: &[u8]) -> Result<Self> {
-        let (_, cert) =
-            X509Certificate::from_der(der).map_err(|e| anyhow!("malformed certificate: {e}"))?;
+        let cert = parse_exact_certificate(der)?;
         Ok(Self(Sha256::digest(cert.public_key().raw).into()))
     }
 
@@ -74,6 +73,18 @@ impl Fingerprint {
         }
         Ok(Self(out))
     }
+}
+
+/// Parse exactly one DER certificate. Prefix parsers are unsafe at a trust
+/// boundary: accepting a valid prefix while later publishing the entire input
+/// would preserve bytes that were never validated.
+fn parse_exact_certificate(der: &[u8]) -> Result<X509Certificate<'_>> {
+    let (trailing, cert) =
+        X509Certificate::from_der(der).map_err(|e| anyhow!("malformed certificate: {e}"))?;
+    if !trailing.is_empty() {
+        bail!("malformed certificate: trailing data after DER certificate");
+    }
+    Ok(cert)
 }
 
 impl std::fmt::Display for Fingerprint {
@@ -184,11 +195,13 @@ fn system_time_to_offset(t: std::time::SystemTime) -> ::time::OffsetDateTime {
 /// # Errors
 /// Fails if the PEM is malformed or holds no certificate.
 pub fn cert_from_pem(pem: &str) -> Result<CertificateDer<'static>> {
-    CertificateDer::pem_slice_iter(pem.as_bytes())
+    let cert = CertificateDer::pem_slice_iter(pem.as_bytes())
         .next()
         .transpose()
         .context("parsing a PEM certificate")?
-        .ok_or_else(|| anyhow!("no certificate found"))
+        .ok_or_else(|| anyhow!("no certificate found"))?;
+    parse_exact_certificate(&cert)?;
+    Ok(cert)
 }
 
 /// Read a PEM certificate file and return the first certificate in it.
@@ -202,6 +215,10 @@ pub fn load_cert(path: &Path) -> Result<CertificateDer<'static>> {
     let certs: Vec<_> = CertificateDer::pem_slice_iter(&pem)
         .collect::<std::result::Result<_, _>>()
         .with_context(|| format!("parsing certificates in {}", path.display()))?;
+    for cert in &certs {
+        parse_exact_certificate(cert)
+            .with_context(|| format!("parsing certificate in {}", path.display()))?;
+    }
     certs
         .into_iter()
         .next()
@@ -214,7 +231,10 @@ pub fn load_cert(path: &Path) -> Result<CertificateDer<'static>> {
 /// Fails if the file is group- or world-accessible, cannot be read, or holds
 /// no private key.
 pub fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let meta = fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let meta = file
+        .metadata()
+        .with_context(|| format!("reading metadata for {}", path.display()))?;
     let mode = meta.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
         bail!(
@@ -224,9 +244,11 @@ pub fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
             path.display()
         );
     }
-    let pem = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    // Reading the bytes here, rather than via `from_pem_file`, keeps the
-    // permission check above on the same file we then parse.
+    // Keep the permission check and the read on the same open file. Reopening
+    // the pathname could read a replacement whose permissions were not checked.
+    let mut pem = Vec::new();
+    file.read_to_end(&mut pem)
+        .with_context(|| format!("reading {}", path.display()))?;
     PrivateKeyDer::pem_slice_iter(&pem)
         .next()
         .transpose()
@@ -259,6 +281,23 @@ pub fn write_private(path: &Path, contents: &str) -> Result<()> {
 /// Fails if the parent directory or the file itself cannot be created.
 pub fn write_public(path: &Path, contents: &str) -> Result<()> {
     write_atomically(path, contents, 0o644)
+}
+
+/// Write only the supplied certificate as a world-readable PEM file.
+///
+/// Callers that import a certificate must retain the DER they validated and
+/// publish that value, rather than reopening the source or copying its PEM
+/// text: the source may change or include private keys and unrelated text.
+///
+/// # Errors
+/// Fails if the destination cannot be written.
+pub fn write_certificate(path: &Path, cert: &CertificateDer<'_>) -> Result<()> {
+    parse_exact_certificate(cert)?;
+    let pem = ::pem::encode_config(
+        &::pem::Pem::new("CERTIFICATE", cert.as_ref()),
+        ::pem::EncodeConfig::new().set_line_ending(::pem::LineEnding::LF),
+    );
+    write_public(path, &pem)
 }
 
 /// Write `contents` to `path` without ever leaving it half-written.
@@ -328,8 +367,13 @@ fn write_atomically(path: &Path, contents: &str, mode: u32) -> Result<()> {
 /// # Errors
 /// Fails if the certificate cannot be parsed, has expired, or is not yet valid.
 pub fn check_validity(der: &[u8], now: UnixTime) -> std::result::Result<(), TlsError> {
-    let (_, cert) = X509Certificate::from_der(der)
+    let (trailing, cert) = X509Certificate::from_der(der)
         .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
+    if !trailing.is_empty() {
+        return Err(TlsError::InvalidCertificate(
+            rustls::CertificateError::BadEncoding,
+        ));
+    }
     let seconds = i64::try_from(now.as_secs())
         .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
     let now = ASN1Time::from_timestamp(seconds)
@@ -593,6 +637,77 @@ mod tests {
             load_key(&path).is_err(),
             "not a real key, must fail to parse"
         );
+    }
+
+    #[test]
+    fn writing_a_loaded_certificate_does_not_reopen_its_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("submitted.crt");
+        let secret = dir.path().join("secret");
+        let destination = dir.path().join("authorized.crt");
+        let (cert_pem, key_pem) = generate_identity("test", &["localhost".into()], 30).unwrap();
+        write_private(
+            &source,
+            &format!("{cert_pem}{key_pem}\nprivate trailing text\n"),
+        )
+        .unwrap();
+        let cert = load_cert(&source).unwrap();
+        let fingerprint = Fingerprint::of_cert(&cert).unwrap();
+
+        // Replace the source after validation, at the boundary where authorize
+        // used to reopen it and publish an unrelated file's contents.
+        write_private(&secret, "must remain private").unwrap();
+        fs::remove_file(&source).unwrap();
+        std::os::unix::fs::symlink(&secret, &source).unwrap();
+        write_certificate(&destination, &cert).unwrap();
+
+        let written = fs::read_to_string(&destination).unwrap();
+        let sections = ::pem::parse_many(&written).unwrap();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].tag(), "CERTIFICATE");
+        assert_eq!(sections[0].contents(), cert.as_ref());
+        assert_eq!(written, cert_pem);
+        assert_eq!(
+            Fingerprint::of_cert(&load_cert(&destination).unwrap()).unwrap(),
+            fingerprint
+        );
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn certificate_loading_rejects_a_malformed_later_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("submitted.crt");
+        let (cert_pem, _) = generate_identity("test", &["localhost".into()], 30).unwrap();
+        write_public(
+            &source,
+            &format!("{cert_pem}-----BEGIN CERTIFICATE-----\n!\n-----END CERTIFICATE-----\n"),
+        )
+        .unwrap();
+        assert!(load_cert(&source).is_err());
+    }
+
+    #[test]
+    fn certificate_parsing_rejects_trailing_der_bytes_everywhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("submitted.crt");
+        let destination = dir.path().join("authorized.crt");
+        let (cert_pem, _) = generate_identity("test", &["localhost".into()], 30).unwrap();
+        let cert = cert_from_pem(&cert_pem).unwrap();
+        let mut bytes = cert.as_ref().to_vec();
+        bytes.extend_from_slice(b"unvalidated trailing bytes");
+        let tainted = CertificateDer::from(bytes.clone());
+        let tainted_pem = ::pem::encode(&::pem::Pem::new("CERTIFICATE", bytes));
+        write_public(&source, &tainted_pem).unwrap();
+
+        assert!(load_cert(&source).is_err());
+        assert!(Fingerprint::of_cert(&tainted).is_err());
+        assert!(write_certificate(&destination, &tainted).is_err());
+        assert!(!destination.exists());
+        assert!(check_validity(&tainted, UnixTime::now()).is_err());
     }
 
     #[test]

@@ -303,9 +303,6 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
         kill_session_processes: args.kill_session_processes,
     };
 
-    let pem = std::fs::read_to_string(&args.certificate)
-        .with_context(|| format!("reading {}", args.certificate.display()))?;
-
     // Policy first, certificate second — the order matters for what a reload
     // landing between the two writes can see.
     //
@@ -326,7 +323,7 @@ fn authorize(paths: &ServerPaths, args: Authorize) -> Result<()> {
             toml::to_string_pretty(&meta)?
         ),
     )?;
-    crypto::write_public(&cert_path, &pem)?;
+    crypto::write_certificate(&cert_path, &cert)?;
 
     if let Some(old) = &replaced {
         remove_entry(&dir, old)?;
@@ -441,4 +438,60 @@ fn hostname() -> String {
         .ok()
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "localhost".into())
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "test failures should identify violated invariants"
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authorize_publishes_only_the_certificate_bound_to_its_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ServerPaths::new(dir.path().join("server"));
+        let source = dir.path().join("submitted.crt");
+        let (cert_pem, key_pem) =
+            crypto::generate_identity("client", &["localhost".into()], 30).unwrap();
+        crypto::write_private(
+            &source,
+            &format!("{cert_pem}{key_pem}\nprivate trailing text\n"),
+        )
+        .unwrap();
+        let original = crypto::load_cert(&source).unwrap();
+        let fingerprint = Fingerprint::of_cert(&original).unwrap();
+        let user = nix::unistd::User::from_uid(nix::unistd::getuid())
+            .unwrap()
+            .unwrap();
+
+        authorize(
+            &paths,
+            Authorize {
+                certificate: source,
+                user: user.name.clone(),
+                name: Some("client".into()),
+                no_shell: false,
+                no_exec: false,
+                commands: Vec::new(),
+                expires_in_days: None,
+                kill_session_processes: false,
+                force: false,
+            },
+        )
+        .unwrap();
+
+        let published = std::fs::read_to_string(paths.authorized().join("client.crt")).unwrap();
+        assert_eq!(published, cert_pem);
+        let sections = pem::parse_many(published).unwrap();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].tag(), "CERTIFICATE");
+        assert_eq!(sections[0].contents(), original.as_ref());
+        let store = AuthStore::load(&paths.authorized()).unwrap();
+        let entry = store.lookup(&fingerprint).unwrap();
+        assert_eq!(entry.meta.user, user.name);
+        assert_eq!(entry.meta.key_fingerprint, Some(fingerprint.to_string()));
+    }
 }

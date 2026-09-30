@@ -47,6 +47,7 @@ clap = { version = "4", features = ["derive"] }
 dirs = "6"
 libc = "0.2"
 nix = { version = "0.31", features = ["term", "process", "fs", "user", "signal", "poll", "hostname"] }
+pem = "3"
 # `default-features = false` keeps `heapless` out of the graph: it is only
 # needed for no_std targets and drags in the unmaintained `atomic-polyfill`.
 postcard = { version = "1", default-features = false, features = ["use-std"] }
