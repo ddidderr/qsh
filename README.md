@@ -374,12 +374,13 @@ at most two attempts at once, and an interleaved IPv6/IPv4 order. Each address
 gets its own connect timeout, so a dual-stack name still works when only one
 family is reachable.
 
-Host pins normalize DNS case, IP address spelling, numeric ports, and effective
-IPv6 scope IDs (`%0` is omitted; resolvable interface names share their numeric
-scope for comparison but remain stored by name). Existing equivalent entries
-with conflicting keys fail closed. A DNS name ending in `.` remains distinct:
-its absolute lookup must not be confused
-with resolver search-domain behavior. DNS aliases are not merged.
+Host pins normalize DNS case, IP address spelling, and numeric ports. Existing
+equivalent entries with conflicting keys fail closed. A DNS name ending in `.`
+remains distinct: its absolute lookup must not be confused with resolver search
+domain behavior. DNS aliases are not merged, and neither are IPv6
+interface-name and numeric-zone aliases (`fe80::1%eth0` and `fe80::1%2` are
+separate pins). An unpinned alias follows the configured first-connection
+policy.
 
 In an interactive session, `~.` at the start of a line disconnects locally and
 restores the terminal immediately, with exit status `255`; it does not wait for
