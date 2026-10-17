@@ -140,6 +140,16 @@ want globbing or redirection, ask for it explicitly:
 qsh server sh -c 'echo hello > /tmp/out'
 ```
 
+rsync 3.2.4 and later escape remote paths for the remote shell that ssh
+would start. qsh starts none, so a remote path with spaces or shell
+metacharacters would arrive with literal backslashes and name a different
+directory. Pass `-s` (`--secluded-args`), or set `RSYNC_PROTECT_ARGS=1`, and
+rsync sends the paths inside its own protocol instead:
+
+```
+rsync -e qsh -s -av ./data/ 'server:/backup/my data/'
+```
+
 ## Security model
 
 There is no password authentication, no PKI, and no CA. Both sides hold a

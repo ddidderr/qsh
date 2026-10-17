@@ -738,7 +738,7 @@ that fixed each one carries its ID.
 | F2 | P1 | After a NAT rebinding or address change a quiet client sends nothing until its 15 s keep-alive, so the session stalls that long | NET-04–06 | open, see below |
 | F3 | P2 | `qsh host cmd \| head` printed "Broken pipe" and exited 255 | EXEC-15 | fixed |
 | F4 | P2 | An oversized request failed with the encoder's "serialize buffer is full" | EXEC-17 | fixed |
-| F5 | P1 | rsync escapes remote paths for a shell; through qsh they arrived with literal backslashes | XFER-04 | open |
+| F5 | P1 | rsync escapes remote paths for a shell; through qsh they arrived with literal backslashes | XFER-04 | fixed (docs) |
 | F6 | P0 | rsync pulls failed: rsync gives the remote shell non-blocking pipes, and qsh treated `EAGAIN` as fatal | XFER-02 | fixed |
 | F7 | P1 | A root daemon left the session's terminal owned by root, so the user could not open it by name | SEC-09 | open |
 | F8 | P1 | Stopping or restarting the server sent no close, so clients hung for the idle timeout | OPS-04, NET-10 | open |
