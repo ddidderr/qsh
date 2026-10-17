@@ -902,12 +902,18 @@ impl EscapeState {
 
 /// The signals that would otherwise kill the client without unwinding.
 ///
-/// `SIGINT` is deliberately absent: in a PTY session Ctrl-C is just a byte for
-/// the remote terminal, and the local process should not act on it.
+/// `SIGINT` is among them: in raw mode Ctrl-C is a byte for the remote
+/// terminal, not a signal, so an INT can only come from outside (`kill -INT`,
+/// `timeout -s INT`, a supervisor), and its default action, like that of USR1,
+/// USR2 and ALRM, would leave the terminal raw.
 struct FatalSignals {
     term: tokio::signal::unix::Signal,
     hup: tokio::signal::unix::Signal,
     quit: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+    usr1: tokio::signal::unix::Signal,
+    usr2: tokio::signal::unix::Signal,
+    alrm: tokio::signal::unix::Signal,
 }
 
 impl FatalSignals {
@@ -921,6 +927,10 @@ impl FatalSignals {
             term: signal(SignalKind::terminate()).context("listening for SIGTERM")?,
             hup: signal(SignalKind::hangup()).context("listening for SIGHUP")?,
             quit: signal(SignalKind::quit()).context("listening for SIGQUIT")?,
+            int: signal(SignalKind::interrupt()).context("listening for SIGINT")?,
+            usr1: signal(SignalKind::user_defined1()).context("listening for SIGUSR1")?,
+            usr2: signal(SignalKind::user_defined2()).context("listening for SIGUSR2")?,
+            alrm: signal(SignalKind::alarm()).context("listening for SIGALRM")?,
         })
     }
 
@@ -930,6 +940,10 @@ impl FatalSignals {
             _ = self.term.recv() => libc::SIGTERM,
             _ = self.hup.recv() => libc::SIGHUP,
             _ = self.quit.recv() => libc::SIGQUIT,
+            _ = self.int.recv() => libc::SIGINT,
+            _ = self.usr1.recv() => libc::SIGUSR1,
+            _ = self.usr2.recv() => libc::SIGUSR2,
+            _ = self.alrm.recv() => libc::SIGALRM,
         };
         pty::restore_termios(fd, &saved);
         let mut stdout = tokio::io::stdout();

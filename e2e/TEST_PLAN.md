@@ -746,7 +746,7 @@ that fixed each one carries its ID.
 | F10 | P1 | A closed stderr made qsh panic (status 101) | EXEC-21 | fixed |
 | F11 | P2 | A missing remote program exited 126; shells and ssh say 127 | EXEC-12 | fixed |
 | F12 | P2 | A resize during session setup was never sent | PTY-14 | fixed |
-| F14 | P1 | An external SIGINT, SIGUSR1, SIGUSR2 or SIGALRM left the local terminal raw | PTY-15 | open |
+| F14 | P1 | An external SIGINT, SIGUSR1, SIGUSR2 or SIGALRM left the local terminal raw | PTY-15 | fixed |
 | F17 | P2 | The first-contact prompt rejected `YES` | SEC-11 | open |
 | F18 | P1 | An argument that is not valid UTF-8 made qsh panic (status 101), also under rsync | EXEC-23 | open |
 | F19 | P2 | Every exit, `~.` included, waited out QUIC's draining period: seconds on a long round trip | PTY-16 | open |
