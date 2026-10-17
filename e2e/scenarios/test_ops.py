@@ -210,6 +210,21 @@ def bring_back(server: QshServer) -> None:
     server.start()
 
 
+# systemd's catalogue IDs for "<unit>: Deactivated successfully." and "<unit>:
+# Failed with result ...", stable across versions and languages.
+UNIT_SUCCESS = "7ad2d189f7e94e70a38c781354912448"
+UNIT_FAILED = "d9b373ed55a64feb8242e02dbe79a49c"
+
+
+def unit_verdicts(server: QshServer, since: str) -> Counter:
+    """How often systemd logged each of those two verdicts on the unit after `since`."""
+    out = server.node.run(
+        ["journalctl", "--after-cursor", since, "-o", "export", f"UNIT={server.unit}.service"], check=True
+    ).stdout
+    found = re.findall(rf"^MESSAGE_ID=({UNIT_SUCCESS}|{UNIT_FAILED})$", out, re.M)
+    return Counter("success" if message == UNIT_SUCCESS else "failed" for message in found)
+
+
 @pytest.mark.plan("OPS-12")
 def test_sighup_stops_the_daemon_and_systemd_leaves_it_stopped(alice_fast, fast_server):
     """SIGHUP is not a reload: qsh-server exits, and stays down.
@@ -236,11 +251,18 @@ def test_sighup_stops_the_daemon_and_systemd_leaves_it_stopped(alice_fast, fast_
     proc = alice_fast.node.popen(argv, user="alice")
     try:
         node.wait_running(f"sleep {marker}", timeout=10)
+        since = fast_server.cursor()
         node.run(["kill", "-HUP", str(pid)], check=True)
         node.wait_for(f"! systemctl is-active --quiet {unit}", timeout=20)
         # A restart would be scheduled RestartSec=2 after the exit. Proving
         # that none comes takes waiting past that point.
         time.sleep(5)
+        # systemd's verdict is in its journal. A unit that exited cleanly, is
+        # not enabled and that nothing refers to is unloaded right after, so
+        # the properties below are an unloaded unit's defaults: they show
+        # that it is neither failed (a failed unit stays loaded) nor running
+        # again, not what systemd thought of the exit.
+        assert unit_verdicts(fast_server, since) == Counter(success=1), unit_verdicts(fast_server, since)
         state = unit_state(fast_server, "ActiveState", "SubState", "Result", "MainPID")
         assert state == {"ActiveState": "inactive", "SubState": "dead", "Result": "success", "MainPID": "0"}, state
         assert node.run(["sh", "-c", f"ss -Hlun 'sport = :{PORT}' | grep -q ."]).rc != 0, "something still listens"
