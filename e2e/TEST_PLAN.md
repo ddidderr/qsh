@@ -397,8 +397,10 @@ fails until the mark is removed, so a fix cannot go unnoticed.
 - **Expected:** a 30 s outage is survived; a 90 s one ends both sides. Detection takes idle timeout plus up to one keep-alive interval (60–75 s).
 
 ### NET-16 — One-way outages
-- **Status:** planned · **Priority:** P1 · **Needs:** netsim with per-direction black holes
-- **Expected:** both sides give up within about twice the idle timeout; the side that still hears its peer does not stay up indefinitely.
+- **Status:** automated · **Priority:** P1 · **Needs:** netsim, server2
+- **Steps:** a session on server2 (8 s idle timeout, 2 s keep-alives) whose client writes a line to stdin every 0.25 s, into `cat` beside `sleep MARKER`; then netsim drops one direction only (`blackhole_up`, client to server, or `blackhole_down`). The relay's counters confirm that the other direction kept carrying traffic.
+- **Expected:** the client exits 255 with "timed out" and the remote job is gone, both within twice the idle timeout plus 8 s. The deaf side's idle timer runs from the last packet it received, so it gives up after one idle timeout and falls silent; the side that still hears its peer hears it until then and gives up one idle timeout later. QUIC restarts the idle timer on every packet received but on a send only for the first ack-eliciting packet since the last receipt (RFC 9000, section 10.1), so talking does not keep a side alive. Measured: client to server dropped, remote job gone after 9.8 s and client exit after 17.7 to 18.2 s; server to client dropped, client exit after 8.3 s and remote job gone after 18.0 s (two runs each). Against `server` (60 s idle timeout), neither side gives up within that bound, which is the failure the test catches.
+- **Why the stdin lines:** QUIC acknowledges only ack-eliciting packets, so with a quiet `sleep` session a server-to-client cut leaves the client silent too, and the server hears nothing either (measured: both sides about 8 s).
 
 ### NET-17 — The path MTU drops mid-session
 - **Status:** planned · **Priority:** P2 · **Needs:** netsim with a datagram size limit

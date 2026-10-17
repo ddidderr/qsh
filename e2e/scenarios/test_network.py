@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import shlex
 import time
 
 import pytest
@@ -27,6 +28,11 @@ def lines_ok(out: bytes, count: int) -> bool:
 def start(client, host, *command, port=None, options=()):
     argv = client.argv(host, *command, port=port, options=options)
     return client.node.popen(argv, user=client.user)
+
+
+def pipeline(client, script: str):
+    """Start a local bash pipeline as the client's account; it fails if any part does."""
+    return client.node.popen(["bash", "-o", "pipefail", "-c", script], user=client.user)
 
 
 @pytest.mark.plan("NET-01")
@@ -305,3 +311,63 @@ def test_outage_tolerance_with_the_default_timeouts(alice, server, make_link):
     assert proc.returncode == 255, err.decode()
     # Idle timeout plus up to one keep-alive interval, then the HUP/TERM/KILL ladder.
     server.node.wait_gone(f"sleep {marker}", timeout=60)
+
+
+# A one-way outage leaves one side deaf while the other still hears it. The
+# deaf side's idle timer runs from the last packet it received, so it gives up
+# after one idle timeout and falls silent; the other side hears it until then
+# and gives up one idle timeout later. QUIC restarts the idle timer on every
+# packet received, but on a send only for the first ack-eliciting packet since
+# the last receipt (RFC 9000, section 10.1): talking cannot keep a side alive.
+ONE_WAY_LIMIT = 2 * FAST_IDLE_TIMEOUT + 8
+
+
+def seconds(elapsed: float | None) -> str:
+    return "never" if elapsed is None else f"{elapsed:.1f}s"
+
+
+@pytest.mark.plan("NET-16")
+@pytest.mark.parametrize("dead", ["up", "down"])
+def test_a_one_way_outage_ends_both_sides(dead, alice_fast, fast_server, make_link):
+    """Only one direction of the path dies: "up" (client -> server) or "down".
+
+    Both directions carry traffic until the cut: the client streams a tick on
+    stdin every 0.25 s and server2 sends keep-alives every 2 s. So the side
+    that still hears its peer really goes on hearing it, and must still give up.
+    """
+    link = make_link("server2:2222")
+    alice_fast.pin(link.host, fast_server.fp, port=link.port)
+    marker = {"up": "4646.25", "down": "4646.5"}[dead]
+    remote = alice_fast.argv("netsim", "sh", "-c", f"cat >/dev/null & exec sleep {marker}", port=link.port)
+    proc = pipeline(alice_fast, f"while :; do echo tick; sleep 0.25; done | {shlex.join(remote)}")
+    try:
+        fast_server.node.wait_running(f"sleep {marker}", timeout=10)
+        time.sleep(1)
+        before = link.stats()["stats"]
+        link.blackhole(True, direction=dead)
+        cut = time.monotonic()
+        client_gone = server_gone = None
+        while client_gone is None or server_gone is None:
+            now = time.monotonic() - cut
+            if client_gone is None and proc.poll() is not None:
+                client_gone = now
+            if server_gone is None and not fast_server.node.pids(f"sleep {marker}"):
+                server_gone = now
+            if now > ONE_WAY_LIMIT + 10:
+                break
+            time.sleep(0.2)
+        after = link.stats()["stats"]
+    finally:
+        if proc.poll() is None:
+            alice_fast.node.kill_command(alice_fast.user, remote)
+        _, err = proc.communicate(timeout=30)
+    times = f"client gone after {seconds(client_gone)}, remote job after {seconds(server_gone)}"
+    print(f"{dead} dead: {times}")
+    heard = "down" if dead == "up" else "up"
+    assert after[dead]["dropped"] > before[dead]["dropped"], after
+    # The open direction kept carrying the hearing side's peer: one-way, really.
+    assert after[heard]["forwarded"] > before[heard]["forwarded"], after
+    assert client_gone is not None and client_gone < ONE_WAY_LIMIT, times
+    assert server_gone is not None and server_gone < ONE_WAY_LIMIT, times
+    assert proc.returncode == 255, err.decode()
+    assert "timed out" in err.decode(), err.decode()

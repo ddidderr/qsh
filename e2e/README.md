@@ -139,3 +139,6 @@ Some lessons the first scenarios taught:
 - Put shared state back in `finally`: a scenario that fails half way
   through (a rotated host key, an edited configuration) must not take
   later scenarios down with it.
+- QUIC acknowledges only packets that ask for it, and a quiet client asks
+  for nothing. To test what one side does while it still hears the other
+  (a one-way outage), give that other side something to send.
