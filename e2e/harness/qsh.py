@@ -237,8 +237,16 @@ class NetLink:
     def reset(self) -> dict:
         return self.ctl("reset")
 
-    def blackhole(self, on: bool) -> dict:
-        return self.ctl("blackhole", "on" if on else "off")
+    def blackhole(self, on: bool, direction: str = "both") -> dict:
+        """Drop everything, or only "up" (client -> target) or "down" traffic.
+
+        The three are separate settings: turning "up" off leaves a "both"
+        black hole in place, and the other way round.
+        """
+        args = ["blackhole", "on" if on else "off"]
+        if direction != "both":
+            args += ["--direction", direction]
+        return self.ctl(*args)
 
     def rebind(self, source_ip: str | None = None) -> dict:
         args = ["rebind"]

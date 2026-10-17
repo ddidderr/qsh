@@ -12,9 +12,17 @@ own. The server therefore sees the relay's address, and `rebind` can change
 that address mid-flow, which is exactly what a NAT rebinding or a client that
 changed networks looks like to the server.
 
+"up" is client -> target, "down" is target -> client. A black hole or a
+datagram size limit can apply to one direction only: a one-way outage, or a
+path whose MTU shrank on one leg. The size limit drops silently, the way a
+router that sends no ICMP "fragmentation needed" does, and it counts UDP
+payload bytes, the size QUIC calls a datagram.
+
     netsim serve --name lossy --listen 4433 --target server:2222 --loss 0.05
     netsim ctl --name lossy set delay_ms=80 jitter_ms=20 reorder=0.02
     netsim ctl --name lossy blackhole on
+    netsim ctl --name lossy blackhole on --direction up
+    netsim ctl --name lossy set max_datagram=1252
     netsim ctl --name lossy rebind --source-ip 172.18.0.250
     netsim ctl --name lossy stats
     kill "$(cat /run/netsim/lossy.pid)"
@@ -39,6 +47,17 @@ from dataclasses import asdict, dataclass, field
 
 CONTROL_DIR = "/run/netsim"
 
+# Receive and send buffer of every socket the relay opens. With the kernel's
+# default (208 KiB, about 140 full-size QUIC datagrams) a fast sender's burst
+# overflows the relay's receive buffer while Python catches up, and the kernel
+# drops datagrams that no impairment asked for: on a long path the sender's
+# congestion control then takes seconds to recover, and the relay, not the
+# path, sets the throughput. SO_RCVBUFFORCE needs CAP_NET_ADMIN, which the
+# netsim node has; without it the kernel caps the size at net.core.rmem_max.
+SOCKET_BUFFER = 16 * 1024 * 1024
+SO_RCVBUFFORCE = getattr(socket, "SO_RCVBUFFORCE", 33)  # the Linux values
+SO_SNDBUFFORCE = getattr(socket, "SO_SNDBUFFORCE", 32)
+
 # Impairment settings a `set` request may change, with their types.
 SETTINGS = {
     "loss": float,  # probability that a datagram is dropped, per direction
@@ -48,6 +67,11 @@ SETTINGS = {
     "reorder_ms": float,  # how long a held-back datagram waits
     "duplicate": float,  # probability that a datagram is sent twice
     "blackhole": bool,  # drop everything, both directions
+    "blackhole_up": bool,  # drop everything client -> target
+    "blackhole_down": bool,  # drop everything target -> client
+    "max_datagram": int,  # drop datagrams larger than this, both directions; 0: no limit
+    "max_datagram_up": int,  # the same, client -> target only
+    "max_datagram_down": int,  # the same, target -> client only
 }
 
 
@@ -60,14 +84,43 @@ class Impairment:
     reorder_ms: float = 25.0
     duplicate: float = 0.0
     blackhole: bool = False
+    blackhole_up: bool = False
+    blackhole_down: bool = False
+    max_datagram: int = 0
+    max_datagram_up: int = 0
+    max_datagram_down: int = 0
+
+    def blackholed(self, direction: str) -> bool:
+        return self.blackhole or getattr(self, f"blackhole_{direction}")
+
+    def size_limit(self, direction: str) -> int:
+        """The largest datagram that may travel `direction`, 0 for any size."""
+        limits = [n for n in (self.max_datagram, getattr(self, f"max_datagram_{direction}")) if n > 0]
+        return min(limits, default=0)
 
 
 @dataclass
 class Counters:
     forwarded: int = 0
-    dropped: int = 0
+    dropped: int = 0  # every datagram not forwarded, oversized ones included
     duplicated: int = 0
     reordered: int = 0
+    oversized: int = 0  # dropped for exceeding the size limit
+    largest: int = 0  # the largest datagram forwarded so far
+    # Bytes waiting out the delay now, and the most at any one time. All of
+    # them are in flight for the sender, so on a path whose delay dominates
+    # the round trip, max_delayed shows how far the sender's window opened.
+    delayed: int = 0
+    max_delayed: int = 0
+
+
+def enlarge_buffers(transport: asyncio.DatagramTransport) -> None:
+    sock = transport.get_extra_info("socket")
+    for forced, plain in ((SO_RCVBUFFORCE, socket.SO_RCVBUF), (SO_SNDBUFFORCE, socket.SO_SNDBUF)):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, forced, SOCKET_BUFFER)
+        except OSError:
+            sock.setsockopt(socket.SOL_SOCKET, plain, SOCKET_BUFFER)
 
 
 @dataclass
@@ -98,19 +151,23 @@ class Link:
         """Apply the current impairment to one datagram travelling `direction`."""
         imp = self.imp
         counters: Counters = getattr(self.stats, direction)
-        dropped = imp.blackhole or (imp.loss > 0 and self.rng.random() < imp.loss)
+        limit = imp.size_limit(direction)
+        oversized = 0 < limit < len(data)
+        dropped = imp.blackholed(direction) or oversized or (imp.loss > 0 and self.rng.random() < imp.loss)
         if self.trace:
             # QUIC's first byte says long (handshake) or short (1-RTT) header.
             kind = "long" if data and data[0] & 0x80 else "short"
             print(
                 f"{time.monotonic() - self.started:9.3f} {direction:4} {len(data):5} {kind}"
-                f"{' DROP' if dropped else ''}",
+                f"{' DROP' if dropped else ''}{' oversized' if oversized else ''}",
                 file=sys.stderr,
                 flush=True,
             )
         if dropped:
             counters.dropped += 1
+            counters.oversized += int(oversized)
             return
+        counters.largest = max(counters.largest, len(data))
         copies = 1
         if imp.duplicate > 0 and self.rng.random() < imp.duplicate:
             copies = 2
@@ -126,7 +183,15 @@ class Link:
             if delay <= 0:
                 send(data)
             else:
-                asyncio.get_running_loop().call_later(delay / 1000, send, data)
+                counters.delayed += len(data)
+                counters.max_delayed = max(counters.max_delayed, counters.delayed)
+                asyncio.get_running_loop().call_later(delay / 1000, self.release, counters, send, data)
+
+    @staticmethod
+    def release(counters: Counters, send, data: bytes) -> None:
+        """Send a datagram whose delay is over."""
+        counters.delayed -= len(data)
+        send(data)
 
     def from_client(self, data: bytes, addr: tuple[str, int]) -> None:
         flow = self.flows.get(addr)
@@ -169,6 +234,7 @@ class Flow:
         transport, _ = await loop.create_datagram_endpoint(
             lambda: Upstream(self), local_addr=local, remote_addr=self.link.target
         )
+        enlarge_buffers(transport)
         old, self.upstream = self.upstream, transport
         if old is not None:
             old.close()
@@ -285,9 +351,10 @@ async def serve(args: argparse.Namespace) -> None:
     link.source_ip = args.source_ip
 
     loop = asyncio.get_running_loop()
-    await loop.create_datagram_endpoint(
+    listener, _ = await loop.create_datagram_endpoint(
         lambda: Listener(link), local_addr=("0.0.0.0", args.listen)
     )
+    enlarge_buffers(listener)
     os.makedirs(CONTROL_DIR, exist_ok=True)
     path = control_path(args.name)
     if os.path.exists(path):
@@ -340,6 +407,10 @@ def main() -> int:
     csub.add_parser("reset", help="clear every impairment")
     cbh = csub.add_parser("blackhole", help="drop everything (on) or nothing (off)")
     cbh.add_argument("state", choices=["on", "off"])
+    cbh.add_argument(
+        "--direction", choices=["both", "up", "down"], default="both",
+        help="up: client -> target only; down: target -> client only",
+    )
     crb = csub.add_parser("rebind", help="move every flow to a new upstream port")
     crb.add_argument("--source-ip", help="also move to this local IP ('' for any)")
     csub.add_parser("stats", help="print counters as JSON")
@@ -356,7 +427,8 @@ def main() -> int:
         values = dict(item.split("=", 1) for item in args.values)
         request = {"cmd": "set", "values": values}
     elif args.action == "blackhole":
-        request = {"cmd": "set", "values": {"blackhole": args.state}}
+        key = "blackhole" if args.direction == "both" else f"blackhole_{args.direction}"
+        request = {"cmd": "set", "values": {key: args.state}}
     elif args.action == "rebind":
         request = {"cmd": "rebind", "source_ip": args.source_ip}
     else:

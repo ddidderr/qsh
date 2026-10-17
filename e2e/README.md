@@ -86,10 +86,15 @@ accounts `alice` (with supplementary group `project`), `bob`, `carol` and
 - **netsim** runs [netsim.py](netsim/netsim.py), a UDP relay with a control
   socket. One relay process is one link, created per scenario on its own
   port: `client → netsim:PORT → server`. It applies loss, delay, jitter,
-  reordering, duplication, a total black hole, and can move a flow to a new
-  source port or address (what a NAT rebinding or a roaming client looks like
-  to the server). `--trace` logs every datagram. Userspace, not `tc netem`,
-  so it behaves the same on every kernel Docker runs on.
+  reordering, duplication, a black hole in both directions or in one, and a
+  datagram size limit (a path MTU that shrinks without ICMP), and can move a
+  flow to a new source port or address (what a NAT rebinding or a roaming
+  client looks like to the server). `--trace` logs every datagram with its
+  size. Userspace, not `tc netem`, so it behaves the same on every kernel
+  Docker runs on. Its sockets have 16 MiB buffers, so the kernel does not
+  drop a fast sender's burst before the relay gets to it, and its counters
+  say how many bytes its delay held at once: on a long path, how far the
+  sender's window opened.
 
 The compose project name and subnet are chosen per run, so several runs can
 coexist on one Docker host.
@@ -138,3 +143,14 @@ Some lessons the first scenarios taught:
 - Put shared state back in `finally`: a scenario that fails half way
   through (a rotated host key, an edited configuration) must not take
   later scenarios down with it.
+- QUIC acknowledges only packets that ask for it, and a quiet client asks
+  for nothing. To test what one side does while it still hears the other
+  (a one-way outage), give that other side something to send.
+- A qsh client that gives up on a handshake sends a close, and the close
+  frees the server's slot. To hold a slot the way a stranger would, drop
+  the server's padded first flight (`max_datagram_down=1150`) and then
+  everything towards the server, as SEC-14 does.
+- The server ignores an Initial over a handshake limit, and quinn sends it
+  again about 1 s later, then 2, 4 and 8 s after that. Start a burst with
+  `harness.env.Burst`, not one `docker exec` per client, and give the path
+  some delay, so that a slot outlives the burst's start.

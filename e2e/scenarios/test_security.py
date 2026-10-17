@@ -6,10 +6,12 @@ Each scenario names the actor from THREAT_MODEL.md it plays.
 from __future__ import annotations
 
 import re
+import threading
 import time
 
 import pytest
 
+from harness.env import Burst
 from harness.terminal import Terminal
 
 
@@ -243,3 +245,112 @@ def test_capabilities_added_to_the_unit_never_reach_sessions(alice_fast, fast_se
     finally:
         fast_server.node.sh(f"rm -rf {dropin} && systemctl daemon-reload")
         fast_server.restart()
+
+
+# SEC-14. The server takes at most 32 handshakes at once (MAX_HANDSHAKES in
+# src/server.rs), at most 4 from one address, so filling the pool takes 8
+# addresses. netsim gives each of 8 links a source address of its own, and
+# each link drops datagrams over 1,150 bytes towards the client: the server's
+# padded first flight never arrives, its Retry and its close do. Once the
+# attempts hold their slots, the links drop everything towards the server as
+# well: each stranger answered the Retry and then fell silent, and not even
+# its client's eventual close can free a slot. Only the server's 5 s deadline
+# (HANDSHAKE_GRACE) can.
+POOL_ADDRESSES = 8
+PER_ADDRESS = 4
+HANDSHAKE_DEADLINE = 5
+CONNECT_TIMEOUT = 10  # the client's default
+
+
+@pytest.mark.plan("SEC-14")
+def test_the_handshake_pool_filled_from_many_addresses(make_client, alice, server, env, make_link):
+    """Actor 1 holds all 32 handshake slots from eight addresses for the 5 s deadline.
+
+    Established sessions must not notice, and every slot must come free at
+    the deadline. While the pool is full a new login cannot get in from any
+    address: THREAT_MODEL.md does not promise to survive a flood from many
+    addresses, and here that only proves the pool really was full.
+    """
+    netsim = env.node("netsim")
+    prefix = env.subnet().prefixlen
+    addresses = [env.spare_ip(30 + i) for i in range(POOL_ADDRESSES)]
+    stranger = make_client("bob", node="client2")  # authorized nowhere
+    session = None
+    try:
+        links = []
+        for ip in addresses:
+            netsim.run(["ip", "addr", "replace", f"{ip}/{prefix}", "dev", "eth0"], check=True)
+            link = make_link("server:2222", source_ip=ip, max_datagram_down=1150)
+            stranger.pin(link.host, server.fp, port=link.port)
+            links.append(link)
+        # An established session that prints a line every 0.25 s for 15 s.
+        session = alice.node.popen(
+            alice.argv("server", "sh", "-c", "for i in $(seq 1 60); do echo $i; sleep 0.25; done"),
+            user=alice.user,
+        )
+        arrivals: list[float] = []
+        reader = threading.Thread(target=lambda: arrivals.extend(time.monotonic() for _ in session.stdout))
+        reader.start()
+        deadline = time.monotonic() + 10
+        while len(arrivals) < 4:
+            assert time.monotonic() < deadline and session.poll() is None, "the session did not start"
+            time.sleep(0.05)
+        since = server.cursor()
+        flood = Burst(
+            stranger.node,
+            [stranger.argv("netsim", "true", port=link.port) for link in links for _ in range(PER_ADDRESS)],
+            user=stranger.user,
+        )
+        flood.wait_launched()
+        flooded = time.monotonic()
+        time.sleep(1)  # 32 clients start, and each gets its Retry and a slot
+        probe = alice.node.popen(alice.argv("server", "echo", "PROBE", options=("--connect-timeout", "2")), user=alice.user)
+        names = " ".join(link.name for link in links)
+        netsim.sh(
+            f"pids=(); for n in {names}; do netsim ctl --name $n blackhole on --direction up >/dev/null & pids+=($!); done;"
+            ' for p in "${pids[@]}"; do wait "$p"; done'
+        )
+        probe_out, probe_err = probe.communicate(timeout=30)
+        probed = time.monotonic() - flooded
+        strangers = flood.wait(timeout=60)
+        begin = time.monotonic()
+        after = alice.run("server", "echo", "AFTER")
+        released = time.monotonic() - begin
+        session.wait(timeout=60)
+        reader.join(timeout=10)
+        time.sleep(1.5)  # the last admission counters reach the journal
+        journal = server.journal(since)
+    finally:
+        for ip in addresses:
+            netsim.run(["ip", "addr", "del", f"{ip}/{prefix}", "dev", "eth0"])
+        if session is not None and session.poll() is None:
+            session.kill()
+    print(
+        f"probe ended {probed:.1f}s into the flood: {probe_err.decode().strip()}; strangers ended after"
+        f" {min(x.took for x in strangers):.2f}-{max(x.took for x in strangers):.2f}s;"
+        f" a login after them took {released:.2f}s"
+    )
+    # The precondition: the pool is full, so no new login gets in.
+    assert probe.returncode == 255 and b"timed out after 2s" in probe_err, f"the pool was not full: {probe_out + probe_err}"
+    # Its last attempt came well before the strangers' deadline.
+    assert probed < HANDSHAKE_DEADLINE - 0.5, f"the probe ended {probed:.1f}s into the flood"
+    # Each slot was held until the server's deadline ended its handshake, not
+    # until the stranger's own timer ran out.
+    for x in strangers:
+        assert x.rc == 255 and f"timed out after {CONNECT_TIMEOUT}s" not in x.err, x
+        assert HANDSHAKE_DEADLINE - 1 < x.took < CONNECT_TIMEOUT - 2, x
+    # Every slot is free again at once.
+    assert after.rc == 0 and after.stdout == "AFTER\n", after.describe()
+    assert released < 2, f"a login after the flood took {released:.1f}s"
+    # All 32 strangers had a slot, and none of them got further.
+    failed = [int(n) for n in re.findall(r"(\d+) connection\(s\) failed to authenticate", journal)]
+    assert sum(failed) == POOL_ADDRESSES * PER_ADDRESS, journal
+    # The established session did not notice: every line, none of them late.
+    assert session.returncode == 0 and len(arrivals) == 60, (session.returncode, len(arrivals))
+    gaps = [b - a for a, b in zip(arrivals, arrivals[1:])]
+    assert max(gaps) < 1.5, f"a {max(gaps):.1f}s gap in the session's output"
+    # Summary lines only: none per attempt, none naming a stranger's address.
+    assert journal.count("\n") < POOL_ADDRESSES * PER_ADDRESS, journal
+    for ip in addresses:
+        assert not re.search(rf"(?<![\d.]){re.escape(ip)}(?![\d.])", journal), journal
+    assert server.is_active()

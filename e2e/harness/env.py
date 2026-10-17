@@ -11,6 +11,7 @@ import ipaddress
 import json
 import os
 import re
+import select
 import shlex
 import subprocess
 import time
@@ -289,6 +290,73 @@ class Node:
         info = json.loads(docker("inspect", self.container).stdout)[0]
         nets = info["NetworkSettings"]["Networks"]
         return nets[self.env.network]["IPAddress"]
+
+
+# Run by one process inside the node, so that every command starts within
+# milliseconds of the others: one `docker exec` per command would spread them
+# over seconds. It says "launched" once they all run, and prints one JSON
+# report when the last one has finished.
+BURST_SCRIPT = r"""
+import json, subprocess, sys, time
+argvs = json.loads(sys.argv[1])
+start = time.monotonic()
+procs = [
+    subprocess.Popen(a, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for a in argvs
+]
+print("launched", flush=True)
+ended = [None] * len(procs)
+while None in ended:
+    for i, p in enumerate(procs):
+        if ended[i] is None and p.poll() is not None:
+            ended[i] = time.monotonic() - start
+    time.sleep(0.005)
+report = []
+for p, took in zip(procs, ended):
+    out, err = p.communicate()
+    report.append({"rc": p.returncode, "took": took, "out": out.decode(errors="replace"),
+                   "err": err.decode(errors="replace")})
+print(json.dumps(report), flush=True)
+"""
+
+
+@dataclass
+class BurstResult:
+    rc: int
+    took: float  # seconds from the start of the burst to this command's exit
+    out: str
+    err: str
+
+
+class Burst:
+    """Many short commands started at the same moment on one node.
+
+    Their output is held in memory until all of them have finished, so keep
+    it small.
+    """
+
+    def __init__(self, node: Node, argvs: list[list[str]], *, user: str | None = None) -> None:
+        self.node = node
+        self.proc = node.popen(["python3", "-c", BURST_SCRIPT, json.dumps(argvs)], user=user)
+
+    def wait_launched(self, timeout: float = 30) -> None:
+        """Return once every command has been started."""
+        ready, _, _ = select.select([self.proc.stdout], [], [], timeout)
+        line = self.proc.stdout.readline() if ready else b""
+        if line.strip() != b"launched":
+            raise AssertionError(f"the burst on {self.node.service} did not start: {line!r}")
+
+    def wait(self, timeout: float = 120) -> list[BurstResult]:
+        """Wait for every command to finish; their results, in launch order."""
+        try:
+            self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            raise AssertionError(f"the burst on {self.node.service} ran longer than {timeout}s") from None
+        out = self.proc.stdout.read().decode().strip().splitlines()
+        if self.proc.returncode != 0 or not out:
+            raise AssertionError(f"the burst runner failed: {self.proc.stderr.read().decode()}")
+        return [BurstResult(**r) for r in json.loads(out[-1])]
 
 
 class Environment:
