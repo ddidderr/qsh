@@ -711,12 +711,12 @@ async fn handle_session(
         Ok(Ok(None)) => return Ok(()),
         Ok(Err(error)) => {
             let error = anyhow!(error).context("reading the qsh/1 session request");
-            refuse_session(send, invalid_request_diagnostic(&error)).await;
+            refuse_session(send, invalid_request_diagnostic(&error), 126).await;
             return Err(error);
         }
         Err(_) => {
             let error = anyhow!("client opened a session but sent no request within 10 seconds");
-            refuse_session(send, invalid_request_diagnostic(&error)).await;
+            refuse_session(send, invalid_request_diagnostic(&error), 126).await;
             return Err(error);
         }
     };
@@ -790,8 +790,8 @@ async fn handle_session(
         Ok(s) => s,
         Err(e) => {
             // Report the refusal in-band so the client can print it, then end
-            // the session with a shell-like "cannot execute" status.
-            refuse_session(send, bounded_diagnostic(&e)).await;
+            // the session with a shell-like status.
+            refuse_session(send, bounded_diagnostic(&e), refusal_status(&e)).await;
             return Err(e);
         }
     };
@@ -822,15 +822,22 @@ async fn handle_session(
     result
 }
 
-async fn refuse_session(send: quinn::SendStream, message: String) {
+/// A shell's status for a session that could not start: 127 when the program
+/// does not exist, which rsync and scripts recognise, 126 for anything else.
+fn refusal_status(error: &anyhow::Error) -> i32 {
+    if error.is::<child::ProgramNotFound>() {
+        127
+    } else {
+        126
+    }
+}
+
+async fn refuse_session(send: quinn::SendStream, message: String, code: i32) {
     let mut stream = SessionStream::new(send);
     let _ = tokio::time::timeout(SHUTDOWN_GRACE, async {
         let _ = stream.write(&Frame::Error(message)).await;
         let _ = stream
-            .write(&Frame::Exit(ExitStatus {
-                code: 126,
-                signal: None,
-            }))
+            .write(&Frame::Exit(ExitStatus { code, signal: None }))
             .await;
         stream.finish().await;
     })

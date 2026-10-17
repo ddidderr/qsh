@@ -430,7 +430,9 @@ returns you to your prompt.
 
 qsh exits with the remote command's exit status, `128+n` if it died from
 signal `n`, and `255` for its own failures — the same convention as ssh, which
-is what makes it a drop-in for scripts and for rsync.
+is what makes it a drop-in for scripts and for rsync. As from a shell, a
+remote program that does not exist gives `127`, and one that cannot be
+executed, or that the key may not run, gives `126`.
 
 ## Running under systemd
 
