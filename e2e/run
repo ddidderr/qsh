@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Entry point for the multi-host end-to-end suite. See e2e/README.md.
 #
-#   e2e/run build              build the node image (qsh compiled inside it)
+#   e2e/run build              build the node image (qsh, and the previous
+#                              release it pins, compiled inside it)
 #   e2e/run test [PYTEST...]   build, then run the scenarios
 #   e2e/run up                 start an environment to explore by hand
 #   e2e/run shell NODE [USER]  open a shell on a node of that environment
@@ -27,16 +28,44 @@ VENV="$OUT_DIR/venv"
 IMAGE=${QSH_E2E_IMAGE:-qsh-e2e-node:latest}
 MANUAL_PROJECT=qsh-e2e-manual
 
+# The previous release, built into the image next to the current one as
+# qsh-$PREVIOUS_VERSION and qsh-server-$PREVIOUS_VERSION for the upgrade and
+# version-skew scenarios (OPS-14, OPS-16). There are no release tags, so it is
+# pinned by commit: "qsh 1.0: SSH replacement over QUIC", 2026-08-12. Moving
+# the pin means renaming the version in e2e/harness/qsh.py as well, and
+# revisiting what those scenarios expect of the previous build
+# (e2e/scenarios/test_ops.py says what they rely on).
+PREVIOUS_COMMIT=22d41fbfe60c13905b6c62de5317ce0c7072a214
+PREVIOUS_VERSION=1.0
+
 die() { echo "e2e/run: $*" >&2; exit 2; }
 
 need() {
     command -v "$1" >/dev/null || die "$1 is required: $2"
 }
 
+# Export the previous release's tree for the image's `previous` build context.
+# A shallow clone (CI's checkout) lacks the commit, so fetch just that one.
+export_previous() {
+    need git "the previous release is exported from this repository"
+    local dir="$OUT_DIR/previous"
+    if ! git -C "$REPO_DIR" cat-file -e "$PREVIOUS_COMMIT^{commit}" 2>/dev/null; then
+        echo "e2e/run: fetching $PREVIOUS_COMMIT (qsh $PREVIOUS_VERSION)" >&2
+        git -C "$REPO_DIR" fetch --quiet --depth=1 origin "$PREVIOUS_COMMIT" \
+            || die "cannot fetch qsh $PREVIOUS_VERSION ($PREVIOUS_COMMIT) from origin"
+    fi
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    git -C "$REPO_DIR" archive "$PREVIOUS_COMMIT" | tar -x -C "$dir"
+}
+
 build() {
     need docker "install Docker (with the buildx/BuildKit and compose plugins)"
+    export_previous
     local args=(build -f "$E2E_DIR/docker/Dockerfile" -t "$IMAGE"
-        --build-arg "PROFILE=${QSH_E2E_PROFILE:-release}")
+        --build-arg "PROFILE=${QSH_E2E_PROFILE:-release}"
+        --build-context "previous=$OUT_DIR/previous"
+        --build-arg "PREVIOUS_VERSION=$PREVIOUS_VERSION")
     if [ -n "${QSH_E2E_BASE_IMAGE:-}" ]; then
         args+=(--build-arg "BASE_IMAGE=$QSH_E2E_BASE_IMAGE")
     fi

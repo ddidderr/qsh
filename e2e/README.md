@@ -72,6 +72,16 @@ the image's Debian release, the shipped
 accounts `alice` (with supplementary group `project`), `bob`, `carol` and
 `dave`.
 
+The image also carries the previous release, for the upgrade and
+version-skew scenarios (OPS-14, OPS-16): `qsh-1.0` and `qsh-server-1.0` next
+to the current binaries, and the unit 1.0 shipped in
+`/usr/local/share/qsh-e2e/`. There are no release tags, so
+[run](run) pins its commit (`PREVIOUS_COMMIT`): `e2e/run build` exports that
+commit's tree with `git archive`, fetching just that commit first when the
+checkout is shallow (as CI's is), and hands it to the build as the `previous`
+context. A separate build stage compiles it with its own `Cargo.lock` and
+caches.
+
 - **server** boots systemd as PID 1 and runs `qsh-server` exactly as the
   README's setup describes: `keygen` as root into `/etc/qsh`, the unit
   started with `systemctl`. It sees a pure cgroup v2 hierarchy (see

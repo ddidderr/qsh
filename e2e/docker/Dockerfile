@@ -1,12 +1,17 @@
 # syntax=docker/dockerfile:1
 #
 # One image for every node of the end-to-end environment: servers, clients
-# and the network simulator. Build it from the repository root:
+# and the network simulator. Build it from the repository root, with the
+# previous release's source tree as the `previous` build context:
 #
-#   docker build -f e2e/docker/Dockerfile -t qsh-e2e-node .
+#   mkdir /tmp/previous
+#   git archive PREVIOUS_COMMIT | tar -x -C /tmp/previous
+#   docker build -f e2e/docker/Dockerfile --build-context previous=/tmp/previous \
+#       -t qsh-e2e-node .
 #
-# `e2e/run build` does that, and also forwards a proxy and an extra CA
-# certificate when the build host needs them (see e2e/README.md).
+# `e2e/run build` does that with the commit it pins (PREVIOUS_COMMIT there),
+# and also forwards a proxy and an extra CA certificate when the build host
+# needs them (see e2e/README.md).
 
 # Pinned so a rebuild months from now produces the same environment. Update
 # them deliberately, as with the CI action pins.
@@ -33,6 +38,30 @@ RUN --mount=type=secret,id=extra_ca,required=false,mode=0444 \
     && cargo build --locked --bins --profile "$PROFILE" \
     && dir=$([ "$PROFILE" = dev ] && echo debug || echo "$PROFILE") \
     && install -D -m 0755 "target/$dir/qsh" "target/$dir/qsh-server" -t /out/
+
+# ---------------------------------------------------------------- previous
+#
+# The previous release, for the upgrade and version-skew scenarios (OPS-14,
+# OPS-16). The `previous` build context is its source tree; e2e/run says which
+# commit that is and passes its version. It builds with its own Cargo.lock
+# and its own caches, so the two builds never trade dependency or target
+# state, and its binaries carry the version as a suffix next to the current
+# ones: qsh-1.0 and qsh-server-1.0.
+FROM ${RUST_IMAGE} AS build-previous
+ARG PROFILE=release
+ARG PREVIOUS_VERSION=1.0
+WORKDIR /src
+COPY --from=previous Cargo.toml Cargo.lock ./
+COPY --from=previous src ./src
+RUN --mount=type=secret,id=extra_ca,required=false,mode=0444 \
+    --mount=type=cache,id=qsh-e2e-previous-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=qsh-e2e-previous-target,target=/src/target \
+    if [ -s /run/secrets/extra_ca ]; then export CARGO_HTTP_CAINFO=/run/secrets/extra_ca; fi \
+    && find src -name '*.rs' -exec touch {} + \
+    && cargo build --locked --bins --profile "$PROFILE" \
+    && dir=$([ "$PROFILE" = dev ] && echo debug || echo "$PROFILE") \
+    && install -D -m 0755 "target/$dir/qsh" "/out/qsh-$PREVIOUS_VERSION" \
+    && install -D -m 0755 "target/$dir/qsh-server" "/out/qsh-server-$PREVIOUS_VERSION"
 
 # ---------------------------------------------------------------- node
 FROM ${BASE_IMAGE} AS node
@@ -82,8 +111,12 @@ RUN groupadd --gid 2000 project \
     && useradd --create-home --shell /bin/sh   --uid 1004 dave
 
 COPY --from=build /out/qsh /out/qsh-server /usr/local/bin/
+COPY --from=build-previous /out/ /usr/local/bin/
 # The unit exactly as shipped: the suite tests the documented deployment.
 COPY contrib/qsh-server.service /etc/systemd/system/qsh-server.service
+# The unit the previous release shipped, for upgrading a host set up by it.
+ARG PREVIOUS_VERSION=1.0
+COPY --from=previous contrib/qsh-server.service /usr/local/share/qsh-e2e/qsh-server-${PREVIOUS_VERSION}.service
 COPY e2e/netsim/netsim.py /usr/local/bin/netsim
 COPY e2e/docker/node-entrypoint.sh /usr/local/sbin/node-entrypoint
 
