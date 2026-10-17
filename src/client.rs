@@ -71,6 +71,8 @@ impl std::fmt::Display for AddressFamily {
 const IDLE_TIMEOUT_SECS: u64 = 60;
 /// Keep-alive interval for an established session.
 const KEEPALIVE_SECS: u64 = 15;
+/// How long a finished session lingers so that its close can leave.
+const CLOSE_GRACE: Duration = Duration::from_millis(250);
 /// Default deadline for reaching one address.
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
@@ -252,7 +254,10 @@ pub async fn run(mut opts: Options) -> Result<i32> {
 
     let status = session(&conn, &opts).await;
     conn.close(0u32.into(), b"bye");
-    endpoint.wait_idle().await;
+    // The close goes out at once. Waiting for the whole draining period (three
+    // PTOs) would hold the caller's prompt for seconds on a long round trip,
+    // `~.` included, with nothing left to deliver.
+    let _ = tokio::time::timeout(CLOSE_GRACE, endpoint.wait_idle()).await;
     status
 }
 
