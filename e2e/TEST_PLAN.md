@@ -698,27 +698,27 @@ commit that fixed it.
 ## CLI — client conventions
 
 ### CLI-01 — Usage, help and version
-- **Status:** planned · **Priority:** P2 · **Needs:** —
+- **Status:** automated · **Priority:** P2 · **Needs:** —
 - **Expected:** bare `qsh` prints usage and exits 255; `--help` exits 0; `--version` prints `qsh …`.
 
 ### CLI-02 — `keygen` writes a private key and refuses to overwrite
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** `id.key` 0600; a second `keygen` refuses without `--force`; `fingerprint` matches.
 
 ### CLI-03 — `known-hosts` add, list, remove, with normalization
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** a pin added as `SERVER:2222` serves `server` under `--refuse-new`; after `remove` the connection is refused.
 
 ### CLI-04 — Adding a pin replaces the old one and fails closed
-- **Status:** planned · **Priority:** P1 · **Needs:** server2
+- **Status:** automated · **Priority:** P1 · **Needs:** server2
 - **Expected:** `known-hosts add` for an equivalent spelling (`SERVER:2222`) replaces the existing pin under the canonical name, as `list` shows; a connection to the real server then refuses its key. (Whether `add` should refuse to replace silently is an open item.)
 
 ### CLI-05 — `-q` silences qsh's own messages
-- **Status:** planned · **Priority:** P2 · **Needs:** —
+- **Status:** automated · **Priority:** P2 · **Needs:** —
 - **Expected:** "permanently added" appears without `-q` and nothing with it.
 
 ### CLI-06 — `QSH_HOME` selects the identity directory
-- **Status:** planned · **Priority:** P2 · **Needs:** —
+- **Status:** automated · **Priority:** P2 · **Needs:** —
 - **Expected:** the session authenticates with that directory's key.
 
 ### CLI-07 — Divergences from OpenSSH that scripts may hit
