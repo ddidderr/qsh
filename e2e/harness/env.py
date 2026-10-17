@@ -268,7 +268,17 @@ class Node:
         What a disk would keep survives (the container's own files: /etc,
         /var); the tmpfs mounts (/run, /tmp) and every process do not.
         systemd gets 30 s to shut down cleanly before Docker kills it.
+
+        The journal is moved to /var/log/journal first, so that the node's
+        end-of-run journal still holds what came before the reboot: the
+        Ubuntu base stores it there by default (`Storage=persistent`), but
+        with systemd's own default, `Storage=auto`, it stays in /run unless
+        that directory exists. The node keeps its IP address but may come
+        back with another MAC address (it does on Docker 29); the other
+        nodes' neighbour entries followed at once here, and the kernel
+        re-resolves a stale one within seconds in any case.
         """
+        self.run(["sh", "-c", "mkdir -p /var/log/journal && journalctl --flush"], check=True)
         docker("restart", "-t", "30", self.container, timeout=timeout)
         self.wait_booted(timeout)
 
