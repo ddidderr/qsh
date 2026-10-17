@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+import shlex
 import time
 
 import pytest
@@ -185,3 +187,80 @@ def test_a_crowd_behind_one_address_gets_in_four_at_a_time(connect_timeout, make
     refused = [int(n) for n in re.findall(r"refused (\d+) connection\(s\) over the concurrency limit", journal)]
     assert sum(refused) >= len(failed) and len(refused) <= connect_timeout + 3, journal
 
+
+# quinn-proto 0.11's default stream receive window: 12,500 kB/s at an expected
+# 100 ms round trip (TransportConfig::default). src/net.rs raises it to 8 MiB
+# (STREAM_WINDOW), and the connection's windows to 32 MiB, so that one stream
+# can fill a long fat path. A sender can never have more than a window of a
+# stream in flight, so a window caps a stream at window / RTT.
+QUINN_DEFAULT_STREAM_WINDOW = 1_250_000
+LONG_FAT_DELAY_MS = 200  # each way: a 400 ms round trip
+LONG_FAT_RTT = 2 * LONG_FAT_DELAY_MS / 1000
+DEFAULT_WINDOW_CEILING = QUINN_DEFAULT_STREAM_WINDOW / LONG_FAT_RTT  # 3.1 MB/s
+LONG_FAT_COUNT = 15_000_000  # `seq 1 15000000` writes 123.9 MB
+
+# Reads a stream to its end, hashes it, and notes when the first byte and each
+# quarter arrived, so the rate can be measured after slow start is over.
+METER = """
+import hashlib, json, sys, time
+total = int(sys.argv[1])
+digest, got, marks = hashlib.sha256(), 0, []
+while chunk := sys.stdin.buffer.read1(1 << 20):
+    if not marks:
+        marks.append(time.monotonic())
+    digest.update(chunk)
+    got += len(chunk)
+    while len(marks) < 5 and got >= total * len(marks) / 4:
+        marks.append(time.monotonic())
+print(json.dumps({"bytes": got, "sha256": digest.hexdigest(), "marks": marks}))
+"""
+
+
+def seq_bytes(count: int) -> int:
+    """How many bytes `seq 1 COUNT` writes."""
+    total, digits, low = 0, 1, 1
+    while low <= count:
+        high = min(count, 10**digits - 1)
+        total += (high - low + 1) * (digits + 1)
+        low, digits = 10**digits, digits + 1
+    return total
+
+
+@pytest.mark.plan("LOAD-07")
+@pytest.mark.parametrize("direction", ["down", "up"])
+def test_throughput_on_a_long_fat_path_beats_the_default_window(direction, alice, server, make_link):
+    """124 MB across a 400 ms round trip: more in flight than quinn's default window allows.
+
+    With the default 1.25 MB stream window no sender can have more than
+    1.25 MB in flight, so no stream can beat 3.1 MB/s on this path however
+    fast the path is. Everything in netsim's delay is in flight, so the most
+    it ever held shows how far the window really opened. "down" goes through
+    the server's output queue, "up" through the remote process's stdin.
+    """
+    link = make_link("server:2222", delay_ms=LONG_FAT_DELAY_MS)
+    alice.pin(link.host, server.fp, port=link.port)
+    total = seq_bytes(LONG_FAT_COUNT)
+    want = alice.shell(f"seq 1 {LONG_FAT_COUNT} | sha256sum").stdout.split()[0]
+    meter = ("python3", "-c", METER, str(total))
+    if direction == "down":
+        remote = alice.argv("netsim", "seq", "1", str(LONG_FAT_COUNT), port=link.port)
+        script = f"{shlex.join(remote)} | {shlex.join(meter)}"
+    else:
+        remote = alice.argv("netsim", *meter, port=link.port)
+        script = f"seq 1 {LONG_FAT_COUNT} | {shlex.join(remote)}"
+    r = alice.shell(script, timeout=180, check=False)
+    assert r.rc == 0, r.describe()
+    got = json.loads(r.stdout)
+    assert got["bytes"] == total and got["sha256"] == want, got
+    marks = got["marks"]
+    # The last three quarters: slow start on a 400 ms path takes seconds.
+    steady = total * 3 / 4 / (marks[4] - marks[1])
+    held = link.stats()["stats"][direction]["max_delayed"]
+    print(
+        f"{direction}: {total / (marks[4] - marks[0]) / 1e6:.1f} MB/s overall, {steady / 1e6:.1f} MB/s"
+        f" over the last three quarters, at most {held / 1e6:.2f} MB in netsim's delay at once"
+    )
+    # Twice what a default window could ever put there, QUIC's overhead and all.
+    assert held > 2 * QUINN_DEFAULT_STREAM_WINDOW, f"at most {held} bytes in flight one way"
+    # A default window ran at 90% of its ceiling; a busy host slows this one.
+    assert steady > 1.3 * DEFAULT_WINDOW_CEILING, f"{steady / 1e6:.1f} MB/s"
