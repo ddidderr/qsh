@@ -305,6 +305,10 @@ against, the boundaries it promises, and the trade-offs already decided.
 * A key's policy is re-read for every session, not captured when the
   connection was made, so revoking a key also cuts off the connections it
   already has.
+* qsh does not use PAM or the shadow file. An expired or locked account,
+  `/etc/nologin` and login records (`utmp`, `wtmp`, `last`) play no part:
+  a key's authorization is the only gate. Withdraw it with `qsh-server
+  revoke`, or give it a deadline with `--expires-in-days`.
 * The client cannot set arbitrary environment variables. Only `TERM`, `LANG`,
   `COLORTERM`, `LC_*` and `QSH_*` survive; `PATH` is fixed by the server. The
   remote process gets a fresh session (`setsid`) and, when root, a full
