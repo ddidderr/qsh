@@ -161,3 +161,11 @@ Some lessons the first scenarios taught:
 - To leave the state an interrupted management command leaves, interrupt a
   real one: `strace -P FILE -e inject=unlink,unlinkat:error=EIO:signal=KILL`
   kills it just as it would delete FILE.
+- A peer that does not answer is not one that refuses. A blackhole route
+  makes the node that has it fail its own sends at once (EINVAL); to make a
+  TCP service go silent, as behind a failed link, put the route on the
+  service's side, for the client's address.
+- With `ldap` in nsswitch.conf and the directory silent, anything that looks
+  up an account missing from /etc/passwd waits out NSS's timeouts.
+  `journalctl -u` is one: it resolves `systemd-coredump`. Read a unit's
+  lines with `journalctl _SYSTEMD_UNIT=…` meanwhile.

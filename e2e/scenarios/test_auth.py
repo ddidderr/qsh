@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
+import shlex
+import subprocess
 import time
 
 import pytest
 
-from harness.qsh import RELOAD_SETTLE
+from harness.env import Unmet
+from harness.qsh import RELOAD_SETTLE, QshServer, unique
 from harness.terminal import Terminal
 
 
@@ -301,3 +305,353 @@ def test_account_controls_outside_qsh_do_not_gate_it(make_client, server):
     # The authorization is the gate: revoking it is what ends access.
     server.revoke(member.entry)
     assert member.run("server", "true").rc == 255
+
+
+# ---------------------------------------------------------------- directory accounts
+#
+# AUTH-20 serves accounts from LDAP, as a site with central accounts does:
+# slapd on server2 with a directory made for the scenario, and on `server`
+# nslcd with `ldap` after `files` for passwd and group. qsh-server itself is
+# neither reconfigured nor restarted: it resolves the account and its groups
+# through NSS when each session is prepared (src/server.rs, the blocking
+# preparation in handle_session; README: groups are resolved before the fork).
+
+LDAP_BASE = "dc=qsh-e2e,dc=test"
+LDAP_ADMIN = f"cn=admin,{LDAP_BASE}"
+LDAP_PASSWORD = "auth20"
+
+# erin exists only in the directory, with her own group and dir-ops; dir-dev
+# is a directory group for alice, whose account and other groups are local.
+DIRECTORY_LDIF = f"""\
+dn: {LDAP_BASE}
+objectClass: dcObject
+objectClass: organization
+dc: qsh-e2e
+o: qsh e2e directory
+
+dn: ou=people,{LDAP_BASE}
+objectClass: organizationalUnit
+ou: people
+
+dn: ou=groups,{LDAP_BASE}
+objectClass: organizationalUnit
+ou: groups
+
+dn: uid=erin,ou=people,{LDAP_BASE}
+objectClass: account
+objectClass: posixAccount
+uid: erin
+cn: Erin
+uidNumber: 3001
+gidNumber: 3001
+homeDirectory: /home/erin
+loginShell: /bin/bash
+
+dn: cn=erin,ou=groups,{LDAP_BASE}
+objectClass: posixGroup
+cn: erin
+gidNumber: 3001
+
+dn: cn=dir-ops,ou=groups,{LDAP_BASE}
+objectClass: posixGroup
+cn: dir-ops
+gidNumber: 3100
+memberUid: erin
+
+dn: cn=dir-dev,ou=groups,{LDAP_BASE}
+objectClass: posixGroup
+cn: dir-dev
+gidNumber: 3101
+memberUid: alice
+"""
+
+# nslcd's timeouts, explicit so that an outage resolves in bounded time.
+# bind_timelimit, reconnect_sleeptime and reconnect_retrytime are nslcd's
+# defaults, and so is the pool of 5 threads; timelimit, which by default
+# waits for ever, gets the same 10 s as bind_timelimit. Measured with these:
+# a lookup that meets the outage fails after 10 to 20 s, a burst queues
+# behind the 5 threads (32 at once all fail within about 35 s), and once
+# the directory is back nslcd tries it again within reconnect_retrytime.
+NSLCD_TIMEOUTS = """\
+bind_timelimit 10
+timelimit 10
+reconnect_sleeptime 1
+reconnect_retrytime 10
+threads 5
+"""
+
+# The NSS module waits at most this long for nslcd to answer (libnss-ldapd's
+# read timeout, measured with nslcd stopped), so no lookup, however stuck
+# the directory, outlasts it.
+NSS_READ_TIMEOUT = 60
+
+
+class Directory:
+    """slapd serving DIRECTORY_LDIF on `node`, run as a transient unit."""
+
+    def __init__(self, node) -> None:
+        self.node = node
+        self.unit = unique("qsh-e2e-slapd")
+        self.state_dir = f"/var/tmp/{self.unit}"
+
+    def start(self) -> None:
+        conf = f"{self.state_dir}/slapd.conf"
+        self.node.sh(f"mkdir -p {self.state_dir}/db")
+        self.node.write(
+            conf,
+            "include /etc/ldap/schema/core.schema\n"
+            "include /etc/ldap/schema/cosine.schema\n"
+            "include /etc/ldap/schema/nis.schema\n"
+            f"pidfile {self.state_dir}/slapd.pid\n"
+            "modulepath /usr/lib/ldap\n"
+            "moduleload back_mdb\n"
+            "database mdb\n"
+            "maxsize 16777216\n"
+            f'suffix "{LDAP_BASE}"\n'
+            f'rootdn "{LDAP_ADMIN}"\n'
+            f"rootpw {LDAP_PASSWORD}\n"
+            f"directory {self.state_dir}/db\n"
+            "index objectClass,uid,uidNumber,gidNumber,memberUid eq\n"
+            "access to * by * read\n",
+        )
+        self.node.write(f"{self.state_dir}/directory.ldif", DIRECTORY_LDIF)
+        self.node.sh(f"slapadd -f {conf} -l {self.state_dir}/directory.ldif")
+        self.node.run(
+            ["systemd-run", f"--unit={self.unit}", "--collect", "slapd", "-d", "0", "-f", conf, "-h", "ldap:///"],
+            check=True,
+        )
+        self.node.wait_for(f"ldapsearch -x -H ldap://localhost -b {LDAP_BASE} -s base dn", timeout=20)
+
+    def stop(self) -> None:
+        self.node.run(["systemctl", "stop", self.unit])
+        self.node.run(["rm", "-rf", self.state_dir])
+
+    def modify(self, ldif: str) -> None:
+        self.node.run(
+            ["ldapmodify", "-x", "-H", "ldap://localhost", "-D", LDAP_ADMIN, "-w", LDAP_PASSWORD],
+            input=ldif,
+            check=True,
+        )
+
+
+@contextlib.contextmanager
+def directory_accounts(server: QshServer, directory_node):
+    """`server` resolves passwd and group from `files`, then a new directory.
+
+    Yields the Directory. Afterwards nsswitch.conf and nslcd.conf are as they
+    were, nslcd and slapd are stopped, and erin's home is gone, whatever the
+    scenario did.
+    """
+    node = server.node
+    directory = Directory(directory_node)
+    nsswitch = node.read("/etc/nsswitch.conf")
+    nslcd_conf = node.read("/etc/nslcd.conf")
+    try:
+        directory.start()
+        node.write(
+            "/etc/nslcd.conf",
+            f"uid nslcd\ngid nslcd\nuri ldap://{directory_node.ip}/\nbase {LDAP_BASE}\n{NSLCD_TIMEOUTS}",
+        )
+        node.sh("chown root:nslcd /etc/nslcd.conf && chmod 0640 /etc/nslcd.conf && systemctl start nslcd")
+        # As pam_mkhomedir would; the session starts in the account's home.
+        node.sh("install -d -o 3001 -g 3001 -m 0755 /home/erin")
+        with_ldap, count = re.subn(rb"(?m)^((?:passwd|group):\s+files\b.*?)[ \t]*$", rb"\1 ldap", nsswitch)
+        assert count == 2, f"no `files` source for passwd and group in nsswitch.conf:\n{nsswitch.decode()}"
+        node.write("/etc/nsswitch.conf", with_ldap)
+        node.wait_for("getent passwd erin", timeout=30)
+        yield directory
+    finally:
+        node.write("/etc/nsswitch.conf", nsswitch)
+        node.run(["systemctl", "stop", "nslcd"])
+        node.write("/etc/nslcd.conf", nslcd_conf)
+        node.run(["rm", "-rf", "/home/erin"])
+        directory.stop()
+
+
+@contextlib.contextmanager
+def unreachable(directory: Directory, client_node):
+    """`client_node` hears nothing from the directory until the block ends.
+
+    A blackhole route on the directory's side discards everything it sends
+    to the client: connection attempts and queries go unanswered, as across
+    a failed link. (The same route on the client's side would make its own
+    sends fail at once with EINVAL, which is not what an outage looks like.)
+    """
+    route = ["ip", "route", "add", "blackhole", f"{client_node.ip}/32"]
+    directory.node.run(route, check=True)
+    try:
+        yield
+    finally:
+        directory.node.run(["ip", "route", "del", "blackhole", f"{client_node.ip}/32"])
+
+
+def unit_journal(server: QshServer, since: str) -> str:
+    """qsh-server's own journal lines after `since`, matched by unit field.
+
+    `journalctl -u` (QshServer.journal) also matches the unit's core dumps,
+    for which it looks up the systemd-coredump account; that account is not
+    in /etc/passwd, so while the directory does not answer, `-u` waits out
+    an LDAP lookup of its own.
+    """
+    argv = ["journalctl", f"_SYSTEMD_UNIT={server.unit}.service", "--no-pager", "-o", "cat", "--after-cursor", since]
+    return server.node.run(argv, check=True).stdout
+
+
+def wait_logins(server: QshServer, since: str, user: str, count: int, timeout: float = 30) -> None:
+    """Wait until `count` connections have authenticated as `user` since `since`."""
+    deadline = time.monotonic() + timeout
+    while (seen := unit_journal(server, since).count(f"authenticated as `{user}`")) < count:
+        if time.monotonic() > deadline:
+            raise AssertionError(f"only {seen} of {count} connections authenticated as {user} within {timeout}s")
+        time.sleep(0.25)
+
+
+def finish(procs: list[subprocess.Popen], *, deadline: float) -> list[tuple[bytes, bytes]]:
+    """Every process's (stdout, stderr), failing if one is still running at `deadline`."""
+    results = []
+    for proc in procs:
+        try:
+            results.append(proc.communicate(timeout=max(0.1, deadline - time.monotonic())))
+        except subprocess.TimeoutExpired as exc:
+            raise AssertionError(f"{shlex.join(proc.args[-6:])} was still waiting at the deadline") from exc
+    return results
+
+
+@pytest.mark.plan("AUTH-20")
+def test_directory_accounts_log_in_with_their_directory_groups(make_client, server, env):
+    """An account and groups that only the directory knows, for every session.
+
+    erin is in the directory only; alice is local, with one more group
+    there. The server was started before the directory was enabled and is
+    not restarted: it must look both up through NSS as each session is
+    prepared, so the session gets the directory's groups merged with the
+    local ones, and a group added in the directory applies to the next
+    session.
+    """
+    pid = server.main_pid()
+    with directory_accounts(server, env.node("server2")) as directory:
+        assert server.node.run(["grep", "-q", "^erin:", "/etc/passwd"]).rc == 1, "erin must not be a local account"
+        erin = make_client("alice", authorize_as="erin")  # `authorize` resolves erin through NSS too
+        member = make_client("alice", authorize_as="alice")
+        r = erin.run("server", "sh", "-c", 'id; echo "$HOME $USER $SHELL"; pwd')
+        assert r.rc == 0, r.describe()
+        assert r.stdout == (
+            "uid=3001(erin) gid=3001(erin) groups=3001(erin),3100(dir-ops)\n/home/erin erin /bin/bash\n/home/erin\n"
+        ), r.describe()
+        r = member.run("server", "id", "-Gn")
+        assert r.rc == 0 and sorted(r.stdout.split()) == ["alice", "dir-dev", "project"], r.describe()
+        directory.modify(f"dn: cn=dir-dev,ou=groups,{LDAP_BASE}\nchangetype: modify\nadd: memberUid\nmemberUid: erin\n")
+        r = erin.run("server", "id", "-Gn")
+        assert r.rc == 0 and sorted(r.stdout.split()) == ["dir-dev", "dir-ops", "erin"], r.describe()
+    assert server.main_pid() == pid, "qsh-server was restarted"
+
+
+@pytest.mark.plan("AUTH-20")
+def test_a_directory_outage_fails_sessions_and_gives_their_budget_back(make_client, server, env):
+    """While the directory is silent, its accounts' sessions fail and hold nothing after.
+
+    40 sessions at once on erin's key: 32 are admitted (the key's limit) and
+    wait in preparation on erin's lookup, the other 8 are refused at once.
+    The 32 must fail with a message naming the lookup, within the NSS
+    module's own read timeout, instead of hanging. While they wait, a key
+    whose account needs no directory (root) still logs in at once: the
+    lookups tie up neither the async workers nor other keys (THREAT_MODEL
+    actor 3). Once the directory answers again, the key has its whole budget
+    back without a restart: 32 sessions run at once.
+    """
+    node = server.node
+    with directory_accounts(server, env.node("server2")) as directory:
+        erin = make_client("alice", authorize_as="erin")
+        admin = make_client("alice", authorize_as="root")
+        assert erin.run("server", "true").rc == 0  # nslcd now holds a connection to the directory
+        since = server.cursor()
+        with unreachable(directory, node):
+            begin = time.monotonic()
+            argv = erin.argv("server", "echo", "granted-auth20")
+            procs = [erin.node.popen(argv, user="alice") for _ in range(40)]
+            try:
+                wait_logins(server, since, "erin", 32)
+                start = time.monotonic()
+                r = admin.run("server", "id", "-u", timeout=30)
+                took = time.monotonic() - start
+                assert (r.rc, r.stdout) == (0, "0\n"), r.describe()
+                assert took < 5, f"root waited {took:.1f}s behind erin's stuck lookups"
+                results = finish(procs, deadline=begin + NSS_READ_TIMEOUT + 15)
+                ended = time.monotonic() - begin
+            finally:
+                for proc in procs:
+                    proc.kill()
+            failed = [err.decode() for proc, (_, err) in zip(procs, results) if proc.returncode == 126]
+            refused = [err.decode() for proc, (_, err) in zip(procs, results) if proc.returncode == 255]
+            assert (len(failed), len(refused)) == (32, 8), sorted(proc.returncode for proc in procs)
+            for err in failed:
+                assert "looking up user `erin`" in err and "no such local user" not in err, err
+            for err in refused:
+                assert "key connection limit reached" in err, err
+            assert not any(b"granted-auth20" in out for out, _ in results)
+            assert ended < NSS_READ_TIMEOUT + 15, f"the failing sessions took {ended:.0f}s to end"
+            assert re.search(r"session from \S+ ended: looking up user `erin`", unit_journal(server, since))
+        # nslcd tries the directory again within reconnect_retrytime; after
+        # that, qsh must not still be holding any of the key's 32 slots.
+        node.wait_for("getent passwd erin", timeout=60)
+        marker = "8282.25"
+        procs = [erin.node.popen(erin.argv("server", "sleep", marker), user="alice") for _ in range(32)]
+        try:
+            node.wait_for(f"[ $(pgrep -fc '^sleep {re.escape(marker)}$') -eq 32 ]", timeout=60)
+        finally:
+            node.run(["pkill", "-TERM", "-f", f"^sleep {re.escape(marker)}$"])
+            codes = [proc.wait(timeout=30) for proc in procs]
+        assert codes == [128 + 15] * 32, codes
+
+
+@pytest.mark.plan("AUTH-20")
+@pytest.mark.xfail(
+    strict=True,
+    raises=Unmet,
+    reason="FXX-AUTH-20: qsh-server does not exit until every stuck account lookup has returned, "
+    "so stop and restart wait out the directory's timeouts",
+)
+def test_a_directory_outage_does_not_hold_up_stopping_the_server(make_client, server, env):
+    """`systemctl stop` while sessions wait on a silent directory.
+
+    16 sessions on erin's key wait on her lookup, queued behind nslcd's
+    threads; left alone they fail some 30 s later. Stopping the server must
+    tell their clients at once and finish as promptly as with no directory
+    at all (OPS-04 holds a stop to 10 s). Nothing a stuck preparation holds
+    needs the process to stay: it takes no lock and starts no child
+    (src/server.rs, handle_session). Until the process is gone systemd
+    cannot start a new one, and nothing listens on the port, not even for
+    keys whose accounts need no directory.
+    """
+    node = server.node
+    with directory_accounts(server, env.node("server2")) as directory:
+        erin = make_client("alice", authorize_as="erin")
+        assert erin.run("server", "true").rc == 0
+        since = server.cursor()
+        procs: list[subprocess.Popen] = []
+        stopper = None
+        try:
+            with unreachable(directory, node):
+                argv = erin.argv("server", "echo", "granted-auth20")
+                procs = [erin.node.popen(argv, user="alice") for _ in range(16)]
+                wait_logins(server, since, "erin", 16)
+                assert all(proc.poll() is None for proc in procs), "a lookup ended before the stop: nothing was stuck"
+                begin = time.monotonic()
+                stopper = node.popen(["systemctl", "stop", server.unit])
+                # The clients hear of the stop at once, as in OPS-04.
+                results = finish(procs, deadline=begin + 10)
+                for proc, (out, err) in zip(procs, results):
+                    assert proc.returncode == 255 and b"shutting down" in err, err.decode()
+                    assert b"granted-auth20" not in out
+                stopper.wait(timeout=120)
+                took = time.monotonic() - begin
+            assert stopper.returncode == 0
+            assert not server.is_active()
+            if took >= 10:
+                raise Unmet(f"stopping qsh-server took {took:.1f}s while account lookups were stuck")
+        finally:
+            for proc in procs:
+                proc.kill()
+            if stopper is not None and stopper.poll() is None:
+                stopper.wait(timeout=120)
+            server.start()
