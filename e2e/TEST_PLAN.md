@@ -245,66 +245,66 @@ commit that fixed it.
 ## XFER — data transfer
 
 ### XFER-01 — rsync push reproduces a tree exactly
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Steps:** `rsync -e qsh -aHS` a tree with many small files, a 5 MiB file, an empty file, a 64 MiB sparse file, hard and symbolic links, odd modes and times, and names with spaces, quotes, newlines and non-ASCII.
 - **Expected:** names, types, modes, sizes, file mtimes, link targets, link counts and contents match (directory times are rsync's business; see the manifest note in the test).
 
 ### XFER-02 — rsync pull reproduces a tree exactly
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Expected:** as XFER-01, server to client. Found F6.
 
 ### XFER-03 — rsync resync sends only the changes
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Steps:** change, add, delete and touch files; resync with `--delete --stats`.
 - **Expected:** exactly the three changed regular files transferred; trees match.
 
 ### XFER-04 — `rsync -s` handles awkward remote paths
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Why:** rsync 3.2.4+ escapes remote paths for a remote shell, which qsh does not have; `-s` (`--secluded-args`) sends them through the rsync protocol (README rsync section).
 - **Expected:** a remote path with spaces, quotes, `$HOME`, `*?` and non-ASCII is used literally, both directions. Found F5.
 
 ### XFER-05 — rsync over an impaired link
-- **Status:** planned · **Priority:** P0 · **Needs:** netsim
+- **Status:** automated · **Priority:** P0 · **Needs:** netsim
 - **Steps:** push and pull a tree with 1% loss, 15 ms delay, 10 ms jitter, 1% reordering and 1% duplication.
 - **Expected:** both directions intact; the relay really dropped packets both ways.
 
 ### XFER-06 — An interrupted rsync resumes with `--partial`
-- **Status:** planned · **Priority:** P1 · **Needs:** netsim, server2
+- **Status:** automated · **Priority:** P1 · **Needs:** netsim, server2
 - **Steps:** black-hole the link part way through a 200 MiB upload; once both ends have given up, restore it and rerun.
 - **Expected:** the rerun sends less than the whole file and the result matches.
 
 ### XFER-07 — tar pipes in both directions
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** `tar c | qsh server tar x` and the reverse reproduce the tree (POSIX format, so sub-second times survive).
 
 ### XFER-08 — rsync as another account from another machine
-- **Status:** planned · **Priority:** P1 · **Needs:** two-clients
+- **Status:** automated · **Priority:** P1 · **Needs:** two-clients
 - **Expected:** bob on client2, with `bob@server` and `-e 'qsh -l bob'`, creates files owned by bob.
 
 ### XFER-09 — A gigabyte each way with checksums
-- **Status:** planned · **Priority:** P1 · **Needs:** — (marked `slow`)
+- **Status:** automated · **Priority:** P1 · **Needs:** — (marked `slow`)
 - **Expected:** identical digests on both ends; throughput printed for the record.
 
 ### XFER-10 — Six rsyncs at once from two machines
-- **Status:** planned · **Priority:** P1 · **Needs:** two-clients
+- **Status:** automated · **Priority:** P1 · **Needs:** two-clients
 - **Expected:** all exit 0 and every tree matches.
 
 ### XFER-11 — A download over a slow link is complete
-- **Status:** planned · **Priority:** P0 · **Needs:** netsim
+- **Status:** automated · **Priority:** P0 · **Needs:** netsim
 - **Steps:** `qsh netsim cat` a 16 MiB file across 40 ms delay and 1% loss.
 - **Expected:** every byte arrives, then status 0. Output still in flight when the remote command exits must be delivered, not abandoned. Found F1.
 
 ### XFER-12 — git over qsh through a `sh -c` wrapper
-- **Status:** planned · **Priority:** P2 · **Needs:** —
+- **Status:** automated · **Priority:** P2 · **Needs:** —
 - **Why:** git passes its remote command as one shell string (`git-upload-pack '/path'`), which qsh does not split. The README documents a wrapper that runs that string with `sh -c`.
 - **Expected:** with the README's wrapper and `GIT_SSH_VARIANT=ssh`, clone (`server:repo.git`, relative to the remote home), push, clone of an `ssh://server:2222/...` URL and fetch all work. Found F20.
 
 ### XFER-13 — rsync under a `--kill-session-processes` key
-- **Status:** planned · **Priority:** P2 · **Needs:** cgroup-v2
+- **Status:** automated · **Priority:** P2 · **Needs:** cgroup-v2
 - **Expected:** push and pull complete; rsync's generator outlives its receiver child, so the cgroup kill at leader exit finds nothing to cut.
 
 ### XFER-14 — Revoking a key in the middle of a large rsync
-- **Status:** planned · **Priority:** P1 · **Needs:** netsim
+- **Status:** automated · **Priority:** P1 · **Needs:** netsim
 - **Expected:** the transfer stops on both sides within 10 s (README: revocation normally takes effect within two seconds); rsync reports an error, not success.
 
 ## NET — network conditions
