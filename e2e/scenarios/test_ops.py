@@ -630,31 +630,33 @@ LATE_ADDRESS_DELAY = 25
 LATE_ADDRESS_BOUND = 10
 
 
-def serve_on_a_late_address(server: QshServer, address: str, prefix: int, *, restart_once: bool = False) -> dict:
+def serve_on_a_late_address(server: QshServer, address: str, prefix: int, *, restarts: int = 0) -> dict:
     """Start the server's unit with `listen` on a missing address, then add the address.
 
     The configuration must already name `address`. The rate limit is reset
-    first, as on a fresh boot. With `restart_once`, an administrator runs
-    `systemctl restart` once after the first failure, to see whether it helps.
-    Returns the unit's state after LATE_ADDRESS_DELAY seconds without the
-    address, how long after it appeared the unit was active and listening on
-    it (None: not within LATE_ADDRESS_BOUND), and the unit's journal.
+    first, as on a fresh boot. With `restarts`, an administrator runs
+    `systemctl restart` that many times, each once the last try has failed,
+    to see whether it helps. Returns the unit's state after
+    LATE_ADDRESS_DELAY seconds without the address, how long after it
+    appeared the unit was active and listening on it (None: not within
+    LATE_ADDRESS_BOUND), when each failed try came (seconds after the first),
+    and the unit's journal.
     """
     node, unit = server.node, server.unit
     since = server.cursor()
     node.run(["systemctl", "reset-failed", unit])
     script = f"systemctl restart {unit}"
-    if restart_once:
-        # Right after the first failure, from inside the node, so that the
-        # sixth start falls inside the window whatever systemd's timer slack.
-        # A restart within 1.0-1.8 s after any try does the same.
+    for _ in range(restarts):
+        # From inside the node, as soon as systemd has scheduled the next
+        # automatic try (the last one failed), so the restarts come at once.
         script += (
-            f" && until [ \"$(systemctl show -p ExecMainStatus --value {unit})\" = 1 ]; do sleep 0.05; done"
+            f" && until [ \"$(systemctl show -p SubState --value {unit})\" = auto-restart ]; do sleep 0.05; done"
             f" && systemctl restart {unit}"
         )
+    failure = rf"binding UDP {re.escape(address)}:{PORT}: Cannot assign requested address"
     begin = time.monotonic()
     node.sh(script, timeout=30)
-    server.wait_journal(rf"binding UDP {re.escape(address)}:{PORT}: Cannot assign requested address", since)
+    server.wait_journal(failure, since)
     time.sleep(max(0.0, begin + LATE_ADDRESS_DELAY - time.monotonic()))
     waiting = unit_state(server, "ActiveState", "NRestarts", "StartLimitBurst")
     node.run(["ip", "addr", "add", f"{address}/{prefix}", "dev", "eth0"], check=True)
@@ -666,7 +668,11 @@ def serve_on_a_late_address(server: QshServer, address: str, prefix: int, *, res
             serving = round(time.monotonic() - added, 2)
         else:
             time.sleep(0.25)
-    return {"waiting": waiting, "serving": serving, "journal": server.journal(since)}
+    # Each failed try logs the bind error; the journal's monotonic clock says when.
+    timed = node.run(["journalctl", "-u", unit, "--after-cursor", since, "-o", "short-monotonic"], check=True).stdout
+    times = [float(t) for t in re.findall(rf"^\[\s*([\d.]+)\].*{failure}", timed, re.M)]
+    tries = [round(t - times[0], 2) for t in times]
+    return {"waiting": waiting, "serving": serving, "tries": tries, "journal": server.journal(since)}
 
 
 def listen_on(server: QshServer, address: str) -> bytes:
@@ -695,9 +701,11 @@ def test_the_shipped_unit_waits_for_a_late_listen_address(make_client, fast_serv
     Binding an address the host does not have fails (EADDRNOTAVAIL) and
     qsh-server exits 1. The shipped unit's `Restart=on-failure` and
     `RestartSec=2` try again every two seconds, and systemd's default start
-    limit (5 starts within 10 s, then the unit fails for good) does not trip:
-    five tries at that pace already take the whole window. When the address
-    appears, the next try binds it and serves.
+    limit (5 starts within 10 s, then the unit fails for good) never trips
+    on that loop alone: each of the five gaps is RestartSec plus the try plus
+    timer slack, more than 2 s, so the sixth start always falls past the
+    window, which then starts over. When the address appears, the next try
+    binds it and serves.
     """
     node = fast_server.node
     address, prefix = env.spare_ip(40), env.subnet().prefixlen
@@ -709,8 +717,11 @@ def test_the_shipped_unit_waits_for_a_late_listen_address(make_client, fast_serv
     try:
         seen = serve_on_a_late_address(fast_server, address, prefix)
         waiting = seen["waiting"]
-        print(f"after {LATE_ADDRESS_DELAY}s without the address: {waiting}; serving after {seen['serving']}s")
-        assert waiting["ActiveState"] != "failed", f"the unit gave up: {waiting}\n{seen['journal'][-3000:]}"
+        print(
+            f"after {LATE_ADDRESS_DELAY}s without the address: {waiting}; tries at {seen['tries']}; "
+            f"serving after {seen['serving']}s"
+        )
+        assert waiting["ActiveState"] != "failed", f"the unit gave up: {waiting}, tries at {seen['tries']}"
         # More tries than the start limit's burst: the limit was really in play.
         assert int(waiting["NRestarts"]) > int(waiting["StartLimitBurst"]), waiting
         assert seen["serving"] is not None, f"not serving {LATE_ADDRESS_BOUND}s after the address appeared"
@@ -721,25 +732,31 @@ def test_the_shipped_unit_waits_for_a_late_listen_address(make_client, fast_serv
 
 
 @pytest.mark.plan("OPS-15")
-@pytest.mark.xfail(strict=True, reason="FXX-OPS-15: one restart while the unit waits for its address trips the start limit for good")
-def test_a_restart_while_waiting_for_the_address_does_not_give_up(make_client, fast_server, env):
-    """An administrator restarts the waiting unit once; it must still come up with the address.
+@pytest.mark.xfail(strict=True, reason="FXX-OPS-15: restarting the unit while it waits for its address trips the start limit for good")
+def test_restarting_while_waiting_for_the_address_does_not_give_up(make_client, fast_server, env):
+    """An administrator restarts the waiting unit; it must still come up with the address.
 
-    The shipped unit survives a late address only because five tries at
-    `RestartSec=2` just fill the 10 s start-limit window: the sixth start
-    comes 10.2-11.1 s after the first. One `systemctl restart` in between,
-    to see whether it helps, makes the sixth start come too early: systemd
-    refuses it ("Start request repeated too quickly") and the unit stays
-    failed, also once the address is there. Proposed: `StartLimitIntervalSec=0`
-    in the unit's [Unit] section, so that it keeps trying.
+    Alone, the retry loop never reaches the start limit (see above). Every
+    start counts towards it, though, the administrator's too: a `systemctl
+    restart` m seconds after a try, to see whether it helps, moves the sixth
+    start to 4 gaps + m after the window opened, inside the 10 s if m is
+    under 1.0-1.8 s (gaps of 2.25-2.05 s). systemd refuses that
+    start ("Start request repeated too quickly") and the unit stays failed,
+    also once the address is there. Here the administrator restarts twice,
+    each right after a failed try: the sixth start then comes about 7 s
+    after the first, so the outcome does not hang on how fast this host
+    runs the loop (one restart leaves about 1 s to spare over four gaps,
+    two leave 3 s over three). Proposed: `StartLimitIntervalSec=0` in the
+    unit's [Unit] section, so that it keeps trying.
     """
     address, prefix = env.spare_ip(40), env.subnet().prefixlen
     client = make_client("alice", authorize_as="alice", on=fast_server)
     client.pin(address, fast_server.fp)
     original = listen_on(fast_server, address)
     try:
-        seen = serve_on_a_late_address(fast_server, address, prefix, restart_once=True)
-        assert seen["serving"] is not None, f"the unit gave up: {seen['waiting']}\n{seen['journal'][-2000:]}"
+        seen = serve_on_a_late_address(fast_server, address, prefix, restarts=2)
+        print(f"after {LATE_ADDRESS_DELAY}s without the address: {seen['waiting']}; tries at {seen['tries']}")
+        assert seen["serving"] is not None, f"the unit gave up: {seen['waiting']}, tries at {seen['tries']}"
         r = client.run(address, "hostname", timeout=30)
         assert r.rc == 0 and r.stdout.strip() == "server2", r.describe()
     finally:
@@ -748,7 +765,8 @@ def test_a_restart_while_waiting_for_the_address_does_not_give_up(make_client, f
 
 def readme_unit() -> str:
     """The unit README.md's "Running under systemd" shows administrators."""
-    section = (REPO_DIR / "README.md").read_text().split("## Running under systemd", 1)[-1]
+    _, heading, section = (REPO_DIR / "README.md").read_text().partition("## Running under systemd")
+    assert heading, 'README.md has no "Running under systemd" section'
     match = re.search(r"```ini\n(.*?)```", section, re.S)
     assert match and "ExecStart=" in match.group(1), "README.md shows no systemd unit"
     return match.group(1)
@@ -780,7 +798,8 @@ def test_the_readme_unit_waits_for_a_late_listen_address(make_client, fast_serve
         # The shipped unit holds 0.0.0.0:2222, which the new address's port would collide with.
         fast_server.stop()
         seen = serve_on_a_late_address(readme, address, prefix)
-        assert seen["serving"] is not None, f"the unit gave up: {seen['waiting']}\n{seen['journal'][-2000:]}"
+        print(f"after {LATE_ADDRESS_DELAY}s without the address: {seen['waiting']}; tries at {seen['tries']}")
+        assert seen["serving"] is not None, f"the unit gave up: {seen['waiting']}, tries at {seen['tries']}"
         r = client.run(address, "hostname", timeout=30)
         assert r.rc == 0 and r.stdout.strip() == "server2", r.describe()
     finally:
