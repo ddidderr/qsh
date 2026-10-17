@@ -204,7 +204,9 @@ def a_session_running(client, server, marker: str, *, terminal: bool):
         argv, wait = term.argv, term.wait_exit
     else:
         argv = client.argv(server.host, "sleep", marker)
-        proc = client.node.popen(argv, user=client.user)
+        # With SIGHUP at its default, as a login shell leaves it: `docker exec`
+        # now and then starts a process with it ignored (e2e/README.md).
+        proc = client.node.popen(["env", "--default-signal=HUP", *argv], user=client.user)
 
         def wait(timeout: float) -> int:
             return proc.wait(timeout=timeout)

@@ -137,6 +137,10 @@ Some lessons the first scenarios taught:
 - pexpect searches its whole buffer again after every small read, so a
   terminal that prints megabytes slows the reader, and qsh behind it, to a
   crawl. Read such output with `Terminal.drain_exit`.
+- `docker exec` can start a process with SIGHUP ignored: where containerd
+  runs with it ignored, about one exec in twenty inherited that. A scenario
+  that hangs up a process without a handler of its own starts it under
+  `env --default-signal=HUP`, as a login shell would leave it.
 - Put shared state back in `finally`: a scenario that fails half way
   through (a rotated host key, an edited configuration) must not take
   later scenarios down with it.
