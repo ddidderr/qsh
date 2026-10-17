@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 import time
 
 import pytest
 
 from conftest import FAST_IDLE_TIMEOUT
+from harness.terminal import Terminal
 
 CGROUP_ROOT = "/sys/fs/cgroup/system.slice/qsh-server.service"
 
@@ -102,3 +104,82 @@ def test_revoking_mid_session_kills_the_process_group(make_client, server):
     proc.wait(timeout=30)
     # Both the leader and its same-group background child.
     server.node.wait_gone(f"sleep {marker}", timeout=10)
+
+
+# ---------------------------------------------------------------- LIFE-09
+#
+# How long the server reads a PTY after the shell has exited (DRAIN_GRACE in
+# src/server.rs), and what the README promises for it: "the session waits two
+# seconds for the rest of the output and then finishes anyway".
+PTY_DRAIN_GRACE = 2
+
+
+def exit_past_a_chatty_job(
+    client, server, job: str, output: str, process: str, *, stall: float = 0
+) -> tuple[int, float, float, str]:
+    """`job &` in an interactive shell, then `exit 5`.
+
+    Returns qsh's status, the seconds from `exit` until it ended, the seconds
+    it stayed after its last output, and the tail of that output. `output` is
+    a line the job prints and its echoed command line cannot contain;
+    `process` is the job's command line on the server, which is stopped
+    afterwards: an ordinary key may leave it running, and nothing else ends
+    it. For `stall` seconds after `exit` the local terminal reads nothing.
+    """
+    term = Terminal(client, server.host, timeout=30)
+    try:
+        term.set_prompt()
+        term.sendline(f"{job} &")
+        term.expect(rf"\n{re.escape(output)}\r?\n")
+        begin = time.monotonic()
+        term.sendline("exit 5")
+        time.sleep(stall)
+        status, tail, quiet = term.drain_exit(timeout=60)
+        return status, time.monotonic() - begin, quiet, tail
+    finally:
+        term.close()
+        server.node.run(["pkill", "-u", client.user, "-f", "^" + re.escape(process)])
+
+
+@pytest.mark.plan("LIFE-09")
+def test_interactive_exit_past_a_background_job_that_keeps_writing(alice, server):
+    """The shell exits while a job it put in the background writes on.
+
+    The job keeps the terminal open, so the server stops reading it after
+    the drain grace and reports the shell's status. Twenty lines a second:
+    every chunk is on its way to the client long before the next one.
+    """
+    status, took, _, tail = exit_past_a_chatty_job(
+        alice,
+        server,
+        "sh -c 'while :; do printf \"chatter-%s\\n\" 9090; sleep 0.05; done'",
+        "chatter-9090",
+        'sh -c while :; do printf "chatter-%s\\n" 9090;',
+    )
+    assert status == 5, tail
+    assert "could not be delivered" not in tail, tail
+    assert took < PTY_DRAIN_GRACE + 3, f"exit took {took:.1f}s"
+
+
+@pytest.mark.plan("LIFE-09")
+@pytest.mark.xfail(
+    strict=True,
+    reason="FXX-LIFE-09: a job that outwrites the terminal turns the exit into status 255 after 6-10 s",
+)
+def test_interactive_exit_past_a_background_job_that_floods_the_terminal(alice, server):
+    """The same, with a job that writes faster than the terminal reads.
+
+    The terminal reads nothing until the drain grace is over, as one that
+    cannot keep up would, so the server's output queue is full when the grace
+    runs out and it holds a chunk read but not yet queued. That is output
+    after the shell's exit, which the README says the session does not wait
+    for: it must not turn into a failed session, nor keep qsh after the
+    output already on its way has arrived.
+    """
+    status, took, quiet, tail = exit_past_a_chatty_job(
+        alice, server, "yes chatter-$((9190 + 1))", "chatter-9191", "yes chatter-9191", stall=PTY_DRAIN_GRACE + 0.5
+    )
+    print(f"exit took {took:.1f}s, {quiet:.1f}s of it after the last output")
+    assert "could not be delivered" not in tail, tail[-300:]
+    assert status == 5, tail[-300:]
+    assert quiet < 1.5, f"qsh stayed {quiet:.1f}s after its last output"

@@ -513,8 +513,10 @@ fails until the mark is removed, so a fix cannot go unnoticed.
 - **Expected:** the leader and its same-group background child are gone.
 
 ### LIFE-09 — Interactive exit with a chatty background job
-- **Status:** planned · **Priority:** P2 · **Needs:** pty
-- **Why:** README promises the session "waits two seconds … and then finishes anyway"; with a background job that keeps writing, the lab measured about 10 s and status 255. Open: decide whether the promise or the drain changes.
+- **Status:** automated · **Priority:** P2 · **Needs:** pty
+- **Why:** README (client reference): a job backgrounded with `&` keeps the terminal open after the shell exits, and "the session waits two seconds for the rest of the output and then finishes anyway". The server reads the PTY for `DRAIN_GRACE` (2 s, `src/server.rs`) after the shell has exited, then stops.
+- **Steps:** in a login shell, start a background job that writes to the terminal, then `exit 5`. First a slow writer (a line every 50 ms), read throughout; then `yes`, with the local terminal reading nothing for 2.5 s after `exit`, as one that cannot keep up would.
+- **Expected:** qsh exits 5 without an error message: the slow writer within 2 s + 3 s (measured 2.3 s), the flood without staying more than 1.5 s after its last output. The flood measured status 255 after 6.3–6.5 s, the last 3 s of it with nothing to print, and the message "the remote output could not be delivered in full" when it still fits in the queue: the output queue is full at the deadline, so the pump holds a chunk it cannot queue (`CutoffPending`), the session counts as incomplete, and the shell's process group gets SIGHUP, 2 s, SIGTERM, 2 s before the status goes out. Found FXX-LIFE-09.
 
 ### LIFE-10 — Client exits that send no close
 - **Status:** planned · **Priority:** P2 · **Needs:** pty, server2
