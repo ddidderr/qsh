@@ -506,6 +506,15 @@ def wait_logins(server: QshServer, since: str, user: str, count: int, timeout: f
         time.sleep(0.25)
 
 
+def wait_ended(procs: list[subprocess.Popen], count: int, *, deadline: float) -> list[subprocess.Popen]:
+    """Wait until `count` of `procs` have ended, failing at `deadline`; return those that have."""
+    while len(ended := [proc for proc in procs if proc.poll() is not None]) < count:
+        if time.monotonic() > deadline:
+            raise AssertionError(f"only {len(ended)} of {count} sessions had ended by the deadline")
+        time.sleep(0.1)
+    return ended
+
+
 def finish(procs: list[subprocess.Popen], *, deadline: float) -> list[tuple[bytes, bytes]]:
     """Every process's (stdout, stderr), failing if one is still running at `deadline`."""
     results = []
@@ -551,13 +560,17 @@ def test_a_directory_outage_fails_sessions_and_gives_their_budget_back(make_clie
     """While the directory is silent, its accounts' sessions fail and hold nothing after.
 
     40 sessions at once on erin's key: 32 are admitted (the key's limit) and
-    wait in preparation on erin's lookup, the other 8 are refused at once.
-    The 32 must fail with a message naming the lookup, within the NSS
-    module's own read timeout, instead of hanging. While they wait, a key
-    whose account needs no directory (root) still logs in at once: the
-    lookups tie up neither the async workers nor other keys (THREAT_MODEL
-    actor 3). Once the directory answers again, the key has its whole budget
-    back without a restart: 32 sessions run at once.
+    wait in preparation on erin's lookup, the other 8 are refused at once
+    (within 10 s; the lookups take 20 s or more). The 32 must fail with a
+    message naming the lookup, within the NSS module's own read timeout,
+    instead of hanging. While they wait, a key whose preparation makes no
+    lookup that reaches the directory still logs in at once: root, found in
+    /etc/passwd and, needing no identity switch, no group lookup either
+    (src/child.rs, prepare_identity). That shows the stuck lookups do not
+    tie up the async workers (THREAT_MODEL actor 3); it says nothing about
+    other local accounts, whose group lookups do wait on the directory (NSS,
+    measured in the plan). Once the directory answers again, the key has
+    its whole budget back without a restart: 32 sessions run at once.
     """
     node = server.node
     with directory_accounts(server, env.node("server2")) as directory:
@@ -570,6 +583,9 @@ def test_a_directory_outage_fails_sessions_and_gives_their_budget_back(make_clie
             argv = erin.argv("server", "echo", "granted-auth20")
             procs = [erin.node.popen(argv, user="alice") for _ in range(40)]
             try:
+                early = wait_ended(procs, 8, deadline=begin + 10)
+                codes = sorted(proc.returncode for proc in early)
+                assert codes == [255] * len(early), f"statuses of the sessions that ended within 10s: {codes}"
                 wait_logins(server, since, "erin", 32)
                 start = time.monotonic()
                 r = admin.run("server", "id", "-u", timeout=30)
