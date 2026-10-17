@@ -403,14 +403,15 @@ class JournalStall:
         return state == "S" and syscall[1:2] == ["0x2"] and limit > 0 and queued >= limit, evidence
 
 
-def login_burst(client: QshClient, host: str, rounds: int, parallel: int = 4) -> int:
+def login_burst(client: QshClient, host: str, rounds: int, parallel: int = 4) -> tuple[int, int]:
     """Log in 2 x `rounds` times in each of `parallel` loops; half the sessions are refused.
 
     Every connection writes a login line before its session is judged, and
     each refusal (the key is alice's, the request is for bob) adds a session
     error under the 16-a-second peer budget. Returns how many connections
-    authenticated. Four loops, because one address may hold only four
-    handshakes at once. Bounded at a minute, which is ten times what it takes.
+    authenticated and how many of their sessions were refused. Four loops,
+    because one address may hold only four handshakes at once. Bounded at a
+    minute, which is ten times what it takes.
     """
     qsh = client.qsh_command
     script = (
@@ -423,7 +424,13 @@ def login_burst(client: QshClient, host: str, rounds: int, parallel: int = 4) ->
     r = client.node.run(["bash", "-c", script], user=client.user, timeout=60, check=True)
     codes = Counter(r.stdout.split())
     assert set(codes) <= {"0", "126"}, f"sessions failed during the burst: {codes}"
-    return codes["0"] + codes["126"]
+    return codes["0"] + codes["126"], codes["126"]
+
+
+# Lines the daemon's queue may drop that OPS-13 does not tally one by one:
+# the once-a-second admission summary for the revoked key's refused
+# connection, and an error line for the session the revocation cut off.
+UNTALLIED_LINES = 4
 
 
 @pytest.mark.plan("OPS-13")
@@ -434,8 +441,9 @@ def test_a_stalled_journald_does_not_stop_serving_or_revocation(alice_fast, fast
     serving". README: a bounded queue and a dedicated writer, so "a full log
     pipe cannot block session handling or authorization reload". The writer
     is shown stuck in write(2) before and after the checks, so they ran while
-    the log was blocked; afterwards, the lines the full queue dropped must be
-    counted.
+    the log was blocked; afterwards, every line the full queue dropped must
+    be counted ("lines that do not fit are counted and reported as
+    suppressed", src/server/diagnostics.rs).
     """
     node = fast_server.node
     noisy = make_client("alice", authorize_as="alice", on=fast_server)
@@ -443,7 +451,7 @@ def test_a_stalled_journald_does_not_stop_serving_or_revocation(alice_fast, fast
     since = fast_server.cursor()
     marker = "7474.25"
     with JournalStall(fast_server) as stall:
-        logins = login_burst(noisy, "server2", rounds=40)
+        logins, refusals = login_burst(noisy, "server2", rounds=40)
         blocked, evidence = stall.writer_blocked()
         assert blocked, evidence
         sessions = []
@@ -470,22 +478,47 @@ def test_a_stalled_journald_does_not_stop_serving_or_revocation(alice_fast, fast
         blocked, evidence = stall.writer_blocked()
         assert blocked, f"the writer recovered before the checks were done: {evidence}"
 
-    # The writer catches up. Whatever the full queue turned away is reported
-    # as suppressed, in the once-a-second summary.
+    # The writer catches up. Each line the daemon produced during the stall
+    # is now either in the journal or counted in a once-a-second
+    # `suppressed N diagnostic message(s)` summary, so the lines missing from
+    # the journal add up to what is counted, give or take UNTALLIED_LINES:
+    # the logins (audit lines, which only a full queue drops), the refusals
+    # (also over the peer budget), and the other sessions' lines.
+    login, refusal = f"(key `{noisy.entry}`)", f"key `{noisy.entry}` is authorized for `alice`, not `bob`"
+    produced = {
+        login: logins,
+        refusal: refusals,
+        "(key `alice-client1`)": len(sessions),
+        f"(key `{victim.entry}`)": 1,
+        "is no longer authorized; closing the connection": 1,
+    }
+
+    def tally() -> tuple[dict[str, int], int, int]:
+        journal = fast_server.journal(since)
+        seen = {text: journal.count(text) for text in produced}
+        assert all(seen[text] <= n for text, n in produced.items()), f"produced {produced}, logged {seen}"
+        missing = sum(n - seen[text] for text, n in produced.items())
+        suppressed = sum(int(n) for n in re.findall(r"suppressed (\d+) diagnostic message", journal))
+        return seen, missing, suppressed
+
     deadline = time.monotonic() + 20
     while True:
-        journal = fast_server.journal(since)
-        seen = journal.count(f"(key `{noisy.entry}`)")
-        suppressed = sum(int(n) for n in re.findall(r"suppressed (\d+) diagnostic message", journal))
-        if seen and suppressed >= logins - seen:
+        seen, missing, suppressed = tally()
+        if seen[login] and suppressed >= missing:
             break
-        assert time.monotonic() < deadline, f"{logins} logins, {seen} logged, {suppressed} counted:\n{journal[-3000:]}"
+        assert time.monotonic() < deadline, f"{missing} missing, {suppressed} counted: produced {produced}, logged {seen}"
         time.sleep(0.5)
+    # A count still held back comes with the next summary.
+    time.sleep(RELOAD_SETTLE)
+    seen, missing, suppressed = tally()
     print(
         f"sessions {', '.join(f'{t:.2f}s' for t in sessions)}; revocation {took:.2f}s; "
-        f"{seen} of {logins} logins logged, {suppressed} lines counted as suppressed"
+        f"{seen[login]} of {logins} logins and {seen[refusal]} of {refusals} refusals logged; "
+        f"{missing} lines missing, {suppressed} counted as suppressed"
     )
-    assert seen < logins, "nothing was dropped: the queue never filled"
+    assert seen[login] < logins, "nothing was dropped: the queue never filled"
+    assert suppressed >= missing, f"{missing - suppressed} dropped lines were not counted: {produced} {seen}"
+    assert suppressed <= missing + UNTALLIED_LINES, f"{suppressed} lines counted, but only {missing} are missing"
     # And the daemon's log stream works again.
     since = fast_server.cursor()
     assert alice_fast.run("server2", "true").rc == 0
@@ -509,7 +542,7 @@ def test_a_restart_during_a_journald_stall_is_not_held_up(alice_fast, fast_serve
     noisy = make_client("alice", authorize_as="alice", on=fast_server)
     try:
         with JournalStall(fast_server) as stall:
-            login_burst(noisy, "server2", rounds=40)
+            login_burst(noisy, "server2", rounds=40)  # fills the queue, as above
             blocked, evidence = stall.writer_blocked()
             assert blocked, evidence
             begin = time.monotonic()
