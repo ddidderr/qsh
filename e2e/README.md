@@ -169,3 +169,10 @@ Some lessons the first scenarios taught:
   up an account missing from /etc/passwd waits out NSS's timeouts.
   `journalctl -u` is one: it resolves `systemd-coredump`. Read a unit's
   lines with `journalctl _SYSTEMD_UNIT=…` meanwhile.
+- `docker exec` sometimes drops a resize made right after a session starts:
+  the client container's terminal keeps the old size and qsh never hears of
+  it. `Terminal.resize_and_wait` forwards it again until that terminal has
+  the new size, so whatever happens next is qsh's doing.
+- `Terminal.expect` and `Terminal.command` wait for ever unless given a
+  timeout. Give one where a broken qsh would print nothing, or the failure
+  shows only when pytest-timeout ends the run 10 minutes later.

@@ -228,14 +228,15 @@ class Node:
                 raise AssertionError(f"on {self.service}: waited {timeout}s for {what}")
             time.sleep(0.25)
 
-    def kill_command(self, user: str, argv: list[str]) -> None:
-        """SIGKILL `user`'s processes running exactly `argv`, inside the node.
+    def kill_command(self, user: str, argv: list[str], *, signal: str = "KILL") -> None:
+        """Send `signal` (SIGKILL) to `user`'s processes running exactly `argv`.
 
         Killing a local `docker exec` client does not stop what it started in
-        the container; this does.
+        the container; this does. Another signal reaches the process itself,
+        not the `docker exec` that started it.
         """
         pattern = "^" + re.escape(" ".join(argv)) + "$"
-        self.run(["pkill", "-KILL", "-u", user, "-f", pattern])
+        self.run(["pkill", f"-{signal}", "-u", user, "-f", pattern])
 
     def edit_hosts(self, add: str | None = None, remove: str | None = None) -> None:
         """Add a line to, or drop lines matching a word from, /etc/hosts.
