@@ -196,7 +196,7 @@ def test_interactive_exit_past_a_background_job_that_keeps_writing(alice, server
 @pytest.mark.plan("LIFE-09")
 @pytest.mark.xfail(
     strict=True,
-    reason="FXX-LIFE-09-flood: a job that outwrites the terminal turns the exit into status 255 after about 6 s",
+    reason="F25: a job that outwrites the terminal turns the exit into status 255 after about 6 s",
 )
 def test_interactive_exit_past_a_background_job_that_floods_the_terminal(alice, server):
     """The same, with a job that writes faster than the terminal reads.
@@ -279,7 +279,7 @@ def test_a_hangup_ends_qsh_at_once_and_the_idle_timeout_ends_its_job(alice_fast,
 @pytest.mark.plan("LIFE-10")
 @pytest.mark.xfail(
     strict=True,
-    reason="FXX-LIFE-10: qsh ends on a signal without a CONNECTION_CLOSE; the job lives on for the idle timeout",
+    reason="F26: qsh ends on a signal without a CONNECTION_CLOSE; the job lives on for the idle timeout",
 )
 @pytest.mark.parametrize(
     "terminal,name",
@@ -311,7 +311,7 @@ def test_a_signal_that_ends_qsh_ends_the_remote_job_at_once(alice_fast, fast_ser
 @pytest.mark.plan("LIFE-10")
 @pytest.mark.xfail(
     strict=True,
-    reason="FXX-LIFE-10-ctrl-c: without a terminal qsh only relays INT, so on a dead path Ctrl-C waits out the idle timeout",
+    reason="F34: without a terminal qsh only relays INT, so on a dead path Ctrl-C waits out the idle timeout",
 )
 def test_ctrl_c_ends_a_command_whose_path_has_gone_dark(alice_fast, fast_server, make_link):
     """Ctrl-C, pressed until something happens, ends qsh even when the server cannot hear it.

@@ -302,7 +302,7 @@ def test_a_handshake_past_the_server_deadline_fails(path, deadline_logins):
 
 @pytest.mark.plan("NET-13")
 @pytest.mark.parametrize("path", sorted(DEADLINE_PATHS))
-@pytest.mark.xfail(strict=True, reason="FXX-NET-13: the server's handshake deadline is reported as quinn's generic application close")
+@pytest.mark.xfail(strict=True, reason="F33: the server's handshake deadline is reported as quinn's generic application close")
 def test_a_handshake_past_the_server_deadline_is_named(path, deadline_logins):
     """The user learns that the server ended a handshake that took too long.
 

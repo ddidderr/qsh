@@ -288,7 +288,7 @@ def test_sighup_stops_the_daemon_and_systemd_leaves_it_stopped(alice_fast, fast_
 
 
 @pytest.mark.plan("OPS-12")
-@pytest.mark.xfail(strict=True, reason="FXX-OPS-12: SIGHUP kills qsh-server silently; clients wait out the idle timeout")
+@pytest.mark.xfail(strict=True, reason="F35: SIGHUP kills qsh-server silently; clients wait out the idle timeout")
 def test_sighup_tells_clients_and_the_journal_like_a_stop(alice_fast, fast_server):
     """Whatever SIGHUP does, the daemon must not vanish without a word.
 
@@ -328,7 +328,7 @@ def test_sighup_tells_clients_and_the_journal_like_a_stop(alice_fast, fast_serve
 # before the close: the client then reports only the reset, and if it closes
 # the connection before the connection's check comes round, the withdrawal
 # is never logged. Measured: 3 of 96 revocations. Either way the session
-# ends. FXX-AUTH-03.
+# ends. F30.
 REVOKED = re.compile(r"withdrawn|stream reset by peer: error 2")
 
 
@@ -550,7 +550,7 @@ def test_a_stalled_journald_does_not_stop_serving_or_revocation(alice_fast, fast
 
 
 @pytest.mark.plan("OPS-13")
-@pytest.mark.xfail(strict=True, reason="FXX-OPS-13: the shutdown line waits on the blocked log writer, so a restart hangs")
+@pytest.mark.xfail(strict=True, reason="F28: the shutdown line waits on the blocked log writer, so a restart hangs")
 def test_a_restart_during_a_journald_stall_is_not_held_up(alice_fast, fast_server, make_client):
     """A restart while journald is stalled must still restart.
 
@@ -756,7 +756,7 @@ def test_the_shipped_unit_waits_for_a_late_listen_address(make_client, fast_serv
 
 
 @pytest.mark.plan("OPS-15")
-@pytest.mark.xfail(strict=True, reason="FXX-OPS-15: restarting the unit while it waits for its address trips the start limit for good")
+@pytest.mark.xfail(strict=True, reason="F29: restarting the unit while it waits for its address trips the start limit for good")
 def test_restarting_while_waiting_for_the_address_does_not_give_up(make_client, fast_server, env):
     """An administrator restarts the waiting unit; it must still come up with the address.
 
@@ -797,7 +797,7 @@ def readme_unit() -> str:
 
 
 @pytest.mark.plan("OPS-15")
-@pytest.mark.xfail(strict=True, reason="FXX-OPS-15-docs: the README's unit restarts every 100 ms, so a late address trips the start limit at once")
+@pytest.mark.xfail(strict=True, reason="F29: the README's unit restarts every 100 ms, so a late address trips the start limit at once")
 def test_the_readme_unit_waits_for_a_late_listen_address(make_client, fast_server, env):
     """The same late address, under the unit the README shows instead of the shipped one.
 
@@ -807,7 +807,7 @@ def test_the_readme_unit_waits_for_a_late_listen_address(make_client, fast_serve
     once the address is there. It is also ordered only after
     `network.target`, which waits for no address at all. Proposed: show the
     shipped unit (`RestartSec=2`, `After=network-online.target`) in the
-    README, with `StartLimitIntervalSec=0` as for FXX-OPS-15.
+    README, with `StartLimitIntervalSec=0` as for F29.
     """
     node = fast_server.node
     address, prefix = env.spare_ip(41), env.subnet().prefixlen
@@ -1278,7 +1278,7 @@ def test_an_upgrade_keeps_keys_authorizations_and_pins(make_client, fast_server)
 @pytest.mark.xfail(
     strict=True,
     raises=Unmet,
-    reason="FXX-OPS-14 (decision): under 1.0's contrib unit (ProtectSystem=full) the upgraded server "
+    reason="F36 (decision): under 1.0's contrib unit (ProtectSystem=full) the upgraded server "
     "cannot open /etc/qsh/authorized.lock for writing and never starts",
 )
 def test_an_upgrade_keeps_serving_under_the_unit_1_0_shipped(make_client, fast_server):
@@ -1499,7 +1499,7 @@ def test_the_previous_release_and_this_one_interoperate(make_client, fast_server
 @pytest.mark.xfail(
     strict=True,
     raises=Unmet,
-    reason="FXX-OPS-16b: this client rejects an Error frame over 4096 bytes, and a 1.0 server "
+    reason="F32: this client rejects an Error frame over 4096 bytes, and a 1.0 server "
     "sends its refusals unbounded",
 )
 def test_a_long_refusal_from_the_previous_server_reaches_this_client(make_client, fast_server):
@@ -1664,7 +1664,7 @@ def test_an_interrupted_revocation_keeps_the_key_refused(make_client, fast_serve
 @pytest.mark.xfail(
     strict=True,
     raises=Unmet,
-    reason="FXX-OPS-16 (decision): 1.0 ignores the denial marker an interrupted revoke leaves, so rolling "
+    reason="F37 (decision): 1.0 ignores the denial marker an interrupted revoke leaves, so rolling "
     "back re-enables the key; only a revoke that first makes the legacy policy unreadable to 1.0 passes",
 )
 def test_a_rollback_keeps_an_interrupted_revocation_refused(make_client, fast_server):

@@ -830,7 +830,7 @@ def test_a_directory_outage_fails_sessions_and_gives_their_budget_back(make_clie
 @pytest.mark.xfail(
     strict=True,
     raises=Unmet,
-    reason="FXX-AUTH-20: qsh-server does not exit until every stuck account lookup has returned, "
+    reason="F31: qsh-server does not exit until every stuck account lookup has returned, "
     "so stop and restart wait out the directory's timeouts",
 )
 def test_a_directory_outage_does_not_hold_up_stopping_the_server(make_client, server, env):
