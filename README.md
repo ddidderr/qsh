@@ -505,6 +505,10 @@ waiting to be noticed.
 parse runs nothing and reports no failure — which is exactly how an earlier
 version of this file sat there doing nothing.
 
+`.github/workflows/e2e.yml` checks that the test plan and the scenarios
+agree, then runs the multi-host suite; pull requests skip the scenarios
+marked slow (a gigabyte each way, outages under the default timeouts).
+
 ### Lints
 
 The crate builds clean under `clippy::pedantic` with warnings as errors, and
