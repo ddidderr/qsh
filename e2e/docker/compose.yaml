@@ -1,0 +1,65 @@
+# The e2e topology: two server machines, two client machines and a network
+# simulator, all on one private bridge network.
+#
+#   client1 (alice) ─┐                    ┌─ server   qsh-server under systemd
+#   client2 (bob)   ─┼── lan ─────────────┼─ server2  a second host: impostor,
+#                    └─ netsim (relay) ───┘           or a second real server
+#
+# Direct paths go client -> server over the bridge. Impaired paths go
+# client -> netsim:PORT -> server, so netsim can drop, delay, reorder,
+# duplicate, black-hole or re-address the traffic of one test without
+# touching any other.
+#
+# The harness starts this with `docker compose -p <project>` and picks a free
+# subnet for each project, so several environments can coexist; nothing here
+# pins a name or a port on the host. The subnet is explicit because Docker
+# only lets a node move to a chosen address (a roaming client) on networks
+# with a configured subnet.
+
+x-node: &node
+  image: ${QSH_E2E_IMAGE:-qsh-e2e-node:latest}
+  networks: [lan]
+  # Short, so a failing scenario never waits long on teardown.
+  stop_grace_period: 5s
+
+x-server: &server
+  <<: *node
+  command: ["init"]
+  # systemd as PID 1 needs to mount its own cgroup view; see
+  # node-entrypoint.sh. The servers are the only privileged nodes.
+  privileged: true
+  cgroup: private
+  tmpfs: [/run, /run/lock, /tmp]
+
+services:
+  server:
+    <<: *server
+    hostname: server
+
+  server2:
+    <<: *server
+    hostname: server2
+
+  client1:
+    <<: *node
+    hostname: client1
+    init: true
+
+  client2:
+    <<: *node
+    hostname: client2
+    init: true
+
+  netsim:
+    <<: *node
+    hostname: netsim
+    init: true
+    # Adding a second address is how the relay simulates a client that
+    # changed networks.
+    cap_add: [NET_ADMIN]
+
+networks:
+  lan:
+    ipam:
+      config:
+        - subnet: ${QSH_E2E_SUBNET:-172.30.77.0/24}

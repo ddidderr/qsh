@@ -1,0 +1,9 @@
+# The build context is the repository root, but the image only needs the
+# crate sources, the systemd unit and the e2e support files.
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+!contrib/qsh-server.service
+!e2e/netsim/netsim.py
+!e2e/docker/node-entrypoint.sh
