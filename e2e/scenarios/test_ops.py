@@ -670,3 +670,105 @@ def test_a_large_authorization_store_keeps_its_bounds(make_client, fast_server):
         node.sh(f"flock {store}.lock sh -c 'rm -rf {store} && cp -a {backup} {store}' && rm -rf {backup} {keys}")
         fast_server.restart()
     assert tree_listing(node, store) == before
+
+
+# A capture of the UDP datagrams to or from one port on a node's eth0, both
+# directions, until a stop file appears: counts per flow, as JSON.
+CAPTURE = r"""
+import json, os, socket, struct, sys, time
+iface, port, stop = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))  # ETH_P_ALL
+sock.bind((iface, 0))
+sock.settimeout(0.2)
+open(stop + ".ready", "w").close()
+flows = {}
+deadline = time.monotonic() + 120
+while not os.path.exists(stop) and time.monotonic() < deadline:
+    try:
+        frame = sock.recv(65535)
+    except socket.timeout:
+        continue
+    if len(frame) < 42 or frame[12:14] != b"\x08\x00" or frame[23] != 17:  # IPv4, UDP
+        continue
+    ihl = (frame[14] & 0x0F) * 4
+    sport, dport = struct.unpack("!HH", frame[14 + ihl:18 + ihl])
+    if port in (sport, dport):
+        key = f"{socket.inet_ntoa(frame[26:30])}:{sport} {socket.inet_ntoa(frame[30:34])}:{dport}"
+        flows[key] = flows.get(key, 0) + 1
+print(json.dumps(flows))
+"""
+
+
+class UdpCapture:
+    """What a node's network interface carried to and from one UDP port.
+
+    An AF_PACKET socket sees the datagrams as they leave and arrive, with the
+    addresses they really carry; Docker gives every container CAP_NET_RAW.
+    """
+
+    def __init__(self, node, port: int) -> None:
+        self.node = node
+        self.port = port
+        self.flows: dict[tuple[str, int, str, int], int] = {}
+
+    def __enter__(self) -> UdpCapture:
+        self.stop = f"/tmp/{unique('capture')}.stop"
+        self.proc = self.node.popen(["python3", "-c", CAPTURE, "eth0", str(self.port), self.stop])
+        deadline = time.monotonic() + 10
+        while not self.node.exists(f"{self.stop}.ready"):
+            if self.proc.poll() is not None or time.monotonic() > deadline:
+                self.proc.kill()
+                raise AssertionError(f"the capture did not start: {self.proc.communicate()[1].decode()}")
+            time.sleep(0.1)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.node.run(["touch", self.stop])
+        out, err = self.proc.communicate(timeout=30)
+        self.node.run(["rm", "-f", self.stop, f"{self.stop}.ready"])
+        assert self.proc.returncode == 0, err.decode()
+        for flow, count in json.loads(out).items():
+            src, dst = (end.rsplit(":", 1) for end in flow.split())
+            self.flows[(src[0], int(src[1]), dst[0], int(dst[1]))] = count
+
+
+@pytest.mark.plan("OPS-18")
+def test_a_wildcard_listener_answers_from_the_address_dialed(make_client, fast_server, env):
+    """server2 gains a second address; replies leave from whichever one the client used.
+
+    The daemon listens on 0.0.0.0:2222, so the kernel would pick the source
+    of an unconnected reply by route: the primary address. A QUIC client
+    drops datagrams from an address it did not dial, so a reply from the
+    wrong one would never connect. quinn learns each datagram's destination
+    (IP_PKTINFO) and answers from it. The capture on client1 shows, per
+    client port, where its datagrams went and where the answers came from.
+    """
+    node = fast_server.node
+    primary = node.ip
+    secondary = env.spare_ip(30)
+    listening = node.run(["ss", "-Hlun", f"sport = :{PORT}"], check=True).stdout
+    assert f"0.0.0.0:{PORT}" in listening, listening
+    client = make_client("alice", authorize_as="alice", on=fast_server)
+    for address in (primary, secondary):
+        client.pin(address, fast_server.fp)
+    node.run(["ip", "addr", "add", f"{secondary}/{env.subnet().prefixlen}", "dev", "eth0"], check=True)
+    try:
+        with UdpCapture(client.node, PORT) as capture:
+            for address in (secondary, primary):
+                r = client.run(address, "hostname", timeout=30)
+                assert r.rc == 0 and r.stdout.strip() == "server2", r.describe()
+    finally:
+        node.run(["ip", "addr", "del", f"{secondary}/{env.subnet().prefixlen}", "dev", "eth0"])
+    me = client.node.ip
+    dialed: dict[int, set[str]] = {}
+    answered: dict[int, set[str]] = {}
+    for (src, sport, dst, dport), _ in capture.flows.items():
+        if src == me and dport == PORT:
+            dialed.setdefault(sport, set()).add(dst)
+        elif dst == me and sport == PORT:
+            answered.setdefault(dport, set()).add(src)
+    for address in (secondary, primary):
+        ports = [port for port, dests in dialed.items() if dests == {address}]
+        assert ports, f"no datagrams to {address}: {capture.flows}"
+        for port in ports:
+            assert answered.get(port) == {address}, f"client port {port} dialed {address}: {capture.flows}"

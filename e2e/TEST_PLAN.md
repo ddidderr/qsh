@@ -603,8 +603,10 @@ fails until the mark is removed, so a fix cannot go unnoticed.
 - **Expected:** the median login within 0.25 s of the small store's and every login under 2 s (measured 0.10–0.12 s with either store, at most 0.18 s); an authorization in effect within 2.5 s (README: "within a second"; 0.2–0.6 s, then 0.7–0.9 s); a revocation within 4 s (README: "normally within two seconds"; 0.7–0.8 s with either store); the idle daemon under half a CPU (5%); the store restored byte for byte.
 
 ### OPS-18 — A wildcard listen address on a host with a secondary address
-- **Status:** planned · **Priority:** P2 · **Needs:** —
-- **Expected:** replies leave from the address the client used; a client dialing the secondary address connects.
+- **Status:** automated · **Priority:** P2 · **Needs:** server2
+- **Why:** on an unconnected socket bound to `0.0.0.0` the kernel picks a reply's source address by route, which is the primary address; a QUIC client drops datagrams from an address it did not dial.
+- **Steps:** add a secondary address from the subnet to server2's `eth0` (the daemon listens on `0.0.0.0:2222`); run a session to the secondary address and one to the primary, while an AF_PACKET socket on client1 records each datagram's addresses.
+- **Expected:** both sessions work; every datagram to a client port comes from the address that port dialed (quinn reads each datagram's destination address and answers from it). A wildcard UDP server that does not do this answers from the primary address, which the capture shows and a connected socket never receives.
 
 ## SEC — threat-model boundaries
 
