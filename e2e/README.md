@@ -86,10 +86,12 @@ accounts `alice` (with supplementary group `project`), `bob`, `carol` and
 - **netsim** runs [netsim.py](netsim/netsim.py), a UDP relay with a control
   socket. One relay process is one link, created per scenario on its own
   port: `client → netsim:PORT → server`. It applies loss, delay, jitter,
-  reordering, duplication, a total black hole, and can move a flow to a new
-  source port or address (what a NAT rebinding or a roaming client looks like
-  to the server). `--trace` logs every datagram. Userspace, not `tc netem`,
-  so it behaves the same on every kernel Docker runs on.
+  reordering, duplication, a black hole in both directions or in one, and a
+  datagram size limit (a path MTU that shrinks without ICMP), and can move a
+  flow to a new source port or address (what a NAT rebinding or a roaming
+  client looks like to the server). `--trace` logs every datagram with its
+  size. Userspace, not `tc netem`, so it behaves the same on every kernel
+  Docker runs on.
 
 The compose project name and subnet are chosen per run, so several runs can
 coexist on one Docker host.
