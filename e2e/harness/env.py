@@ -30,6 +30,15 @@ class CommandFailed(AssertionError):
     """A command that was expected to succeed did not. Carries its output."""
 
 
+class Unmet(Exception):
+    """What a strict-xfail scenario expects and qsh does not do yet.
+
+    Raised for that one expectation only, and named in the mark's `raises`,
+    so a broken precondition fails the test instead of passing as the
+    expected failure.
+    """
+
+
 @dataclass
 class Result:
     argv: list[str]
@@ -221,10 +230,12 @@ class Node:
             time.sleep(0.25)
 
     def kill_command(self, user: str, argv: list[str], signal: str = "KILL") -> bool:
-        """Signal `user`'s processes running exactly `argv`, inside the node.
+        """Send `signal` (SIGKILL) to `user`'s processes running exactly `argv`.
 
         Killing a local `docker exec` client does not stop what it started in
-        the container; this does. Returns whether any process matched.
+        the container; this does. Another signal reaches the process itself,
+        not the `docker exec` that started it. Returns whether any process
+        matched.
         """
         pattern = "^" + re.escape(" ".join(argv)) + "$"
         return self.run(["pkill", f"-{signal}", "-u", user, "-f", pattern]).rc == 0

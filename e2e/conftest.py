@@ -14,7 +14,7 @@ from collections.abc import Callable, Iterator
 import pytest
 
 from harness.env import DEFAULT_IMAGE, Environment, docker
-from harness.qsh import NetLink, QshClient, QshServer, unique
+from harness.qsh import NetLink, PreviousQshClient, QshClient, QshServer, unique
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -109,7 +109,8 @@ def make_client(env: Environment, server: QshServer) -> Iterator[Callable[..., Q
 
     The identity lives in its own directory, is pinned to `server` (or the
     server given as `on`), and its authorization, named `client.entry`, is
-    revoked again when the scenario ends.
+    revoked again when the scenario ends. With `previous=True` the previous
+    release's client makes and drives it (`harness.qsh.PreviousQshClient`).
     """
     made: list[tuple[QshClient, str | None]] = []
 
@@ -121,10 +122,12 @@ def make_client(env: Environment, server: QshServer) -> Iterator[Callable[..., Q
         options: tuple[str, ...] = (),
         pin: bool = True,
         on: QshServer | None = None,
+        previous: bool = False,
     ) -> QshClient:
         target = on or server
         name = unique(f"{user}-{node}")
-        client = QshClient(env.node(node), user, identity=f"/home/{user}/.config/{name}")
+        kind = PreviousQshClient if previous else QshClient
+        client = kind(env.node(node), user, identity=f"/home/{user}/.config/{name}")
         client.keygen()
         client.entry = name
         if authorize_as is not None:

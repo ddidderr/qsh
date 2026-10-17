@@ -18,6 +18,15 @@ from .env import CommandFailed, Node, Result
 
 PORT = 2222
 
+DEFAULT_STATE_DIR = "/etc/qsh"
+
+# The previous release, installed next to the current binaries with its
+# version as a suffix (e2e/run pins which commit that is). The upgrade and
+# version-skew scenarios run it; everything else runs the current build.
+PREVIOUS_VERSION = "1.0"
+PREVIOUS_QSH = f"qsh-{PREVIOUS_VERSION}"
+PREVIOUS_QSH_SERVER = f"qsh-server-{PREVIOUS_VERSION}"
+
 # `qsh-server authorize` and `revoke` take effect at the server's next
 # once-a-second reload; revocation also needs the next policy check. The
 # README promises "normally within two seconds". Scenarios wait this long
@@ -33,20 +42,36 @@ def unique(prefix: str) -> str:
 
 
 class QshServer:
-    """A qsh-server on a server node, run by systemd as root (or by hand)."""
+    """A qsh-server on a server node, run by systemd as root (or by hand).
 
-    def __init__(self, node: Node, *, state_dir: str = "/etc/qsh", unit: str = "qsh-server") -> None:
+    `program` is the binary that manages it, `qsh-server` unless a scenario
+    drives another build. A state directory other than /etc/qsh is passed to
+    every management command with `--dir`.
+    """
+
+    def __init__(
+        self,
+        node: Node,
+        *,
+        state_dir: str = DEFAULT_STATE_DIR,
+        unit: str = "qsh-server",
+        program: str = "qsh-server",
+    ) -> None:
         self.node = node
         self.state_dir = state_dir
         self.unit = unit
+        self.program = program
 
     @property
     def host(self) -> str:
         return self.node.service
 
     def admin(self, *args: str, check: bool = True, user: str | None = None) -> Result:
-        """Run `qsh-server <args>` as root (the default /etc/qsh)."""
-        return self.node.run(["qsh-server", *args], user=user, check=check)
+        """Run `qsh-server [--dir DIR] <args>`, as root unless `user` is given."""
+        argv = [self.program]
+        if self.state_dir != DEFAULT_STATE_DIR:
+            argv += ["--dir", self.state_dir]
+        return self.node.run([*argv, *args], user=user, check=check)
 
     def keygen(self, *args: str) -> str:
         out = self.admin("keygen", *args).stdout
@@ -133,13 +158,14 @@ class QshClient:
     fingerprint: str = ""
     extra: list[str] = field(default_factory=list)
     entry: str = ""  # its authorization's name, when a fixture made one
+    program: str = "qsh"  # the client binary
 
     @property
     def identity_dir(self) -> str:
         return self.identity or f"/home/{self.user}/.config/qsh"
 
     def keygen(self, *args: str) -> str:
-        argv = ["qsh", "keygen", *args]
+        argv = [self.program, "keygen", *args]
         if self.identity:
             argv += ["--identity", self.identity]
         out = self.node.run(argv, user=self.user, check=True).stdout
@@ -150,7 +176,7 @@ class QshClient:
         return self.node.read(f"{self.identity_dir}/id.crt", user=self.user)
 
     def subcommand(self, name: str, *args: str, check: bool = True) -> Result:
-        argv = ["qsh", name]
+        argv = [self.program, name]
         if self.identity:
             argv += ["-i", self.identity]
         return self.node.run([*argv, *args], user=self.user, check=check)
@@ -160,7 +186,7 @@ class QshClient:
 
     def argv(self, host: str, *command: str, port: int | None = None, options: tuple[str, ...] = ()) -> list[str]:
         """The `qsh` command line for this identity."""
-        argv = ["qsh"]
+        argv = [self.program]
         if self.identity:
             argv += ["-i", self.identity]
         if port is not None:
@@ -190,10 +216,26 @@ class QshClient:
     @property
     def qsh_command(self) -> str:
         """`qsh` with this identity, as a string for rsync -e / GIT_SSH_COMMAND."""
-        argv = ["qsh"]
+        argv = [self.program]
         if self.identity:
             argv += ["-i", self.identity]
         return shlex.join([*argv, *self.extra])
+
+
+@dataclass
+class PreviousQshClient(QshClient):
+    """An identity made and driven by the previous release's client, `qsh-1.0`.
+
+    1.0's `known-hosts` takes no `-i`: it finds the identity through
+    `QSH_HOME`, which both releases honour. Connecting and `keygen` take the
+    same options in both.
+    """
+
+    program: str = PREVIOUS_QSH
+
+    def subcommand(self, name: str, *args: str, check: bool = True) -> Result:
+        env = {"QSH_HOME": self.identity} if self.identity else None
+        return self.node.run([self.program, name, *args], user=self.user, env=env, check=check)
 
 
 def parse_fingerprint(text: str, label: str) -> str:
