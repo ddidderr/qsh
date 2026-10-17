@@ -485,6 +485,12 @@ The end-to-end tests start a real `qsh-server` on a loopback UDP port and
 drive the real `qsh` binary against it, including a binary round trip and, if
 `rsync` is installed, an actual `rsync -e qsh` transfer.
 
+The multi-host suite in [`e2e/`](e2e/README.md) goes further: Docker
+containers as separate machines, `qsh-server` under the shipped systemd unit,
+a network simulator that loses, delays, reorders and re-addresses traffic,
+and real rsync, tar and terminal sessions. `just e2e` runs it;
+[`e2e/TEST_PLAN.md`](e2e/TEST_PLAN.md) lists what it checks and why.
+
 ### Continuous integration
 
 `.github/workflows/ci.yml` runs rustfmt, pedantic clippy as errors, the tests

@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# Entry point for the multi-host end-to-end suite. See e2e/README.md.
+#
+#   e2e/run build              build the node image (qsh compiled inside it)
+#   e2e/run test [PYTEST...]   build, then run the scenarios
+#   e2e/run up                 start an environment to explore by hand
+#   e2e/run shell NODE [USER]  open a shell on a node of that environment
+#   e2e/run down               remove that environment
+#   e2e/run plan               check TEST_PLAN.md against the scenarios
+#
+# Environment variables:
+#   QSH_E2E_IMAGE      image tag to build and test (default qsh-e2e-node:latest)
+#   QSH_E2E_PROFILE    cargo profile for the binaries: release (default) or dev
+#   QSH_E2E_PROJECT    compose project name (default: unique per test run)
+#   QSH_E2E_SKIP_BUILD=1   test the image as it is
+#   QSH_E2E_CA_BUNDLE  extra CA certificate for builds behind a TLS-intercepting
+#                      proxy (default: $SSL_CERT_FILE when a proxy is set)
+set -euo pipefail
+
+E2E_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_DIR=$(dirname "$E2E_DIR")
+OUT_DIR="$REPO_DIR/target/e2e"
+VENV="$OUT_DIR/venv"
+IMAGE=${QSH_E2E_IMAGE:-qsh-e2e-node:latest}
+MANUAL_PROJECT=qsh-e2e-manual
+
+die() { echo "e2e/run: $*" >&2; exit 2; }
+
+need() {
+    command -v "$1" >/dev/null || die "$1 is required: $2"
+}
+
+build() {
+    need docker "install Docker (with the buildx/BuildKit and compose plugins)"
+    local args=(build -f "$E2E_DIR/docker/Dockerfile" -t "$IMAGE"
+        --build-arg "PROFILE=${QSH_E2E_PROFILE:-release}")
+    # A proxy on the build host is only reachable from the build container
+    # through the host's network namespace.
+    local proxy=${https_proxy:-${HTTPS_PROXY:-}}
+    if [ -n "$proxy" ]; then
+        args+=(--network host --build-arg "https_proxy=$proxy" --build-arg "HTTPS_PROXY=$proxy")
+        local ca=${QSH_E2E_CA_BUNDLE:-${SSL_CERT_FILE:-}}
+        if [ -n "$ca" ]; then
+            [ -r "$ca" ] || die "CA bundle $ca is not readable"
+            args+=(--secret "id=extra_ca,src=$ca")
+        fi
+    fi
+    echo "e2e/run: building $IMAGE" >&2
+    docker "${args[@]}" "$REPO_DIR"
+}
+
+venv() {
+    need python3 "Python 3.10 or later"
+    if [ ! -x "$VENV/bin/pytest" ] || [ "$E2E_DIR/requirements.txt" -nt "$VENV/.installed" ]; then
+        echo "e2e/run: preparing $VENV" >&2
+        python3 -m venv "$VENV" || die "python3 -m venv failed (Debian/Ubuntu: apt install python3-venv)"
+        "$VENV/bin/pip" install --quiet --upgrade pip
+        "$VENV/bin/pip" install --quiet -r "$E2E_DIR/requirements.txt"
+        touch "$VENV/.installed"
+    fi
+}
+
+compose() {
+    docker compose -p "$MANUAL_PROJECT" -f "$E2E_DIR/docker/compose.yaml" "$@"
+}
+
+cmd=${1:-help}
+shift || true
+case "$cmd" in
+    build)
+        build
+        ;;
+    test)
+        [ "${QSH_E2E_SKIP_BUILD:-0}" = 1 ] || build
+        venv
+        mkdir -p "$OUT_DIR"
+        export QSH_E2E_IMAGE="$IMAGE"
+        export QSH_E2E_ARTIFACTS="$OUT_DIR/artifacts"
+        rm -rf "$QSH_E2E_ARTIFACTS"
+        cd "$E2E_DIR"
+        exec "$VENV/bin/pytest" --junitxml="$OUT_DIR/junit.xml" "$@"
+        ;;
+    up)
+        venv
+        cd "$E2E_DIR"
+        QSH_E2E_IMAGE="$IMAGE" "$VENV/bin/python" -c '
+import sys
+from harness.env import Environment
+from harness.qsh import QshServer, QshClient
+env = Environment(sys.argv[1], sys.argv[2])
+env.down()
+env.up()
+server = QshServer(env.node("server"))
+fp = server.keygen()
+server.start()
+for node, user in (("client1", "alice"), ("client2", "bob")):
+    client = QshClient(env.node(node), user)
+    client.keygen()
+    server.authorize(client.cert(), user=user, name=f"{user}-{node}", settle=False)
+    client.pin("server", fp)
+print(f"environment {env.project} is up; server key {fp}")
+print("  e2e/run shell client1 alice   then: qsh server")
+' "$MANUAL_PROJECT" "$IMAGE"
+        ;;
+    shell)
+        node=${1:?usage: e2e/run shell NODE [USER]}
+        user=${2:-root}
+        exec docker exec -it -u "$user" -w "$( [ "$user" = root ] && echo /root || echo "/home/$user")" \
+            -e "HOME=$( [ "$user" = root ] && echo /root || echo "/home/$user")" -e "USER=$user" \
+            -e TERM="${TERM:-xterm}" "$MANUAL_PROJECT-$node-1" bash -l
+        ;;
+    down)
+        compose down --volumes --timeout 5
+        ;;
+    plan)
+        exec python3 "$E2E_DIR/tools/plan_check.py"
+        ;;
+    help|-h|--help)
+        # The comment block at the top, without the code after it.
+        sed -n '2,/^[^#]/{/^#/p}' "$0" | sed 's/^# \{0,1\}//'
+        ;;
+    *)
+        die "unknown command $cmd (try e2e/run help)"
+        ;;
+esac

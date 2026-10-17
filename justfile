@@ -3,6 +3,7 @@
 #   just            list the recipes
 #   just check      what CI runs: format, lints, tests
 #   just demo       a throwaway server + client in /tmp, ready to poke at
+#   just e2e        the multi-host end-to-end suite (Docker)
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
@@ -58,6 +59,15 @@ test-unit:
 # Just the end-to-end suite, with output shown.
 test-e2e:
     cargo test --test e2e -- --nocapture
+
+# Multi-host end-to-end suite in Docker; args go to pytest (e2e/README.md).
+[positional-arguments]
+e2e *ARGS:
+    e2e/run test "$@"
+
+# Check e2e/TEST_PLAN.md against the scenarios that implement it.
+e2e-plan:
+    e2e/run plan
 
 # List every justified `unsafe` exception and count the blocks per file.
 audit-unsafe:
