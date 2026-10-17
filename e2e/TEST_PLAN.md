@@ -523,47 +523,47 @@ commit that fixed it.
 ## OPS — running the server
 
 ### OPS-01 — Root `keygen` lays out `/etc/qsh`
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Expected:** `server.key` 0600 root, the configuration, `authorized/` not group- or world-writable, `fingerprint` matches, a second `keygen` refuses without `--force`.
 
 ### OPS-02 — The shipped unit runs the server
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Expected:** active, `User=root`, `Delegate=yes`, `KillMode=control-group`, `Restart=on-failure`; journal says `listening on 0.0.0.0:2222`.
 
 ### OPS-03 — Logins are logged with peer, key and account
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** `<client1 IP>:<port> authenticated as `alice` (key `alice-client1`)`.
 
 ### OPS-04 — `systemctl stop` ends sessions and tells clients at once
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Expected:** the unit stops within 10 s, the job is gone, the client exits 255 within 10 s saying the server is shutting down (not after the 60 s idle timeout). Found F8.
 
 ### OPS-05 — A crashed daemon is restarted and its sessions cleaned
-- **Status:** planned · **Priority:** P0 · **Needs:** server2
+- **Status:** automated · **Priority:** P0 · **Needs:** server2
 - **Expected:** after `kill -9` of the main process, systemd starts a new one; the old session's job is gone (`KillMode=control-group`); new sessions work.
 
 ### OPS-06 — The configured listen address is used
-- **Status:** planned · **Priority:** P1 · **Needs:** server2
+- **Status:** automated · **Priority:** P1 · **Needs:** server2
 - **Expected:** `listen = "0.0.0.0:2400"` serves on 2400 after a restart.
 
 ### OPS-07 — An invalid configuration stops startup with a reason
-- **Status:** planned · **Priority:** P1 · **Needs:** server2
+- **Status:** automated · **Priority:** P1 · **Needs:** server2
 - **Expected:** the unit fails; the journal says "`listen` is not a socket address".
 
 ### OPS-08 — An explicit missing configuration fails before startup
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** non-zero status naming the file (README: "must exist").
 
 ### OPS-09 — A second daemon on a busy port fails clearly
-- **Status:** planned · **Priority:** P2 · **Needs:** —
+- **Status:** automated · **Priority:** P2 · **Needs:** —
 - **Expected:** a message that the address is already in use; the service is unaffected.
 
 ### OPS-10 — A non-root server serves only its own account
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** alice's own daemon from `~/.config/qsh-server` serves alice; a session as bob fails.
 
 ### OPS-11 — Rotating the host key is refused until re-pinned
-- **Status:** planned · **Priority:** P0 · **Needs:** server2
+- **Status:** automated · **Priority:** P0 · **Needs:** server2
 - **Expected:** after `keygen --force` and a restart the client refuses with status 255, naming both the pinned and the presented `sha256:` fingerprints and how to remove the old pin; after re-pinning it works. Found F9.
 
 ### OPS-12 — SIGHUP is not a reload
