@@ -79,9 +79,9 @@ accounts `alice` (with supplementary group `project`), `bob`, `carol` and
   `--kill-session-processes` works the way it does on a modern host.
 - **server2** is a second machine: a server with an 8 s idle timeout for the
   scenarios that wait for a peer to be declared dead, the impostor in the
-  host-key scenarios, and the victim of the crash, reconfiguration and
-  key-rotation scenarios. (NET-10 and OPS-04 restart and stop `server`
-  itself, on purpose: they need its default 60 s idle timeout.)
+  host-key scenarios, and the victim of the crash, reconfiguration,
+  key-rotation and reboot scenarios. (NET-10 and OPS-04 restart and stop
+  `server` itself, on purpose: they need its default 60 s idle timeout.)
 - **client1** and **client2** are where qsh runs, as `alice` and `bob`.
 - **netsim** runs [netsim.py](netsim/netsim.py), a UDP relay with a control
   socket. One relay process is one link, created per scenario on its own
@@ -108,8 +108,9 @@ The fixtures in [conftest.py](conftest.py) provide the shared machines:
 pinned identities), `alice_fast` (alice's key on server2), `make_client`
 (a fresh identity with its own policy, revoked afterwards) and `make_link`
 (a netsim relay, closed afterwards). The helpers in [harness/](harness/)
-run commands on nodes (`Node.run`, `Node.sh`, `Node.wait_for`), drive qsh
-(`QshServer`, `QshClient`, `NetLink`), and drive terminals (`Terminal`).
+run commands on nodes (`Node.run`, `Node.sh`, `Node.wait_for`) and reboot
+them (`Node.reboot`), drive qsh (`QshServer`, `QshClient`, `NetLink`), and
+drive terminals (`Terminal`).
 
 Scenarios share the environment, as tests on real machines would. Leave
 shared state as you found it: use your own identity from `make_client`, a

@@ -251,6 +251,27 @@ class Node:
                 raise AssertionError(f"on {self.service}: `{script}` did not hold within {timeout}s")
             time.sleep(interval)
 
+    # ------------------------------------------------------------ boot
+
+    def wait_booted(self, timeout: float = 60) -> None:
+        """Wait until systemd, PID 1 on a server node, has finished booting."""
+        # `degraded` is acceptable: some unit unrelated to qsh may fail in a
+        # container. What matters is that boot finished and systemd is up.
+        self.wait_for(
+            "s=$(systemctl is-system-running 2>/dev/null); [ \"$s\" = running ] || [ \"$s\" = degraded ]",
+            timeout=timeout,
+        )
+
+    def reboot(self, *, timeout: float = 60) -> None:
+        """Reboot a server node: systemd shuts down, the container restarts, systemd boots.
+
+        What a disk would keep survives (the container's own files: /etc,
+        /var); the tmpfs mounts (/run, /tmp) and every process do not.
+        systemd gets 30 s to shut down cleanly before Docker kills it.
+        """
+        docker("restart", "-t", "30", self.container, timeout=timeout)
+        self.wait_booted(timeout)
+
     # ------------------------------------------------------------ network
 
     @property
@@ -282,12 +303,7 @@ class Environment:
         self.subnet_spec = free_subnet(self.project)
         self.compose("up", "--detach", "--quiet-pull")
         for service in ("server", "server2"):
-            # `degraded` is acceptable: some unit unrelated to qsh may fail in a
-            # container. What matters is that boot finished and systemd is up.
-            self.node(service).wait_for(
-                "s=$(systemctl is-system-running 2>/dev/null); [ \"$s\" = running ] || [ \"$s\" = degraded ]",
-                timeout=60,
-            )
+            self.node(service).wait_booted()
 
     def down(self) -> None:
         self.compose("down", "--volumes", "--timeout", "5", check=False)
