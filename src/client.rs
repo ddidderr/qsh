@@ -722,8 +722,17 @@ async fn receive_output(
     stderr: &mut (impl tokio::io::AsyncWrite + Unpin),
 ) -> Result<i32> {
     while let Some(frame) = read_frame(recv).await? {
-        if let Some(status) = apply(frame, stdout, stderr).await? {
-            return Ok(status.wait_status());
+        match apply(frame, stdout, stderr).await {
+            Ok(Some(status)) => return Ok(status.wait_status()),
+            Ok(None) => {}
+            // Whoever read our output has gone, as `head` does once it has
+            // its line. A local writer would die of SIGPIPE here, silently;
+            // end the same way. Leaving the session lets the server stop the
+            // remote writer.
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+                return Ok(128 + libc::SIGPIPE);
+            }
+            Err(error) => return Err(error.into()),
         }
     }
     bail!("the connection closed before the remote process reported an exit status")
@@ -734,7 +743,7 @@ async fn apply(
     frame: Frame,
     stdout: &mut (impl tokio::io::AsyncWrite + Unpin),
     stderr: &mut (impl tokio::io::AsyncWrite + Unpin),
-) -> Result<Option<ExitStatus>> {
+) -> std::io::Result<Option<ExitStatus>> {
     match frame {
         Frame::Stdout(data) => {
             stdout.write_all(&data).await?;
