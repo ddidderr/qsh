@@ -743,7 +743,7 @@ that fixed each one carries its ID.
 | F7 | P1 | A root daemon left the session's terminal owned by root, so the user could not open it by name | SEC-09 | open |
 | F8 | P1 | Stopping or restarting the server sent no close, so clients hung for the idle timeout | OPS-04, NET-10 | open |
 | F9 | P1 | A changed host key was reported as Rust debug output with decimal bytes, not fingerprints | OPS-11, SEC-01 | open |
-| F10 | P1 | A closed stderr made qsh panic (status 101) | EXEC-21 | open |
+| F10 | P1 | A closed stderr made qsh panic (status 101) | EXEC-21 | fixed |
 | F11 | P2 | A missing remote program exited 126; shells and ssh say 127 | EXEC-12 | open |
 | F12 | P2 | A resize during session setup was never sent | PTY-14 | open |
 | F14 | P1 | An external SIGINT, SIGUSR1, SIGUSR2 or SIGALRM left the local terminal raw | PTY-15 | open |

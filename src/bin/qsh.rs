@@ -11,6 +11,7 @@
 //! the remote command and is passed through as a structured argument list,
 //! never re-joined into a shell string.
 
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -64,7 +65,9 @@ fn main() -> ExitCode {
         // reports for its own failures.
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(255)),
         Err(e) => {
-            eprintln!("qsh: {e:#}");
+            // Not eprintln!: it panics when stderr is a closed pipe, as in
+            // `qsh host cmd 2>&1 | head`, and the status would become 101.
+            let _ = writeln!(std::io::stderr(), "qsh: {e:#}");
             ExitCode::from(255)
         }
     }

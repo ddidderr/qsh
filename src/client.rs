@@ -225,7 +225,10 @@ pub async fn run(mut opts: Options) -> Result<i32> {
         }
         known.set_if_new(&host_key, fp)?;
         if !opts.quiet {
-            eprintln!("qsh: permanently added {host_key} ({fp}) to known hosts");
+            let _ = writeln!(
+                std::io::stderr(),
+                "qsh: permanently added {host_key} ({fp}) to known hosts"
+            );
         }
         fp
     };
@@ -556,7 +559,7 @@ async fn session(conn: &quinn::Connection, opts: &Options) -> Result<i32> {
     match read_frame(&mut recv).await? {
         Some(Frame::Started) => {}
         Some(Frame::Error(msg)) => {
-            eprintln!("qsh: {msg}");
+            let _ = writeln!(std::io::stderr(), "qsh: {msg}");
             // Drain the exit status the server sends after an error.
             if let Ok(Some(Frame::Exit(s))) = read_frame(&mut recv).await {
                 return Ok(s.wait_status());
