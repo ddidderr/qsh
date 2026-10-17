@@ -537,6 +537,7 @@ async fn session(conn: &quinn::Connection, opts: &Options) -> Result<i32> {
         }
     }
 
+    let sent_size = pty_req.as_ref().map(|p| p.size);
     let (mut send, mut recv) = conn.open_bi().await.context("opening the session stream")?;
 
     write_frame(
@@ -585,7 +586,7 @@ async fn session(conn: &quinn::Connection, opts: &Options) -> Result<i32> {
     };
 
     let blocking = BlockingStdio::enable();
-    let result = pump(send, recv, use_pty, opts.no_stdin).await;
+    let result = pump(send, recv, sent_size, opts.no_stdin).await;
     drop(raw);
     drop(blocking);
     result
@@ -649,9 +650,10 @@ type Outbound = mpsc::Sender<Frame>;
 async fn pump(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
-    use_pty: bool,
+    sent_size: Option<crate::proto::PtySize>,
     no_stdin: bool,
 ) -> Result<i32> {
+    let use_pty = sent_size.is_some();
     let (tx, mut rx) = mpsc::channel::<Frame>(64);
     let (disconnect, disconnected) = oneshot::channel();
     // JoinSet aborts its tasks even if this future is cancelled or errors.
@@ -677,8 +679,8 @@ async fn pump(
             disconnect,
         ));
     }
-    if use_pty {
-        tasks.spawn(forward_winch(tx.clone()));
+    if let Some(sent) = sent_size {
+        tasks.spawn(forward_winch(tx.clone(), sent));
     }
     if !terminal_input {
         tasks.spawn(forward_signals(tx.clone()));
@@ -945,20 +947,27 @@ fn terminal_size() -> crate::proto::PtySize {
 }
 
 /// Forward terminal resizes.
-async fn forward_winch(tx: Outbound) {
+///
+/// `sent` is the size the request carried. A resize while the session was
+/// being set up, before this listens for SIGWINCH, is caught by comparing
+/// against it rather than against the size at the time this starts.
+async fn forward_winch(tx: Outbound, sent: crate::proto::PtySize) {
     let Ok(mut winch) =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
     else {
         return;
     };
-    let mut last = terminal_size();
-    while winch.recv().await.is_some() {
+    let mut last = sent;
+    loop {
         let size = terminal_size();
         if size != last {
             last = size;
             if tx.send(Frame::Resize(size)).await.is_err() {
                 break;
             }
+        }
+        if winch.recv().await.is_none() {
+            break;
         }
     }
 }
