@@ -45,13 +45,19 @@ need() {
 }
 
 # Export the previous release's tree for the image's `previous` build context.
-# A shallow clone (CI's checkout) lacks the commit, so fetch just that one.
+# A shallow clone (CI's checkout) lacks the commit, so fetch just that one;
+# only a clone that is shallow already is fetched into shallowly, so a full
+# one that lacks the commit stays a full one.
 export_previous() {
     need git "the previous release is exported from this repository"
     local dir="$OUT_DIR/previous"
     if ! git -C "$REPO_DIR" cat-file -e "$PREVIOUS_COMMIT^{commit}" 2>/dev/null; then
         echo "e2e/run: fetching $PREVIOUS_COMMIT (qsh $PREVIOUS_VERSION)" >&2
-        git -C "$REPO_DIR" fetch --quiet --depth=1 origin "$PREVIOUS_COMMIT" \
+        local depth=
+        if [ "$(git -C "$REPO_DIR" rev-parse --is-shallow-repository)" = true ]; then
+            depth=--depth=1
+        fi
+        git -C "$REPO_DIR" fetch --quiet ${depth:+"$depth"} origin "$PREVIOUS_COMMIT" \
             || die "cannot fetch qsh $PREVIOUS_VERSION ($PREVIOUS_COMMIT) from origin"
     fi
     rm -rf "$dir"
