@@ -302,7 +302,7 @@ fails until the mark is removed, so a fix cannot go unnoticed.
 
 ### XFER-12 — git over qsh through a `sh -c` wrapper
 - **Status:** automated · **Priority:** P2 · **Needs:** —
-- **Why:** git passes its remote command as one shell string (`git-upload-pack '/path'`), which qsh does not split. The README documents a wrapper that runs that string with `sh -c`.
+- **Why:** git passes its remote command as one shell string (`git-upload-pack '/path'`), which qsh does not split. The README documents a wrapper that runs that string with `sh -c` and drops the `-o SendEnv=GIT_PROTOCOL` git adds for `GIT_SSH_VARIANT=ssh`, since qsh has no `-o`.
 - **Expected:** with the README's wrapper and `GIT_SSH_VARIANT=ssh`, clone (`server:repo.git`, relative to the remote home), push, clone of an `ssh://server:2222/...` URL and fetch all work. Found F20.
 
 ### XFER-13 — rsync under a `--kill-session-processes` key

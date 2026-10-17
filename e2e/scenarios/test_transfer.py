@@ -301,8 +301,16 @@ def test_revoking_a_key_mid_rsync_stops_the_transfer(make_client, server, workdi
 
 # The wrapper the README's git section documents.
 QSH_GIT = """#!/bin/bash
-# qsh-git: git passes the remote command as one string, for a shell.
-exec qsh "${@:1:$#-1}" sh -c "${@: -1}"
+# qsh-git: git passes ssh's -o options, then the remote command as one
+# string, for a shell.
+args=()
+while [ $# -gt 1 ]; do
+    case $1 in
+        -o) shift 2 ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+exec qsh "${args[@]}" sh -c "$1"
 """
 
 

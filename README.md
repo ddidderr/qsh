@@ -159,13 +159,22 @@ rsync -e qsh -s -av ./data/ 'server:/backup/my data/'
 ## git
 
 git hands its ssh program the remote command as one string,
-`git-upload-pack '/srv/repo.git'`, for a remote shell to parse. qsh starts
-no shell, so give git a wrapper that asks for one:
+`git-upload-pack '/srv/repo.git'`, for a remote shell to parse, and adds
+ssh's `-o SendEnv=GIT_PROTOCOL`. qsh starts no shell and takes no `-o`, so
+give git a wrapper that asks for a shell and drops the option:
 
 ```
 #!/bin/bash
-# qsh-git: git passes the remote command as one string, for a shell.
-exec qsh "${@:1:$#-1}" sh -c "${@: -1}"
+# qsh-git: git passes ssh's -o options, then the remote command as one
+# string, for a shell.
+args=()
+while [ $# -gt 1 ]; do
+    case $1 in
+        -o) shift 2 ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+exec qsh "${args[@]}" sh -c "$1"
 ```
 
 ```
@@ -175,6 +184,8 @@ git clone ssh://server:2222/srv/repo.git
 ```
 
 `GIT_SSH_VARIANT=ssh` makes git pass the port of an `ssh://` URL as `-p`.
+Without `GIT_PROTOCOL` on the server, git speaks its original protocol
+(v0), which every git server understands.
 
 ## Security model
 
