@@ -414,12 +414,23 @@ fn verify_signature(
 #[derive(Debug)]
 pub struct PinnedServerVerifier {
     expected: Fingerprint,
+    /// The key a server offered instead of the pinned one, for the message.
+    offered: std::sync::Mutex<Option<Fingerprint>>,
 }
 
 impl PinnedServerVerifier {
     #[must_use]
     pub fn new(expected: Fingerprint) -> Arc<Self> {
-        Arc::new(Self { expected })
+        Arc::new(Self {
+            expected,
+            offered: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// The key a server presented in place of the pinned one, if any did.
+    #[must_use]
+    pub fn mismatch(&self) -> Option<Fingerprint> {
+        *crate::sync::mutex(&self.offered)
     }
 }
 
@@ -436,6 +447,7 @@ impl ServerCertVerifier for PinnedServerVerifier {
         let got = Fingerprint::of_cert(end_entity)
             .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
         if got != self.expected {
+            *crate::sync::mutex(&self.offered) = Some(got);
             return Err(TlsError::InvalidCertificate(
                 rustls::CertificateError::Other(rustls::OtherError(Arc::new(HostKeyMismatch {
                     got,

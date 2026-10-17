@@ -232,8 +232,23 @@ pub async fn run(mut opts: Options) -> Result<i32> {
         }
         fp
     };
-    let config = client_config(PinnedServerVerifier::new(pinned), Some(&identity))?;
-    let (endpoint, conn) = connect_any(&addrs, &config, &opts).await?;
+    let verifier = PinnedServerVerifier::new(pinned);
+    let config = client_config(verifier.clone(), Some(&identity))?;
+    let (endpoint, conn) = match connect_any(&addrs, &config, &opts).await {
+        Ok(connected) => connected,
+        Err(error) => match verifier.mismatch() {
+            Some(offered) => bail!(
+                "the host key for {host_key} has changed.\n  \
+                 pinned:    {pinned}\n  \
+                 presented: {offered}\n\
+                 If the server's key was replaced on purpose, remove the old entry with \
+                 `{command} remove {host_key}` and pin the new one; otherwise someone may \
+                 be impersonating the server.",
+                command = opts.known_hosts_command(),
+            ),
+            None => return Err(error),
+        },
+    };
 
     let status = session(&conn, &opts).await;
     conn.close(0u32.into(), b"bye");
@@ -392,7 +407,7 @@ async fn connect_one(
         Ok(Err(error)) => {
             let fatal = matches!(&error, quinn::ConnectionError::TransportError(te)
                 if te.to_string().contains("HostKeyMismatch"));
-            let error = connect_error(&error, opts, addr, &host.key(opts.port));
+            let error = connect_error(&error, opts, addr);
             if fatal {
                 Err(error.context(HostKeyRejected))
             } else {
@@ -408,27 +423,9 @@ async fn connect_one(
 }
 
 /// Turn a connection failure into a message that says what to do next.
-fn connect_error(
-    e: &quinn::ConnectionError,
-    opts: &Options,
-    addr: SocketAddr,
-    host_key: &str,
-) -> anyhow::Error {
+fn connect_error(e: &quinn::ConnectionError, opts: &Options, addr: SocketAddr) -> anyhow::Error {
     let base = anyhow!("cannot connect to {} ({addr}): {e}", opts.host);
     match e {
-        quinn::ConnectionError::TransportError(te)
-            if te.to_string().contains("HostKeyMismatch") =>
-        {
-            anyhow!(
-                "{}\n\nThe host key for {} has changed. If this is expected, remove the old \
-                 entry with `{} remove {}`; otherwise someone may be \
-                 impersonating the server.",
-                te,
-                host_key,
-                opts.known_hosts_command(),
-                host_key
-            )
-        }
         quinn::ConnectionError::TimedOut => anyhow!(
             "{base}\n\nNo response. Check that qsh-server is running and that UDP port {} is \
              reachable — QUIC needs UDP, not TCP.",
