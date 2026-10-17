@@ -387,75 +387,75 @@ commit that fixed it.
 ## AUTH — authorization and policy
 
 ### AUTH-01 — An unauthorized key is refused
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Expected:** status 255, a handshake or authorization message, no `authenticated as` line on the server.
 
 ### AUTH-02 — `authorize` takes effect without a restart
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Expected:** works within the reload interval; the daemon's PID is unchanged (README: "within a second — no restart").
 
 ### AUTH-03 — `revoke` cuts off new and running sessions
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Expected:** a running session ends with 255 within 6 s, its job is gone, new connections fail (THREAT_MODEL actor 3).
 
 ### AUTH-04 — `--no-shell` allows commands only
-- **Status:** planned · **Priority:** P0 · **Needs:** pty
+- **Status:** automated · **Priority:** P0 · **Needs:** pty
 - **Expected:** commands run; a login shell is refused with a message.
 
 ### AUTH-05 — `--no-exec` allows the shell only
-- **Status:** planned · **Priority:** P0 · **Needs:** pty
+- **Status:** automated · **Priority:** P0 · **Needs:** pty
 - **Expected:** commands get 126; a login shell works.
 
 ### AUTH-06 — A command filter matches argv[0] exactly
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Steps:** a key with `--command /usr/bin/uptime`.
 - **Expected:** `/usr/bin/uptime -p` runs; `id`, bare `uptime`, a planted look-alike and `sh -c uptime` get 126 naming the program (README: "matched against the whole of `argv[0]`, never its basename").
 
 ### AUTH-07 — A server-side deadline expires the authorization
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Steps:** `--expires-in-days 30` (listed with 29–30 days left), then bring `expires_at_unix` forward by hand.
 - **Expected:** the running session ends shortly after the deadline; new attempts fail.
 
 ### AUTH-08 — An expired client certificate is refused
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Expected:** a `--days 0` certificate fails with "Expired" even though authorized.
 
 ### AUTH-09 — A revoked key can be authorized again
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** works again after a fresh `authorize` (tombstone removed).
 
 ### AUTH-10 — One key under two names fails closed
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Steps:** copy an entry by hand under a second name mapping to bob.
 - **Expected:** the key is refused; `list` shows a conflict; `revoke` removes both aliases.
 
 ### AUTH-11 — A hand-edited policy applies to the next session
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** `allow_exec = false` gives 126 on the next command.
 
 ### AUTH-12 — The identity is the key, not the machine
-- **Status:** planned · **Priority:** P2 · **Needs:** two-clients
+- **Status:** automated · **Priority:** P2 · **Needs:** two-clients
 - **Expected:** alice's key directory copied to client2 logs in as alice from there.
 
 ### AUTH-13 — Narrowing a policy ends sessions it no longer allows
-- **Status:** planned · **Priority:** P0 · **Needs:** pty
+- **Status:** automated · **Priority:** P0 · **Needs:** pty
 - **Expected:** setting `allow_shell = false` ends a running shell within seconds; commands still work.
 
 ### AUTH-14 — A bare command name runs from the server's fixed PATH
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Steps:** `--command uptime`, with a fake `uptime` planted in the account's home.
 - **Expected:** `uptime` runs the real `/usr/bin/uptime`; `/usr/bin/uptime` is refused (exact match).
 
 ### AUTH-15 — A legacy policy without `key_fingerprint` still works, with a warning
-- **Status:** planned · **Priority:** P1 · **Needs:** pty
+- **Status:** automated · **Priority:** P1 · **Needs:** pty
 - **Expected:** accepted, with a journal warning naming the file; re-running `authorize --force` with the same flags binds it to the key and keeps the restrictions. (`authorize` builds the policy from its own flags only, so flags left off that command line are dropped.)
 
 ### AUTH-16 — `authorize --force` rotates a client key
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** the old key is cut off, including its live sessions; the new one works.
 
 ### AUTH-17 — A revocation tombstone blocks hand-restored files
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** copying the revoked `.crt` and `.toml` back does not restore access; `authorize` does.
 
 ### AUTH-18 — Narrowing a policy tells the user why
@@ -463,7 +463,7 @@ commit that fixed it.
 - **Why:** today the client only sees `stream reset by peer: error 2` and the server writes no line. Open: decide the message and the audit line, then test them.
 
 ### AUTH-19 — Account controls outside qsh do not gate it
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Why:** admins coming from sshd with PAM expect an expired account or `/etc/nologin` to stop logins; qsh has no PAM (README security model).
 - **Expected:** with carol's account expired (`chage -E 0`) and `/etc/nologin` present, carol's key still logs in; revoking the key ends access. Found F21.
 
