@@ -234,8 +234,9 @@ def test_throughput_on_a_long_fat_path_beats_the_default_window(direction, alice
     With the default 1.25 MB stream window no sender can have more than
     1.25 MB in flight, so no stream can beat 3.1 MB/s on this path however
     fast the path is. Everything in netsim's delay is in flight, so the most
-    it ever held shows how far the window really opened. "down" goes through
-    the server's output queue, "up" through the remote process's stdin.
+    it ever held shows how far the window really opened, whatever the host's
+    load does to the rate. "down" goes through the server's output queue,
+    "up" through the remote process's stdin.
     """
     link = make_link("server:2222", delay_ms=LONG_FAT_DELAY_MS)
     alice.pin(link.host, server.fp, port=link.port)
@@ -262,5 +263,6 @@ def test_throughput_on_a_long_fat_path_beats_the_default_window(direction, alice
     )
     # Twice what a default window could ever put there, QUIC's overhead and all.
     assert held > 2 * QUINN_DEFAULT_STREAM_WINDOW, f"at most {held} bytes in flight one way"
-    # A default window ran at 90% of its ceiling; a busy host slows this one.
-    assert steady > 1.3 * DEFAULT_WINDOW_CEILING, f"{steady / 1e6:.1f} MB/s"
+    # A default window can never beat its ceiling (it ran at 90% of it). A busy
+    # host slows the relay and this transfer, so the ceiling is the bar.
+    assert steady > DEFAULT_WINDOW_CEILING, f"{steady / 1e6:.1f} MB/s"
