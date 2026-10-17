@@ -11,6 +11,7 @@ from collections import Counter
 import pytest
 
 from conftest import FAST_IDLE_TIMEOUT
+from harness.env import REPO_DIR, docker
 from harness.qsh import PORT, RELOAD_SETTLE, QshClient, QshServer, parse_fingerprint, unique
 
 
@@ -499,6 +500,240 @@ def test_a_restart_during_a_journald_stall_is_not_held_up(alice_fast, fast_serve
     finally:
         # A restart cut short by the timeout carries on once journald runs again.
         bring_back(fast_server)
+
+
+@pytest.mark.plan("OPS-15")
+def test_an_enabled_unit_comes_back_after_a_reboot_with_its_state(alice_fast, fast_server, make_client):
+    """server2 reboots; the enabled unit starts by itself, with the same key, store and pins.
+
+    The shipped unit is `WantedBy=multi-user.target`, so `systemctl enable`
+    is what brings the server back after a reboot. Everything it needs lives
+    under /etc/qsh, and clients pin its host key: after the reboot it must
+    present the same key and accept the same authorizations without anyone
+    touching it. A session running across the reboot is told, as by a stop
+    (F8). The second boot must also give systemd its cgroup v2 tree again
+    (node-entrypoint.sh) and the unit its delegated subtree, or every
+    `--kill-session-processes` session fails closed.
+    """
+    node, unit = fast_server.node, fast_server.unit
+    restricted = make_client("alice", authorize_as="alice", options=("--kill-session-processes",), on=fast_server)
+
+    def contained(marker: str) -> None:
+        # Its own cgroup under the unit's subtree, and a setsid'd, double-forked
+        # job dies with the session (LIFE-04, LIFE-07).
+        script = f"cat /proc/self/cgroup; setsid sh -c 'sleep {marker} & exit' >/dev/null 2>&1 </dev/null; echo detached"
+        r = restricted.run("server2", "sh", "-c", script, timeout=30)
+        assert r.rc == 0 and r.stdout.split()[-1:] == ["detached"], r.describe()
+        assert "/qsh-restricted/session-" in r.stdout, r.stdout
+        node.wait_gone(f"sleep {marker}", timeout=10)
+
+    contained("7676.25")
+    enabled = node.run(["systemctl", "is-enabled", unit]).stdout.strip()
+    state = tree_listing(node, "/etc/qsh")
+    started = docker("inspect", "-f", "{{.State.StartedAt}}", node.container).stdout
+    marker = "7677.25"
+    argv = alice_fast.argv("server2", "sleep", marker)
+    proc = None
+    try:
+        node.run(["systemctl", "enable", unit], check=True)
+        proc = alice_fast.node.popen(argv, user="alice")
+        node.wait_running(f"sleep {marker}", timeout=10)
+        begin = time.monotonic()
+        node.reboot()
+        booted = time.monotonic() - begin
+        assert docker("inspect", "-f", "{{.State.StartedAt}}", node.container).stdout != started
+        # systemd stopped the unit on the way down, which closes every connection.
+        _, err = proc.communicate(timeout=30)
+        assert proc.returncode == 255 and "shutting down" in err.decode(), err.decode()
+        # Nobody started it: it came up with the boot, at the first attempt.
+        after = unit_state(fast_server, "ActiveState", "SubState", "UnitFileState", "NRestarts")
+        assert after == {"ActiveState": "active", "SubState": "running", "UnitFileState": "enabled", "NRestarts": "0"}, after
+        fast_server.wait_listening()
+        assert tree_listing(node, "/etc/qsh") == state, "/etc/qsh changed across the reboot"
+        assert fast_server.fingerprint() == fast_server.fp
+        # alice's pin for server2 and her authorization: the daemon presents the same key.
+        r = alice_fast.run("server2", "hostname", timeout=30)
+        assert r.rc == 0 and r.stdout.strip() == "server2", r.describe()
+        assert node.run(["stat", "-fc", "%T", "/sys/fs/cgroup"], check=True).stdout.strip() == "cgroup2fs"
+        contained("7678.25")
+        print(f"rebooted and booted in {booted:.1f}s; server2 is at {node.ip}")
+    finally:
+        if proc is not None:
+            proc.kill()
+            alice_fast.node.kill_command("alice", argv)
+        if enabled != "enabled":
+            node.run(["systemctl", "disable", unit])
+        if not fast_server.is_active():
+            bring_back(fast_server)
+
+
+# A listen address the host does not have yet: a DHCP lease, or a floating IP
+# (keepalived, a cloud's reassignable address), which can take this long to
+# arrive. Once it is there, the unit must be serving on it within the bound:
+# RestartSec=2, systemd's timer slack, a start, and room for a busy host.
+LATE_ADDRESS_DELAY = 25
+LATE_ADDRESS_BOUND = 10
+
+
+def serve_on_a_late_address(server: QshServer, address: str, prefix: int, *, restart_once: bool = False) -> dict:
+    """Start the server's unit with `listen` on a missing address, then add the address.
+
+    The configuration must already name `address`. The rate limit is reset
+    first, as on a fresh boot. With `restart_once`, an administrator runs
+    `systemctl restart` once after the first failure, to see whether it helps.
+    Returns the unit's state after LATE_ADDRESS_DELAY seconds without the
+    address, how long after it appeared the unit was active and listening on
+    it (None: not within LATE_ADDRESS_BOUND), and the unit's journal.
+    """
+    node, unit = server.node, server.unit
+    since = server.cursor()
+    node.run(["systemctl", "reset-failed", unit])
+    script = f"systemctl restart {unit}"
+    if restart_once:
+        # Right after the first failure, from inside the node, so that the
+        # sixth start falls inside the window whatever systemd's timer slack.
+        # A restart within 1.0-1.8 s after any try does the same.
+        script += (
+            f" && until [ \"$(systemctl show -p ExecMainStatus --value {unit})\" = 1 ]; do sleep 0.05; done"
+            f" && systemctl restart {unit}"
+        )
+    begin = time.monotonic()
+    node.sh(script, timeout=30)
+    server.wait_journal(rf"binding UDP {re.escape(address)}:{PORT}: Cannot assign requested address", since)
+    time.sleep(max(0.0, begin + LATE_ADDRESS_DELAY - time.monotonic()))
+    waiting = unit_state(server, "ActiveState", "NRestarts", "StartLimitBurst")
+    node.run(["ip", "addr", "add", f"{address}/{prefix}", "dev", "eth0"], check=True)
+    added = time.monotonic()
+    serving = None
+    while serving is None and time.monotonic() < added + LATE_ADDRESS_BOUND:
+        listening = node.run(["ss", "-Hlun", f"sport = :{PORT}"]).stdout
+        if server.is_active() and f"{address}:{PORT}" in listening:
+            serving = round(time.monotonic() - added, 2)
+        else:
+            time.sleep(0.25)
+    return {"waiting": waiting, "serving": serving, "journal": server.journal(since)}
+
+
+def listen_on(server: QshServer, address: str) -> bytes:
+    """Point server2's configuration at `address`; returns the original to put back."""
+    conf = "/etc/qsh/qsh-server.toml"
+    original = server.node.read(conf)
+    changed = original.replace(f"0.0.0.0:{PORT}".encode(), f"{address}:{PORT}".encode())
+    assert changed != original, original
+    server.node.write(conf, changed)
+    return original
+
+
+def put_back(server: QshServer, original: bytes, address: str, prefix: int) -> None:
+    """Undo `listen_on` and `serve_on_a_late_address`: the address, the configuration, the daemon."""
+    server.node.run(["ip", "addr", "del", f"{address}/{prefix}", "dev", "eth0"])
+    server.node.write("/etc/qsh/qsh-server.toml", original)
+    # Restart, not start: a unit that came up is still bound to the address.
+    server.node.run(["systemctl", "reset-failed", server.unit])
+    server.restart()
+
+
+@pytest.mark.plan("OPS-15")
+def test_the_shipped_unit_waits_for_a_late_listen_address(make_client, fast_server, env):
+    """`listen` names an address that arrives 25 s late; the shipped unit retries until it does.
+
+    Binding an address the host does not have fails (EADDRNOTAVAIL) and
+    qsh-server exits 1. The shipped unit's `Restart=on-failure` and
+    `RestartSec=2` try again every two seconds, and systemd's default start
+    limit (5 starts within 10 s, then the unit fails for good) does not trip:
+    five tries at that pace already take the whole window. When the address
+    appears, the next try binds it and serves.
+    """
+    node = fast_server.node
+    address, prefix = env.spare_ip(40), env.subnet().prefixlen
+    client = make_client("alice", authorize_as="alice", on=fast_server)
+    client.pin(address, fast_server.fp)
+    # Or a bind to a missing address would succeed and prove nothing.
+    assert node.read("/proc/sys/net/ipv4/ip_nonlocal_bind").strip() == b"0"
+    original = listen_on(fast_server, address)
+    try:
+        seen = serve_on_a_late_address(fast_server, address, prefix)
+        waiting = seen["waiting"]
+        print(f"after {LATE_ADDRESS_DELAY}s without the address: {waiting}; serving after {seen['serving']}s")
+        assert waiting["ActiveState"] != "failed", f"the unit gave up: {waiting}\n{seen['journal'][-3000:]}"
+        # More tries than the start limit's burst: the limit was really in play.
+        assert int(waiting["NRestarts"]) > int(waiting["StartLimitBurst"]), waiting
+        assert seen["serving"] is not None, f"not serving {LATE_ADDRESS_BOUND}s after the address appeared"
+        r = client.run(address, "hostname", timeout=30)
+        assert r.rc == 0 and r.stdout.strip() == "server2", r.describe()
+    finally:
+        put_back(fast_server, original, address, prefix)
+
+
+@pytest.mark.plan("OPS-15")
+@pytest.mark.xfail(strict=True, reason="FXX-OPS-15: one restart while the unit waits for its address trips the start limit for good")
+def test_a_restart_while_waiting_for_the_address_does_not_give_up(make_client, fast_server, env):
+    """An administrator restarts the waiting unit once; it must still come up with the address.
+
+    The shipped unit survives a late address only because five tries at
+    `RestartSec=2` just fill the 10 s start-limit window: the sixth start
+    comes 10.2-11.1 s after the first. One `systemctl restart` in between,
+    to see whether it helps, makes the sixth start come too early: systemd
+    refuses it ("Start request repeated too quickly") and the unit stays
+    failed, also once the address is there. Proposed: `StartLimitIntervalSec=0`
+    in the unit's [Unit] section, so that it keeps trying.
+    """
+    address, prefix = env.spare_ip(40), env.subnet().prefixlen
+    client = make_client("alice", authorize_as="alice", on=fast_server)
+    client.pin(address, fast_server.fp)
+    original = listen_on(fast_server, address)
+    try:
+        seen = serve_on_a_late_address(fast_server, address, prefix, restart_once=True)
+        assert seen["serving"] is not None, f"the unit gave up: {seen['waiting']}\n{seen['journal'][-2000:]}"
+        r = client.run(address, "hostname", timeout=30)
+        assert r.rc == 0 and r.stdout.strip() == "server2", r.describe()
+    finally:
+        put_back(fast_server, original, address, prefix)
+
+
+def readme_unit() -> str:
+    """The unit README.md's "Running under systemd" shows administrators."""
+    section = (REPO_DIR / "README.md").read_text().split("## Running under systemd", 1)[-1]
+    match = re.search(r"```ini\n(.*?)```", section, re.S)
+    assert match and "ExecStart=" in match.group(1), "README.md shows no systemd unit"
+    return match.group(1)
+
+
+@pytest.mark.plan("OPS-15")
+@pytest.mark.xfail(strict=True, reason="FXX-OPS-15-docs: the README's unit restarts every 100 ms, so a late address trips the start limit at once")
+def test_the_readme_unit_waits_for_a_late_listen_address(make_client, fast_server, env):
+    """The same late address, under the unit the README shows instead of the shipped one.
+
+    The README's unit has `Restart=on-failure` but no `RestartSec=`, so
+    systemd retries after its default 100 ms: five tries take about a
+    second, the start limit trips, and the unit stays failed for good, also
+    once the address is there. It is also ordered only after
+    `network.target`, which waits for no address at all. Proposed: show the
+    shipped unit (`RestartSec=2`, `After=network-online.target`) in the
+    README, with `StartLimitIntervalSec=0` as for FXX-OPS-15.
+    """
+    node = fast_server.node
+    address, prefix = env.spare_ip(41), env.subnet().prefixlen
+    readme = QshServer(node, unit=unique("qsh-readme"))
+    path = f"/etc/systemd/system/{readme.unit}.service"
+    client = make_client("alice", authorize_as="alice", on=fast_server)
+    client.pin(address, fast_server.fp)
+    original = listen_on(fast_server, address)
+    try:
+        node.write(path, readme_unit())
+        node.run(["systemctl", "daemon-reload"], check=True)
+        # The shipped unit holds 0.0.0.0:2222, which the new address's port would collide with.
+        fast_server.stop()
+        seen = serve_on_a_late_address(readme, address, prefix)
+        assert seen["serving"] is not None, f"the unit gave up: {seen['waiting']}\n{seen['journal'][-2000:]}"
+        r = client.run(address, "hostname", timeout=30)
+        assert r.rc == 0 and r.stdout.strip() == "server2", r.describe()
+    finally:
+        node.run(["systemctl", "stop", readme.unit])
+        node.run(["systemctl", "reset-failed", readme.unit])
+        node.run(["rm", "-f", path])
+        node.run(["systemctl", "daemon-reload"])
+        put_back(fast_server, original, address, prefix)
 
 
 # Timing helpers that run on a client node, so that what they measure is the
