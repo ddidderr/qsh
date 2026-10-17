@@ -10,6 +10,7 @@ from contextlib import contextmanager
 import pytest
 
 from conftest import FAST_IDLE_TIMEOUT
+from harness.qsh import unique
 from harness.terminal import Terminal
 
 CGROUP_ROOT = "/sys/fs/cgroup/system.slice/qsh-server.service"
@@ -271,3 +272,81 @@ def test_a_signal_that_ends_qsh_ends_the_remote_job_at_once(alice_fast, fast_ser
         wait(timeout=10)
         # Well under server2's 8 s idle timeout: a close arrives at once.
         fast_server.node.wait_gone(f"sleep {marker}", timeout=3)
+
+
+# ---------------------------------------------------------------- LIFE-11
+
+
+@pytest.mark.plan("LIFE-11")
+@pytest.mark.parametrize(
+    "partial",
+    [
+        pytest.param(
+            ("-P",),
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="FXX-LIFE-11: the old receiver's --partial cleanup moves its partial file over the retry's result",
+            ),
+            id="partial",
+        ),
+        pytest.param(("-P", "--partial-dir=.rsync-partial"), id="partial-dir"),
+    ],
+)
+def test_an_rsync_retried_at_once_survives_the_old_receivers_cleanup(alice_fast, fast_server, make_link, partial):
+    """An upload is cut by an outage, stopped with Ctrl-C, and re-run at once.
+
+    The old receiver on server2 cannot hear that its client is gone: it lives
+    until the idle timeout, then gets SIGHUP and an end of input, and rsync's
+    `--partial` cleanup moves the file it was writing to the destination
+    name. A retry over a working path that finished in the meantime must keep
+    its complete result. The first run is throttled so that the outage lands
+    part way through, whatever the host's speed; the retry runs at full speed.
+    """
+    name = unique("retry")
+    local, remote = f"/home/alice/{name}-local", f"/home/alice/{name}-remote"
+    link = make_link("server2:2222")
+    alice_fast.pin(link.host, fast_server.fp, port=link.port)
+    qsh = f"{alice_fast.qsh_command} -p {link.port}"
+    # The first run passes --bwlimit to its receiver, which tells it apart.
+    old_receiver = f"^rsync --server .*--bwlimit=.* {re.escape(remote)}/$"
+    first = None
+    try:
+        alice_fast.shell(f"mkdir -p {local} && head -c 32M /dev/urandom > {local}/large.bin")
+        fast_server.node.run(["mkdir", "-p", remote], user="alice", check=True)
+        want = alice_fast.node.run(["sha256sum", f"{local}/large.bin"], check=True).stdout.split()[0]
+        # In a session of its own, so that a Ctrl-C reaches rsync and its qsh
+        # alike, as a terminal's would.
+        first = alice_fast.node.popen(
+            ["setsid", "--wait", "rsync", "-e", qsh, *partial, "--bwlimit=2m", f"{local}/large.bin", f"netsim:{remote}/"],
+            user="alice",
+        )
+        fast_server.node.wait_for(f"find {remote} -maxdepth 1 -name '.large.bin.*' -size +4M | grep -q .", timeout=60)
+        link.blackhole(True)
+        (leader,) = alice_fast.node.pids(f"rsync -e {qsh} ")
+        alice_fast.node.run(["kill", "-INT", "--", f"-{leader}"], check=True)
+        _, err = first.communicate(timeout=30)
+        assert first.returncode != 0, f"the interrupted rsync reported success: {err.decode()}"
+
+        out = alice_fast.node.run(
+            ["rsync", "-e", alice_fast.qsh_command, *partial, f"{local}/large.bin", f"server2:{remote}/"],
+            user="alice",
+            timeout=120,
+        )
+        assert out.rc == 0, out.describe()
+        if fast_server.node.run(["pgrep", "-u", "alice", "-f", old_receiver]).rc != 0:
+            pytest.skip("the old receiver was gone before the retry finished; nothing to race")
+        got = fast_server.node.run(["sha256sum", f"{remote}/large.bin"], check=True).stdout.split()[0]
+        assert got == want, "the retry did not produce the file"
+
+        fast_server.node.wait_for(f"! pgrep -u alice -f '{old_receiver}'", timeout=FAST_IDLE_TIMEOUT + 15)
+        # And the first qsh, which waits out its own idle timeout.
+        alice_fast.node.wait_gone(f"qsh -p {link.port} netsim rsync", timeout=FAST_IDLE_TIMEOUT + 15)
+        size = fast_server.node.run(["stat", "-c", "%s", f"{remote}/large.bin"], check=True).stdout.strip()
+        got = fast_server.node.run(["sha256sum", f"{remote}/large.bin"], check=True).stdout.split()[0]
+        assert got == want, f"after the old receiver's cleanup the destination has {size} of 33554432 bytes"
+    finally:
+        if first is not None and first.poll() is None:
+            alice_fast.node.run(["pkill", "-u", "alice", "-f", f"^rsync -e {re.escape(qsh)} "])
+            first.wait(timeout=10)
+        alice_fast.node.run(["rm", "-rf", local])
+        fast_server.node.run(["rm", "-rf", remote])

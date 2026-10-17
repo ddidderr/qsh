@@ -525,9 +525,10 @@ fails until the mark is removed, so a fix cannot go unnoticed.
 - **Expected:** after HUP qsh exits 129 within 2 s (measured 0.2 s) and the job is gone within the idle timeout plus a margin, as after `kill -9` (LIFE-01). Proposed: qsh sends a close before it exits, so that after each of these signals the job is gone within 3 s. Measured 8.8–9.3 s for every one, the idle timeout. Found FXX-LIFE-10.
 
 ### LIFE-11 — rsync `-P` cut by an outage and re-run at once
-- **Status:** planned · **Priority:** P2 · **Needs:** netsim
-- **Why:** the old receiver lives on until the idle timeout; on SIGHUP it moves its partial file into place, possibly over the retry's result.
-- **Expected:** the retried transfer's result survives the old receiver's cleanup.
+- **Status:** automated · **Priority:** P2 · **Needs:** netsim, server2
+- **Why:** the old receiver cannot tell that its client has gone: it lives until the server's idle timeout, then gets end of input and SIGHUP, and rsync's `--partial` cleanup renames the temporary file it was writing to the destination name, over whatever is there by then.
+- **Steps:** `rsync -P --bwlimit=2m` a 32 MiB file through a netsim link to server2, throttled so that the outage lands part way whatever the host's speed. Once the receiver's temporary file passes 4 MiB, black-hole the link and press Ctrl-C (SIGINT to rsync's process group, qsh included). At once rerun `rsync -P` at full speed, straight to server2. Wait until the old receiver and the old qsh are gone. Again with `--partial-dir=.rsync-partial`.
+- **Expected:** the interrupted rsync fails; the retry exits 0, leaving the source's digest while the old receiver still runs; the destination keeps that digest after the old receiver is gone. With `--partial-dir` it does: the partial lands in `.rsync-partial/`. With `-P` alone the old receiver, cleaned up about 10 s after the outage, replaces the complete 32 MiB with its 5 MiB partial. Found FXX-LIFE-11.
 
 ## OPS — running the server
 
