@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 
 import pytest
+
+from harness.env import Burst
 
 
 def daemon_fds(server) -> int:
@@ -97,3 +100,88 @@ def test_the_global_session_budget_across_five_keys(make_client, bob):
             proc.kill()
     assert codes.count(0) == 128, sorted(codes)
     assert codes.count(0) + codes.count(255) == len(codes), sorted(codes)
+
+
+# LOAD-06. One address may hold 4 of the server's 32 handshake slots at once
+# (MAX_HANDSHAKES_PER_SOURCE in src/server.rs). The server ignores an Initial
+# over that limit without a word, and the client sends it again when its
+# retransmission timer fires: about 1 s later (quinn's first RTT estimate is
+# 333 ms), then 2, 4 and 8 s after that. A crowd behind one NAT therefore gets
+# in four at a time, once per resend: four resends fit in the default 10 s
+# --connect-timeout. The fifth comes after quinn's 15 s Retry token lifetime,
+# and the server refuses it as an invalid token, so a longer timeout does not
+# let more in.
+PER_SOURCE_HANDSHAKES = 4
+RESENDS_THAT_COUNT = 4  # at about 1, 3, 7 and 15 s: the first four
+CROWD = 32  # one key's connection limit
+# Each way: the client's Finished takes a 200 ms round trip to free a slot,
+# far longer than the crowd takes to start, so a slot cannot serve two
+# members of one wave.
+CROWD_DELAY_MS = 100
+
+
+def waves(times: list[float], gap: float = 0.5) -> list[list[float]]:
+    """Group sorted times into runs separated by more than `gap` seconds."""
+    groups: list[list[float]] = []
+    for t in sorted(times):
+        if groups and t - groups[-1][-1] <= gap:
+            groups[-1].append(t)
+        else:
+            groups.append([t])
+    return groups
+
+
+@pytest.mark.plan("LOAD-06")
+@pytest.mark.parametrize("connect_timeout", [10, 20])
+def test_a_crowd_behind_one_address_gets_in_four_at_a_time(connect_timeout, make_client, alice, server, make_link):
+    """32 logins at the same moment from behind one NAT address, 100 ms each way.
+
+    The cap is what keeps one address from taking every handshake slot, so
+    another address is served at once meanwhile. The crowd sees the cost:
+    16 of the 32 get in, in four waves of four, and the rest fail with
+    status 255, whatever --connect-timeout says.
+    """
+    crowd = make_client("alice", authorize_as="alice")
+    link = make_link("server:2222", delay_ms=CROWD_DELAY_MS)
+    crowd.pin(link.host, server.fp, port=link.port)
+    options = ("--connect-timeout", str(connect_timeout))
+    since = server.cursor()
+    burst = Burst(
+        crowd.node,
+        [crowd.argv("netsim", "echo", f"CROWD-{i}", port=link.port, options=options) for i in range(CROWD)],
+        user=crowd.user,
+    )
+    burst.wait_launched()
+    time.sleep(0.3)  # the first four are in their handshakes now
+    begin = time.monotonic()
+    r = alice.run("server", "echo", "ELSEWHERE")
+    elsewhere = time.monotonic() - begin
+    results = burst.wait(timeout=connect_timeout + 30)
+    time.sleep(1.5)  # the last batch of refusals reaches the journal
+    journal = server.journal(since)
+
+    logged_in = [x.took for i, x in enumerate(results) if x.rc == 0 and x.out == f"CROWD-{i}\n"]
+    failed = [x for x in results if x.rc != 0]
+    groups = waves(logged_in)
+    print(
+        f"timeout {connect_timeout}s: in at {[[round(t, 2) for t in g] for g in groups]}; "
+        f"{len(failed)} failed after {sorted({round(x.took, 1) for x in failed})}s: "
+        f"{sorted({x.err.strip() for x in failed})}; another address served in {elsewhere:.2f}s"
+    )
+    assert r.rc == 0 and r.stdout == "ELSEWHERE\n", r.describe()
+    assert elsewhere < 2, f"another address waited {elsewhere:.1f}s"
+    assert all(len(g) <= PER_SOURCE_HANDSHAKES for g in groups), groups
+    assert len(logged_in) == PER_SOURCE_HANDSHAKES * RESENDS_THAT_COUNT, groups
+    assert len(logged_in) + len(failed) == CROWD, results
+    for x in failed:
+        assert x.rc == 255 and x.out == "", x
+        if connect_timeout == 10:
+            assert f"timed out after {connect_timeout}s" in x.err, x
+        else:
+            # The server refused the expired token: the client's own timer had not run out.
+            assert x.took < connect_timeout - 2 and f"timed out after {connect_timeout}s" not in x.err, x
+    assert journal.count(f"(key `{crowd.entry}`)") == len(logged_in), journal
+    # Refusals come in batches, at most one line a second.
+    refused = [int(n) for n in re.findall(r"refused (\d+) connection\(s\) over the concurrency limit", journal)]
+    assert sum(refused) >= len(failed) and len(refused) <= connect_timeout + 3, journal
+
