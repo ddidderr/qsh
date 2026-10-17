@@ -597,8 +597,10 @@ fails until the mark is removed, so a fix cannot go unnoticed.
 - **Expected:** a previous build's client and server interoperate with the current one, or refuse clearly; a rolled-back server still fails closed on state the newer build wrote.
 
 ### OPS-17 — A large authorization store
-- **Status:** planned · **Priority:** P2 · **Needs:** —
-- **Expected:** with 2,000 keys, login latency, the once-a-second reload and revocation latency stay within the documented bounds.
+- **Status:** automated · **Priority:** P2 · **Needs:** server2 (marked `slow`)
+- **Why:** the daemon re-reads the whole store every second on a runtime worker (`spawn_store_refresher` in `src/server.rs`), and `qsh-server authorize` reads it whole too.
+- **Steps:** back up server2's `authorized/`; measure 15 logins, the delay from `qsh-server authorize` returning to a newcomer's first session (retrying from before the authorization), and the time from `revoke` to the end of a running session; add 2,000 keys (`qsh keygen` and `qsh-server authorize` loops on server2: 76–82 s); measure again, and the idle daemon's CPU; put the directory back under its lock and restart.
+- **Expected:** the median login within 0.25 s of the small store's and every login under 2 s (measured 0.10–0.12 s with either store, at most 0.18 s); an authorization in effect within 2.5 s (README: "within a second"; 0.2–0.6 s, then 0.7–0.9 s); a revocation within 4 s (README: "normally within two seconds"; 0.7–0.8 s with either store); the idle daemon under half a CPU (5%); the store restored byte for byte.
 
 ### OPS-18 — A wildcard listen address on a host with a secondary address
 - **Status:** planned · **Priority:** P2 · **Needs:** —

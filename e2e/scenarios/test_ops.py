@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import re
+import statistics
 import time
 from collections import Counter
 
 import pytest
 
 from conftest import FAST_IDLE_TIMEOUT
-from harness.qsh import PORT, QshClient, QshServer, parse_fingerprint
+from harness.qsh import PORT, RELOAD_SETTLE, QshClient, QshServer, parse_fingerprint, unique
 
 
 def stat(node, path: str) -> str:
@@ -497,3 +499,174 @@ def test_a_restart_during_a_journald_stall_is_not_held_up(alice_fast, fast_serve
     finally:
         # A restart cut short by the timeout carries on once journald runs again.
         bring_back(fast_server)
+
+
+# Timing helpers that run on a client node, so that what they measure is the
+# session and not `docker exec`.
+TIMED_RUNS = r"""
+import json, subprocess, sys, time
+n, argv = int(sys.argv[1]), sys.argv[2:]
+runs = []
+for _ in range(n):
+    begin = time.monotonic()
+    rc = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+    runs.append((rc, time.monotonic() - begin))
+print(json.dumps(runs))
+"""
+
+FIRST_SUCCESS = r"""
+import json, subprocess, sys, time
+deadline, argv = time.monotonic() + float(sys.argv[1]), sys.argv[2:]
+print("polling", flush=True)
+tries = 0
+while time.monotonic() < deadline:
+    tries += 1
+    rc = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+    if rc == 0:
+        print(json.dumps({"at": time.time(), "tries": tries}))
+        break
+"""
+
+
+def login_times(client: QshClient, host: str, n: int = 15) -> list[float]:
+    """Seconds each of `n` consecutive `qsh host true` took, end to end."""
+    argv = ["python3", "-c", TIMED_RUNS, str(n), *client.argv(host, "true")]
+    r = client.node.run(argv, user=client.user, timeout=120, check=True)
+    runs = json.loads(r.stdout)
+    assert all(rc == 0 for rc, _ in runs), runs
+    return [took for _, took in runs]
+
+
+def authorization_delay(server: QshServer, newcomer: QshClient) -> float:
+    """Seconds from `qsh-server authorize` returning to the newcomer's first session.
+
+    The newcomer retries from the moment before the authorization; both
+    clocks are the one kernel clock every container shares.
+    """
+    poller = newcomer.node.popen(
+        ["python3", "-c", FIRST_SUCCESS, "30", *newcomer.argv(server.host, "true")], user=newcomer.user
+    )
+    try:
+        assert poller.stdout.readline().strip() == b"polling"
+        path = f"/tmp/{newcomer.entry}.crt"
+        server.node.write(path, newcomer.cert())
+        done = server.node.sh(
+            f"qsh-server authorize {path} --user {newcomer.user} --name {newcomer.entry} >/dev/null"
+            f" && date +%s.%N && rm -f {path}"
+        )
+        out, _ = poller.communicate(timeout=60)
+    finally:
+        poller.kill()
+    assert out.strip(), "the newcomer was not let in within 30 s"
+    result = json.loads(out)
+    assert result["tries"] > 1, "the newcomer was let in before it was authorized"
+    return result["at"] - float(done.stdout)
+
+
+def revocation_delay(server: QshServer, victim: QshClient, marker: str) -> float:
+    """Seconds from `qsh-server revoke` starting to the victim's running session ending."""
+    proc = victim.node.popen(victim.argv(server.host, "sleep", marker), user=victim.user)
+    try:
+        server.node.wait_running(f"sleep {marker}", timeout=10)
+        begin = time.monotonic()
+        server.revoke(victim.entry, settle=False)
+        _, err = proc.communicate(timeout=30)
+        took = time.monotonic() - begin
+    finally:
+        proc.kill()
+    assert proc.returncode == 255 and "withdrawn" in err.decode(), err.decode()
+    server.node.wait_gone(f"sleep {marker}", timeout=10)
+    return took
+
+
+def daemon_cpu(server: QshServer, seconds: float = 5.0) -> float:
+    """The daemon's CPU use while idle, as a fraction of one CPU."""
+    pid = server.main_pid()
+    hz = int(server.node.run(["getconf", "CLK_TCK"], check=True).stdout)
+
+    def ticks() -> int:
+        fields = server.node.read(f"/proc/{pid}/stat").decode().rsplit(")", 1)[1].split()
+        return int(fields[11]) + int(fields[12])  # utime + stime
+
+    before = ticks()
+    time.sleep(seconds)
+    return (ticks() - before) / hz / seconds
+
+
+def tree_listing(node, path: str) -> str:
+    """Every entry under `path` with its type, mode, owner, size and content digest."""
+    return node.sh(
+        f"cd {path} && find . -mindepth 1 -printf '%P %y %m %U:%G %s\\n' | sort"
+        " && find . -type f -print0 | sort -z | xargs -0r sha256sum"
+    ).stdout
+
+
+@pytest.mark.plan("OPS-17")
+@pytest.mark.slow
+def test_a_large_authorization_store_keeps_its_bounds(make_client, fast_server):
+    """2,000 authorized keys: logins, the reload and revocation stay within bounds.
+
+    README: an authorization "takes effect within a second", a revocation
+    "normally within two seconds". The store is re-read whole, every second,
+    on a runtime worker (`spawn_store_refresher` in src/server.rs), and
+    `qsh-server authorize` reads it whole too. The same three measurements
+    are taken on the store as it is and with 2,000 more keys. server2's store
+    is put back exactly as it was: revoking 2,000 keys would leave 2,000
+    tombstones.
+    """
+    node = fast_server.node
+    store = "/etc/qsh/authorized"
+    backup = "/var/tmp/ops17-authorized"
+    keys = "/var/tmp/ops17-keys"
+    before = tree_listing(node, store)
+    node.sh(f"rm -rf {backup} && cp -a {store} {backup}")
+    try:
+        member = make_client("alice", authorize_as="alice", on=fast_server)
+        newcomers = [make_client("alice", on=fast_server) for _ in range(2)]
+        victims = [make_client("alice", authorize_as="alice", on=fast_server) for _ in range(2)]
+        small = {
+            "login": login_times(member, "server2"),
+            "authorize": authorization_delay(fast_server, newcomers[0]),
+            "revoke": revocation_delay(fast_server, victims[0], "7575.25"),
+        }
+
+        prefix = unique("ops17")
+        begin = time.monotonic()
+        node.sh(
+            f"mkdir -p {keys} && for i in $(seq 2000); do qsh keygen --identity {keys}/$i >/dev/null; done"
+            f" && for i in $(seq 2000); do"
+            f" qsh-server authorize {keys}/$i/id.crt --user dave --name {prefix}-$i >/dev/null; done",
+            timeout=900,
+        )
+        filled = time.monotonic() - begin
+        listed = fast_server.list().count(f"{prefix}-")
+        assert listed == 2000, f"{listed} of the 2,000 keys are listed"
+        time.sleep(RELOAD_SETTLE)
+
+        large = {
+            "login": login_times(member, "server2"),
+            "authorize": authorization_delay(fast_server, newcomers[1]),
+            "revoke": revocation_delay(fast_server, victims[1], "7576.25"),
+            "cpu": daemon_cpu(fast_server),
+        }
+        report = (
+            f"filling took {filled:.0f}s; logins {statistics.median(small['login']):.3f}s -> "
+            f"{statistics.median(large['login']):.3f}s (max {max(large['login']):.3f}s); authorize "
+            f"{small['authorize']:.2f}s -> {large['authorize']:.2f}s; revoke {small['revoke']:.2f}s -> "
+            f"{large['revoke']:.2f}s; idle daemon {large['cpu']:.0%} of a CPU"
+        )
+        print(report)
+        # Logins: no documented bound, so against the small store's, with room for a busy host.
+        assert statistics.median(large["login"]) < statistics.median(small["login"]) + 0.25, report
+        assert max(large["login"]) < 2, report
+        # "Within a second": the next once-a-second reload, which must not take long itself.
+        assert large["authorize"] < RELOAD_SETTLE, report
+        # "Normally within two seconds", plus the revoke command and a margin.
+        assert large["revoke"] < 4, report
+        # The reload of 2,000 entries every second must not eat the server.
+        assert large["cpu"] < 0.5, report
+    finally:
+        # Under the store's lock, so no reload sees it half restored.
+        node.sh(f"flock {store}.lock sh -c 'rm -rf {store} && cp -a {backup} {store}' && rm -rf {backup} {keys}")
+        fast_server.restart()
+    assert tree_listing(node, store) == before
