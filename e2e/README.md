@@ -145,3 +145,11 @@ Some lessons the first scenarios taught:
 - QUIC acknowledges only packets that ask for it, and a quiet client asks
   for nothing. To test what one side does while it still hears the other
   (a one-way outage), give that other side something to send.
+- A qsh client that gives up on a handshake sends a close, and the close
+  frees the server's slot. To hold a slot the way a stranger would, drop
+  the server's padded first flight (`max_datagram_down=1150`) and then
+  everything towards the server, as SEC-14 does.
+- The server ignores an Initial over a handshake limit, and quinn sends it
+  again about 1 s later, then 2, 4 and 8 s after that. Start a burst with
+  `harness.env.Burst`, not one `docker exec` per client, and give the path
+  some delay, so that a slot outlives the burst's start.
