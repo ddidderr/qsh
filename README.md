@@ -464,9 +464,15 @@ qsh server sh -c 'nohup ./daemon >/dev/null 2>&1 &'
 
 An interactive session is different, because a terminal has no equivalent of
 "the last writer closed it": a job you background with `&` keeps the terminal
-open after the shell exits. There the session waits two seconds for the rest of
-the output and then finishes anyway, so `sleep 300 &` followed by `exit` still
-returns you to your prompt.
+open after the shell exits. So the session does not wait for the terminal:
+`exit` or Ctrl-D delivers what the shell printed and returns you to your prompt
+at once, with the shell's exit status. Only a job that writes to the terminal
+more than ten times a second can hold that up, for at most two seconds. The
+background job keeps running, as after `exit` in a local terminal, but its
+later output goes nowhere. A key with `kill_session_processes` ends it
+instead. A session that ends abnormally
+(`~.`, a lost connection) hangs up the shell, and bash passes that on to its
+`&` jobs; `nohup`, `setsid` or `disown` keeps a job running.
 
 qsh exits with the remote command's exit status, `128+n` if it died from
 signal `n`, and `255` for its own failures — the convention scripts and rsync

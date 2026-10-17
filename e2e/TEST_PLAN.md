@@ -514,9 +514,11 @@ fails until the mark is removed, so a fix cannot go unnoticed.
 - **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Expected:** the leader and its same-group background child are gone.
 
-### LIFE-09 — Interactive exit with a chatty background job
-- **Status:** planned · **Priority:** P2 · **Needs:** pty
-- **Why:** README promises the session "waits two seconds … and then finishes anyway"; with a background job that keeps writing, the lab measured about 10 s and status 255. Open: decide whether the promise or the drain changes.
+### LIFE-09 — Interactive exit returns at once past background jobs
+- **Status:** automated · **Priority:** P2 · **Needs:** pty
+- **Why:** a background job holds the terminal open, so the session waited two seconds for it after the shell exited, and with a job that kept writing the lab measured up to 10 s and status 255. Decided 2026-10-17: `exit` and Ctrl-D end the session at once. Found F24.
+- **Steps:** leave a quiet job (`sleep`) or a chatty one (a line every 300 ms) in the background, then `echo bye; exit 7`.
+- **Expected:** `bye` arrives and qsh exits 7 well within the old two seconds; the job is still running, because a normal exit does not end it (README).
 
 ### LIFE-10 — Client exits that send no close
 - **Status:** planned · **Priority:** P2 · **Needs:** pty, server2
@@ -763,6 +765,7 @@ that fixed each one carries its ID.
 | F21 | P2 | Undocumented: account expiry, locking and `/etc/nologin` do not gate qsh (no PAM) | AUTH-19 | fixed (docs) |
 | F22 | P2 | A narrowed policy ended sessions with `stream reset by peer: error 2` and no journal line | AUTH-18 | fixed |
 | F23 | P2 | `-o` accepted any ssh option and silently ignored all but `StrictHostKeyChecking=…`, including `UserKnownHostsFile`; `-v`, `-C`, `-a`, `-x` were no-ops | CLI-07 | fixed (all removed) |
+| F24 | P2 | An interactive `exit` waited two seconds for any background job on the terminal, and a chatty one could make it end with 255 | LIFE-09 | fixed |
 
 ### Open items
 
@@ -774,7 +777,6 @@ are not security findings under THREAT_MODEL.md.
   up to a keep-alive interval (15 s) away. With F1 fixed the session survives
   the stall. A shorter client keep-alive would shorten it at the cost of more
   idle traffic.
-- **A chatty background job at interactive exit** (LIFE-09).
 - **Idle detection takes the idle timeout plus up to one keep-alive** (60–75 s
   by default), not exactly the idle timeout the README states.
 - **A home directory root cannot enter** (NFS `root_squash`): the server

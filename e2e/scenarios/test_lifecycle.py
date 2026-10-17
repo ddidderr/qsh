@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 import time
 
 import pytest
 
 from conftest import FAST_IDLE_TIMEOUT
+from harness.terminal import Terminal
 
 CGROUP_ROOT = "/sys/fs/cgroup/system.slice/qsh-server.service"
 
@@ -90,6 +92,34 @@ def test_restricted_session_runs_in_its_own_cgroup(make_client, server):
     r = restricted.run("server", "cat", "/proc/self/cgroup")
     assert r.rc == 0, r.describe()
     assert "/qsh-restricted/session-" in r.stdout, r.stdout
+
+
+@pytest.mark.plan("LIFE-09")
+@pytest.mark.parametrize(
+    "job",
+    ["sleep 6666.25", "sh -c 'while :; do echo tick-6667; sleep 0.3; done'"],
+    ids=["quiet", "chatty"],
+)
+def test_an_interactive_exit_returns_at_once_past_background_jobs(alice, server, job):
+    """`exit` ends the session with the shell's status; the job keeps running."""
+    running = job.replace("'", "")  # its command line, as pgrep sees it
+    term = Terminal(alice, "server")
+    try:
+        term.set_prompt()
+        term.sendline(f"{job} &")
+        server.node.wait_running(running, timeout=10)
+        begin = time.monotonic()
+        term.sendline("echo bye; exit 7")
+        term.expect(r"\nbye\r")
+        assert term.wait_exit() == 7
+        took = time.monotonic() - begin
+    finally:
+        term.close()
+    try:
+        assert took < 1.5, f"exit took {took:.2f}s"
+        assert server.node.pids(running), "a normal exit ended the background job"
+    finally:
+        server.node.run(["pkill", "-f", "^" + re.escape(running)])
 
 
 @pytest.mark.plan("LIFE-08")

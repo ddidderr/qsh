@@ -35,13 +35,24 @@ use crate::proto::{
 };
 use crate::pty;
 
-/// How long to keep reading a PTY once the leader has exited.
+/// How long a PTY must be quiet, once its leader has exited, to count as
+/// drained.
 ///
 /// A pipe ends when its last writer closes it, so that case needs no deadline.
 /// A PTY master has no such guarantee: a job backgrounded from an interactive
 /// shell keeps the slave open after the shell exits, and without a bound the
-/// session would never finish — `sleep 300 &` then `exit` would hang the
-/// client forever.
+/// session would never finish. A gap rather than "nothing readable right now",
+/// because the kernel moves terminal output to the master side from a worker:
+/// right after a read, the rest of a backlog can be in flight and not yet
+/// readable. Output after the gap is a background job's, and the job outlives
+/// the session anyway, so `exit` returns at once.
+const PTY_QUIET: Duration = Duration::from_millis(100);
+
+/// The most a PTY's drain may take once its leader has exited.
+///
+/// Reached only by a client that is not reading, or a job that never leaves the
+/// terminal quiet for [`PTY_QUIET`]; the session then ends with whatever was
+/// delivered.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// How long to wait for the job to die before escalating to the next signal.
@@ -1487,13 +1498,9 @@ enum Drained {
 /// deliver, and cutting that short on a timer is what turned a slow reader
 /// into a truncated file with a successful exit status.
 ///
-/// A PTY gets a deadline, because it has no last-writer guarantee — a job
+/// A PTY gets deadlines, because it has no last-writer guarantee — a job
 /// backgrounded from an interactive shell holds the slave open indefinitely.
-/// The pump reports whether cutoff discarded a chunk already read from the
-/// PTY. A pending send means output is lost, even when the client is reading
-/// steadily; it does not by itself establish that the client stopped reading.
-/// This preserves the existing bounded drain policy and its incomplete-output
-/// status while making cancellation outcomes explicit.
+/// See [`drain_terminal`].
 ///
 /// The handles stay borrowed so that a cancelled drain leaves them intact for
 /// the caller to abort.
@@ -1501,14 +1508,7 @@ async fn drain(tasks: &mut [Pump], is_pty: bool) -> Drained {
     let mut result = Drained::Fully;
     for pump in tasks.iter_mut() {
         let end = if is_pty {
-            if let Ok(joined) = tokio::time::timeout(DRAIN_GRACE, &mut pump.task).await {
-                joined.unwrap_or(PumpEnd::Failed)
-            } else {
-                if let Some(cancel) = pump.cancel.take() {
-                    let _ = cancel.send(());
-                }
-                (&mut pump.task).await.unwrap_or(PumpEnd::Failed)
-            }
+            drain_terminal(pump).await
         } else {
             (&mut pump.task).await.unwrap_or(PumpEnd::Failed)
         };
@@ -1525,6 +1525,27 @@ async fn drain(tasks: &mut [Pump], is_pty: bool) -> Drained {
     result
 }
 
+/// Finish a PTY's output once its leader has exited.
+///
+/// The pump ends at end of file or at the first [`PTY_QUIET`] gap in the
+/// output. Time spent handing a chunk to a slow client does not count as a
+/// gap, so a backlog is not cut short. At [`DRAIN_GRACE`] it stops outright,
+/// and reports a chunk it could not hand over as lost output. A pending send
+/// does not by itself establish that the client stopped reading, but it does
+/// mean the output is incomplete.
+async fn drain_terminal(pump: &mut Pump) -> PumpEnd {
+    if let Some(exited) = pump.leader_exited.take() {
+        let _ = exited.send(());
+    }
+    if let Ok(joined) = tokio::time::timeout(DRAIN_GRACE, &mut pump.task).await {
+        return joined.unwrap_or(PumpEnd::Failed);
+    }
+    if let Some(cancel) = pump.cancel.take() {
+        let _ = cancel.send(());
+    }
+    (&mut pump.task).await.unwrap_or(PumpEnd::Failed)
+}
+
 /// How an output pump finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PumpEnd {
@@ -1534,7 +1555,8 @@ enum PumpEnd {
     ReadError,
     /// Nobody is left to receive the frames.
     ClientGone,
-    /// The PTY drain deadline arrived while waiting for more output.
+    /// The PTY went quiet after its leader exited, or the drain deadline
+    /// arrived while waiting for more output.
     CutoffIdle,
     /// The PTY drain deadline arrived with a chunk still awaiting delivery.
     CutoffPending,
@@ -1601,9 +1623,12 @@ impl Drop for SessionStream {
     }
 }
 
-/// One output stream being forwarded, with a cooperative drain cutoff.
+/// One output stream being forwarded. A PTY's pump is told when the leader
+/// exits, so it can end once the terminal goes quiet, and has a cooperative
+/// drain cutoff.
 struct Pump {
     task: AbortOnDrop<PumpEnd>,
+    leader_exited: Option<tokio::sync::oneshot::Sender<()>>,
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -1661,9 +1686,11 @@ fn spawn_pump<R: AsyncRead + Unpin + Send + 'static>(
     tx: mpsc::Sender<Frame>,
     wrap: fn(Vec<u8>) -> Frame,
 ) -> Pump {
+    let (leader_exited, exited) = tokio::sync::oneshot::channel();
     let (cancel, cancelled) = tokio::sync::oneshot::channel();
     Pump {
-        task: AbortOnDrop::new(tokio::spawn(pump(src, tx, wrap, cancelled))),
+        task: AbortOnDrop::new(tokio::spawn(pump(src, tx, wrap, exited, cancelled))),
+        leader_exited: Some(leader_exited),
         cancel: Some(cancel),
     }
 }
@@ -1672,14 +1699,21 @@ async fn pump<R: AsyncRead + Unpin>(
     mut src: R,
     tx: mpsc::Sender<Frame>,
     wrap: fn(Vec<u8>) -> Frame,
+    mut exited: tokio::sync::oneshot::Receiver<()>,
     mut cancelled: tokio::sync::oneshot::Receiver<()>,
 ) -> PumpEnd {
     let mut buf = vec![0u8; CHUNK];
+    let mut leader_gone = false;
     loop {
         // `read` is cancel-safe. Only this branch can stop without owing a chunk.
         let read = tokio::select! {
             biased;
             _ = &mut cancelled => return PumpEnd::CutoffIdle,
+            _ = &mut exited, if !leader_gone => {
+                leader_gone = true;
+                continue;
+            }
+            () = tokio::time::sleep(PTY_QUIET), if leader_gone => return PumpEnd::CutoffIdle,
             read = src.read(&mut buf) => read,
         };
         match read {
@@ -2395,6 +2429,34 @@ mod tests {
         source.write_all(b"ab").await.unwrap();
         pump.cancel.take().unwrap().send(()).unwrap();
         assert_eq!(pump.task.await.unwrap(), PumpEnd::CutoffPending);
+    }
+
+    #[tokio::test]
+    async fn a_backlog_behind_a_slow_client_is_not_a_quiet_terminal() {
+        let (mut source, reader) = tokio::io::duplex(1);
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(Frame::Started).await.unwrap();
+        let mut pump = spawn_pump(reader, tx, Frame::Stdout);
+        // As above: the pump holds `a` and waits on the full channel, and `b`
+        // is buffered behind it. The client then stalls past the quiet gap.
+        source.write_all(b"ab").await.unwrap();
+        pump.leader_exited.take().unwrap().send(()).unwrap();
+        tokio::time::sleep(PTY_QUIET * 3).await;
+        assert!(matches!(rx.recv().await, Some(Frame::Started)));
+        assert!(matches!(rx.recv().await, Some(Frame::Stdout(data)) if data == b"a"));
+        assert!(matches!(rx.recv().await, Some(Frame::Stdout(data)) if data == b"b"));
+        assert_eq!(pump.task.await.unwrap(), PumpEnd::CutoffIdle);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_held_open_does_not_hold_up_the_end_of_the_session() {
+        // A background job keeps the PTY open, so its reader never sees EOF.
+        let (_job, reader) = tokio::io::duplex(64);
+        let (tx, _rx) = mpsc::channel(1);
+        let mut pumps = vec![spawn_pump(reader, tx, Frame::Stdout)];
+        let begin = std::time::Instant::now();
+        assert!(matches!(drain(&mut pumps, true).await, Drained::Fully));
+        assert!(begin.elapsed() < DRAIN_GRACE / 2, "{:?}", begin.elapsed());
     }
 
     #[tokio::test]
