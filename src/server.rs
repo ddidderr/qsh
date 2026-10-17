@@ -97,7 +97,7 @@ const FIRST_FRAME_GRACE: Duration = Duration::from_secs(10);
 /// four MiB per session. Backpressure continues through the child's pipes.
 const OUTPUT_QUEUE_FRAMES: usize = 8;
 
-/// Run the server until the process is stopped.
+/// Run the server until `shutdown` completes.
 ///
 /// # Errors
 /// Fails if the host identity is missing, the authorisation store cannot be
@@ -106,6 +106,7 @@ pub async fn serve(
     paths: &ServerPaths,
     cfg: &ServerConfig,
     listen_override: Option<SocketAddr>,
+    shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let identity = crypto::load_identity(&paths.cert(), &paths.key()).with_context(|| {
         format!(
@@ -161,7 +162,22 @@ pub async fn serve(
     let per_key = Arc::new(PerKeyConnections::default());
     let sessions = SessionBudget::new();
 
-    while let Some(incoming) = endpoint.accept().await {
+    tokio::pin!(shutdown);
+    loop {
+        let incoming = tokio::select! {
+            incoming = endpoint.accept() => incoming,
+            () = &mut shutdown => {
+                // Tell every client now. Without a CONNECTION_CLOSE they wait
+                // on a dead session until their idle timeout, and the next
+                // process's stateless resets cannot reach them either.
+                endpoint.close(0u32.into(), b"server shutting down");
+                let _ = tokio::time::timeout(SHUTDOWN_GRACE, endpoint.wait_idle()).await;
+                break;
+            }
+        };
+        let Some(incoming) = incoming else {
+            break;
+        };
         // Make the peer prove it can receive at its claimed address before we
         // spend anything on it. Without this, a spoofed-source flood would
         // reach the work below on every packet.
