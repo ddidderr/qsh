@@ -748,7 +748,7 @@ that fixed each one carries its ID.
 | F12 | P2 | A resize during session setup was never sent | PTY-14 | fixed |
 | F14 | P1 | An external SIGINT, SIGUSR1, SIGUSR2 or SIGALRM left the local terminal raw | PTY-15 | fixed |
 | F17 | P2 | The first-contact prompt rejected `YES` | SEC-11 | fixed |
-| F18 | P1 | An argument that is not valid UTF-8 made qsh panic (status 101), also under rsync | EXEC-23 | open |
+| F18 | P1 | An argument that is not valid UTF-8 made qsh panic (status 101), also under rsync | EXEC-23 | fixed |
 | F19 | P2 | Every exit, `~.` included, waited out QUIC's draining period: seconds on a long round trip | PTY-16 | open |
 | F20 | P2 | git cannot use qsh directly: it sends one command string for a shell; no documented way around | XFER-12 | open |
 | F21 | P2 | Undocumented: account expiry, locking and `/etc/nologin` do not gate qsh (no PAM) | AUTH-19 | open |

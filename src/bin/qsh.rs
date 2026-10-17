@@ -59,8 +59,7 @@ Examples:
 
 fn main() -> ExitCode {
     qsh::install_crypto_provider();
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match dispatch(args) {
+    match text_args().and_then(dispatch) {
         // Statuses outside a byte cannot be represented; 255 is what ssh
         // reports for its own failures.
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(255)),
@@ -71,6 +70,26 @@ fn main() -> ExitCode {
             ExitCode::from(255)
         }
     }
+}
+
+/// The command line as text. qsh/1 carries arguments as UTF-8 strings, so a
+/// file name in another encoding is refused with a message rather than
+/// crashing `std::env::args`.
+fn text_args() -> Result<Vec<String>> {
+    std::env::args_os()
+        .skip(1)
+        .enumerate()
+        .map(|(index, arg)| {
+            arg.into_string().map_err(|raw| {
+                anyhow::anyhow!(
+                    "argument {} ({}) is not valid UTF-8, which qsh cannot send; \
+                     with rsync, pass -s so it sends file names itself",
+                    index + 1,
+                    raw.to_string_lossy()
+                )
+            })
+        })
+        .collect()
 }
 
 fn dispatch(args: Vec<String>) -> Result<i32> {
