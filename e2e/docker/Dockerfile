@@ -69,6 +69,9 @@ FROM ${BASE_IMAGE} AS node
 # Behind a TLS-intercepting proxy, plain-HTTP mirrors are usually refused and
 # the slim image has no CA store yet, so switch to HTTPS and trust the extra
 # CA for this one step. Without a proxy this is the stock configuration.
+#
+# strace is for OPS-16, which stops a management command at an exact system
+# call to leave the state an interrupted one would.
 RUN --mount=type=secret,id=extra_ca,required=false,mode=0444 \
     set -eu; \
     if [ -n "${https_proxy:-}" ]; then \
@@ -82,7 +85,7 @@ RUN --mount=type=secret,id=extra_ca,required=false,mode=0444 \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         systemd systemd-sysv dbus \
         bash ca-certificates coreutils git iproute2 iputils-ping less \
-        ncurses-bin procps psmisc python3 rsync tar util-linux xxd; \
+        ncurses-bin procps psmisc python3 rsync strace tar util-linux xxd; \
     rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/90e2e-proxy
 
 # systemd as PID 1 in a container: keep the units that make sense, mask the

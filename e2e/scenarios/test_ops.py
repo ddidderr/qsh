@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import re
+import subprocess
 import time
 
 import pytest
@@ -16,6 +17,7 @@ from harness.qsh import (
     QshClient,
     QshServer,
     parse_fingerprint,
+    unique,
 )
 
 
@@ -206,12 +208,13 @@ def test_rotating_the_host_key_is_refused_until_repinned(alice_fast, fast_server
 #
 # The previous release is installed next to the current binaries as qsh-1.0
 # and qsh-server-1.0 (e2e/run pins its commit). OPS-14 upgrades a server that
-# 1.0 set up.
+# 1.0 set up; OPS-16 mixes the two builds and rolls a server back.
 
 UNIT_BINARY = "/usr/local/bin/qsh-server"
 UNIT_FILE = "/etc/systemd/system/qsh-server.service"
 PREVIOUS_UNIT_FILE = f"/usr/local/share/qsh-e2e/qsh-server-{PREVIOUS_VERSION}.service"
 SAVED = "/var/lib/qsh-e2e-saved"
+PAYLOAD = bytes(range(256)) * 4096  # 1 MiB with every byte value
 
 
 class Unmet(Exception):
@@ -398,3 +401,269 @@ def test_an_upgrade_keeps_serving_under_the_unit_1_0_shipped(make_client, fast_s
         if r.rc != 0:
             raise Unmet(r.describe())
 
+
+# ---------------------------------------------------------------- version skew
+#
+# Servers run by hand on server2, each with its own state directory and port,
+# so the unit and the shared /etc/qsh stay as they are.
+
+SKEW_PORTS = {"current": 2416, "previous": 2417, "rollback": 2418, "interrupted": 2419, "interrupted-1.0": 2420}
+
+
+def standalone_server(node, program: str, label: str) -> QshServer:
+    """A new state directory under /var/tmp, its host key made by `program`."""
+    server = QshServer(node, state_dir=f"/var/tmp/{unique(label)}", program=program)
+    server.fp = server.keygen()
+    return server
+
+
+@contextlib.contextmanager
+def serving_by_hand(server: QshServer, port: int):
+    """`server` run by hand as root, outside systemd, listening on `port`.
+
+    Yields a function that stops it with SIGTERM, as `systemctl stop` does;
+    the block's end stops it in any case. Its stderr is appended to
+    `<state dir>.log`.
+    """
+    node = server.node
+    argv = [server.program, "--dir", server.state_dir, "serve", "--listen", f"0.0.0.0:{port}"]
+    command = " ".join(argv)
+    proc = node.popen(
+        ["sh", "-c", 'exec "$@" 2>>"$0"', f"{server.state_dir}.log", *argv],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    def stop() -> None:
+        node.run(["pkill", "-TERM", "-f", "^" + re.escape(command) + "$"])
+        node.wait_gone(command)
+
+    try:
+        server.wait_listening(port=port)
+        yield stop
+    finally:
+        stop()
+        proc.wait(timeout=20)
+
+
+def remove_state(server: QshServer) -> None:
+    server.node.run(["rm", "-rf", server.state_dir, f"{server.state_dir}.log"])
+
+
+@pytest.mark.plan("OPS-16")
+def test_the_previous_release_and_this_one_interoperate(make_client, fast_server):
+    """qsh 1.0's client against this server, and this client against a 1.0 server.
+
+    The wire protocol is still qsh/1, version 1 (README "Protocol"), so a
+    mixed pair has to work as a matched one does: the exit status and death
+    by signal, stdin and stdout byte for byte without a terminal, stderr
+    apart, argv and the environment verbatim. A refusal must arrive as a
+    message and a status, never as a hang: a policy refusal, a key the server
+    does not know, and this server shutting down under a 1.0 client.
+    """
+    node = fast_server.node
+    current = standalone_server(node, "qsh-server", "ops16-current")
+    previous = standalone_server(node, PREVIOUS_QSH_SERVER, "ops16-previous")
+    pairs = []
+    skews = ((current, SKEW_PORTS["current"], True), (previous, SKEW_PORTS["previous"], False))
+    for server, port, old_client in skews:
+        client = make_client("alice", pin=False, previous=old_client)
+        stranger = make_client("alice", pin=False, previous=old_client)  # authorized nowhere
+        server.authorize(client.cert(), user="alice", name=client.entry, settle=False)
+        client.pin("server2", server.fp, port=port)
+        stranger.pin("server2", server.fp, port=port)
+        pairs.append((client, stranger, server, port))
+    marker = "7373.25"
+    try:
+        for client, stranger, server, port in pairs:
+            pair = f"{client.program} against {server.program}"
+            with serving_by_hand(server, port) as stop:
+                r = client.run(
+                    "server2", "sh", "-c", "cat; echo e-ops16 >&2; exit 7", port=port, input=PAYLOAD, timeout=30
+                )
+                assert (r.rc, r.err) == (7, b"e-ops16\n"), f"{pair}: {r.describe()}"
+                assert r.out == PAYLOAD, f"{pair}: stdout differs, {len(r.out)} bytes of {len(PAYLOAD)}"
+                r = client.run("server2", "sh", "-c", "kill -TERM $$", port=port, timeout=30)
+                assert r.rc == 128 + 15, f"{pair}: {r.describe()}"
+                r = client.run(
+                    "server2", "sh", "-c", 'printf "[%s]" "$@" "$QSH_OPS16"', "sh", "a b", "*", "$HOME", "",
+                    port=port, options=("-E", "QSH_OPS16=v 16"), timeout=30,
+                )
+                assert (r.rc, r.stdout) == (0, "[a b][*][$HOME][][v 16]"), f"{pair}: {r.describe()}"
+                r = client.run("bob@server2", "true", port=port, timeout=30)
+                assert r.rc == 126 and "not `bob`" in r.stderr, f"{pair}: {r.describe()}"
+                r = stranger.run("server2", "true", port=port, timeout=30)
+                assert r.rc == 255 and r.stderr.startswith("qsh: "), f"{pair}: {r.describe()}"
+                if server is current:
+                    proc = client.node.popen(client.argv("server2", "sleep", marker, port=port), user="alice")
+                    node.wait_running(f"sleep {marker}", timeout=10)
+                    begin = time.monotonic()
+                    stop()
+                    _, err = proc.communicate(timeout=30)
+                    took = time.monotonic() - begin
+                    assert proc.returncode == 255 and "shutting down" in err.decode(), f"{pair}: {err.decode()}"
+                    assert took < 10, f"{pair}: the client took {took:.0f}s to notice the shutdown"
+    finally:
+        node.run(["pkill", "-f", f"^sleep {marker}$"])
+        for server in (current, previous):
+            remove_state(server)
+
+
+@pytest.mark.plan("OPS-16")
+def test_a_rolled_back_server_fails_closed_on_newer_state(make_client, fast_server):
+    """Roll a server back to 1.0 over the state this build wrote, and forward again.
+
+    1.0 set the host up: its host key and broad policies for `legacy`,
+    `revoked` and `narrowed`. Then this build authorized `bound` (its policy
+    names its key), revoked `revoked`, gave `expired` a deadline that has
+    passed and narrowed `narrowed` to `--no-exec`. Served by 1.0 again,
+    nothing this build refused may get in. What 1.0 can still read is its own
+    policies, so a revocation must remove those, not only mark them; a policy
+    this build wrote is unreadable to 1.0 and refused whole. Forward again, a
+    key revoked here and authorized anew by 1.0 in between stays refused:
+    1.0's `authorize` leaves this build's tombstone in place. The lock file
+    this build added stays private to root throughout (THREAT_MODEL actor 4).
+    """
+    node = fast_server.node
+    port = SKEW_PORTS["rollback"]
+    previous = standalone_server(node, PREVIOUS_QSH_SERVER, "ops16-rollback")
+    current = QshServer(node, state_dir=previous.state_dir)
+    legacy, bound, revoked, expired, narrowed = (make_client("alice", pin=False) for _ in range(5))
+    lock = f"{current.state_dir}/authorized.lock"
+
+    def outcome(client: QshClient):
+        return client.run("server2", "echo", "granted-ops16", port=port, timeout=30)
+
+    def granted(client: QshClient) -> None:
+        r = outcome(client)
+        assert (r.rc, r.stdout) == (0, "granted-ops16\n"), f"{client.entry}: {r.describe()}"
+
+    def refused(client: QshClient) -> None:
+        r = outcome(client)
+        assert r.rc == 255 and "granted-ops16" not in r.stdout, f"{client.entry}: {r.describe()}"
+
+    try:
+        for client in (legacy, revoked, narrowed):
+            previous.authorize(client.cert(), user="alice", name=client.entry, settle=False)
+        current.authorize(bound.cert(), user="alice", name=bound.entry, settle=False)
+        current.revoke(revoked.entry, settle=False)
+        current.authorize(
+            expired.cert(), user="alice", name=expired.entry, options=("--expires-in-days", "0"), settle=False
+        )
+        current.authorize(
+            narrowed.cert(), user="alice", name=narrowed.entry, options=("--no-exec", "--force"), settle=False
+        )
+        for client in (legacy, bound, revoked, expired, narrowed):
+            client.pin("server2", previous.fp, port=port)
+        assert stat(node, lock) == "600 root root"
+        time.sleep(1.5)  # `--expires-in-days 0` set the deadline to now
+
+        with serving_by_hand(current, port):
+            granted(legacy)
+            granted(bound)
+            refused(revoked)
+            refused(expired)
+            r = outcome(narrowed)
+            assert r.rc == 126 and "may not execute commands" in r.stderr, r.describe()
+
+        with serving_by_hand(previous, port):
+            granted(legacy)  # 1.0 does serve this store
+            for client in (bound, revoked, expired, narrowed):
+                refused(client)
+            log = node.read(f"{previous.state_dir}.log").decode()
+            assert f"ignoring authorization `{bound.entry}`" in log and "unknown field `key_fingerprint`" in log, log
+            # Meanwhile the administrator authorizes the revoked key again, with 1.0.
+            previous.authorize(revoked.cert(), user="alice", name=revoked.entry, settle=False)
+            granted(revoked)
+        assert stat(node, lock) == "600 root root"
+
+        with serving_by_hand(current, port):
+            refused(revoked)
+            granted(legacy)
+            granted(bound)
+        listing = current.list()
+        assert re.search(rf"^{re.escape(revoked.entry)} .*\[DENIED", listing, re.M), listing
+    finally:
+        remove_state(previous)
+
+
+def interrupted_revocation(make_client, previous: QshServer) -> tuple[QshServer, QshClient]:
+    """A key 1.0 authorized in `previous`'s store, whose revocation by this
+    build was cut short.
+
+    `revoke` is killed at the moment it deletes the key's certificate: after
+    whatever it does first, before the key's files are gone. That is the
+    state an interrupted `revoke` leaves (README: "If a management process
+    stops partway through, a denial marker keeps that key inactive").
+    Returns the current build's server for the same store, and the key.
+    """
+    node = previous.node
+    current = QshServer(node, state_dir=previous.state_dir)
+    current.fp = previous.fp
+    victim = make_client("alice", pin=False)
+    previous.authorize(victim.cert(), user="alice", name=victim.entry, settle=False)
+    cert = f"{previous.state_dir}/authorized/{victim.entry}.crt"
+    r = node.run([
+        "strace", "-f", "-qq", "-o", "/dev/null", "-P", cert,
+        "-e", "trace=unlink,unlinkat", "-e", "inject=unlink,unlinkat:error=EIO:signal=KILL",
+        "qsh-server", "--dir", current.state_dir, "revoke", victim.entry,
+    ])
+    assert r.rc == 128 + 9 and node.exists(cert), f"revoke was not stopped before deleting {cert}\n{r.describe()}"
+    return current, victim
+
+
+@pytest.mark.plan("OPS-16")
+def test_an_interrupted_revocation_keeps_the_key_refused(make_client, fast_server):
+    """This build keeps a key refused whose revocation stopped partway.
+
+    The control for the rollback below: the files of the key are all still
+    there, and only what `revoke` wrote first says it is on its way out.
+    `list` must say so, the server must refuse the key, and running `revoke`
+    again must finish the job.
+    """
+    port = SKEW_PORTS["interrupted"]
+    previous = standalone_server(fast_server.node, PREVIOUS_QSH_SERVER, "ops16-interrupted")
+    try:
+        current, victim = interrupted_revocation(make_client, previous)
+        victim.pin("server2", current.fp, port=port)
+        listing = current.list()
+        assert re.search(rf"^{re.escape(victim.entry)} .*\[DENIED: interrupted mutation\]$", listing, re.M), listing
+        with serving_by_hand(current, port):
+            r = victim.run("server2", "echo", "granted-ops16", port=port, timeout=30)
+            assert r.rc == 255 and "granted-ops16" not in r.stdout, r.describe()
+        current.revoke(victim.entry, settle=False)
+        assert victim.entry not in current.list()
+    finally:
+        remove_state(previous)
+
+
+@pytest.mark.plan("OPS-16")
+@pytest.mark.xfail(
+    strict=True,
+    raises=Unmet,
+    reason="FXX-OPS-16: 1.0 ignores the denial marker an interrupted revoke leaves, so rolling back re-enables the key",
+)
+def test_a_rollback_keeps_an_interrupted_revocation_refused(make_client, fast_server):
+    """The state above, served by qsh-server 1.0 after a rollback.
+
+    The administrator has stopped trusting the key; this build refuses it.
+    Rolled back to 1.0, it must stay refused (THREAT_MODEL actor 3:
+    revocation is enforced for every session). `bystander`, an ordinary
+    1.0 policy in the same store, shows that 1.0 serves the store at all.
+    """
+    port = SKEW_PORTS["interrupted-1.0"]
+    previous = standalone_server(fast_server.node, PREVIOUS_QSH_SERVER, "ops16-interrupted")
+    bystander = make_client("alice", pin=False)
+    try:
+        _, victim = interrupted_revocation(make_client, previous)
+        previous.authorize(bystander.cert(), user="alice", name=bystander.entry, settle=False)
+        for client in (victim, bystander):
+            client.pin("server2", previous.fp, port=port)
+        with serving_by_hand(previous, port):
+            r = bystander.run("server2", "true", port=port, timeout=30)
+            assert r.rc == 0, f"1.0 does not serve this store at all\n{r.describe()}"
+            r = victim.run("server2", "echo", "granted-ops16", port=port, timeout=30)
+            if r.rc != 255 or "granted-ops16" in r.stdout:
+                raise Unmet(f"after the rollback the key whose revocation was interrupted got in:\n{r.describe()}")
+    finally:
+        remove_state(previous)

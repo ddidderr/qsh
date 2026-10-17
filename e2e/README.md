@@ -68,8 +68,8 @@ glibc. CI and the scenarios' expectations assume the pinned Debian.
 All five containers run one image, built by
 [docker/Dockerfile](docker/Dockerfile): qsh compiled from this checkout inside
 the image's Debian release, the shipped
-[systemd unit](../contrib/qsh-server.service), rsync, git, python3, and the
-accounts `alice` (with supplementary group `project`), `bob`, `carol` and
+[systemd unit](../contrib/qsh-server.service), rsync, git, python3, strace, and
+the accounts `alice` (with supplementary group `project`), `bob`, `carol` and
 `dave`.
 
 The image also carries the previous release, for the upgrade and
@@ -156,3 +156,6 @@ Some lessons the first scenarios taught:
   a dedicated exception for the unmet expectation and name it in the mark's
   `raises`, so a broken precondition still fails (see `Unmet` in
   `test_ops.py`).
+- To leave the state an interrupted management command leaves, interrupt a
+  real one: `strace -P FILE -e inject=unlink,unlinkat:error=EIO:signal=KILL`
+  kills it just as it would delete FILE.
