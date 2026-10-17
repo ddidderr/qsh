@@ -172,12 +172,14 @@ def test_interactive_exit_past_a_background_job_that_keeps_writing(alice, server
 def test_interactive_exit_past_a_background_job_that_floods_the_terminal(alice, server):
     """The same, with a job that writes faster than the terminal reads.
 
-    The terminal reads nothing until the drain grace is over, as one that
-    cannot keep up would, so the server's output queue is full when the grace
-    runs out and it holds a chunk read but not yet queued. That is output
-    after the shell's exit, which the README says the session does not wait
-    for: it must not turn into a failed session, nor keep qsh after the
-    output already on its way has arrived.
+    `yes` outwrites the path whatever reads it: with this terminal read at
+    full speed the exit already failed in most runs. Here the terminal reads
+    nothing until the drain grace is over, as one that cannot keep up would,
+    which makes it fail every time: the server's output queue is full when
+    the grace runs out and it holds a chunk read but not yet queued. That is
+    output after the shell's exit, which the README says the session does
+    not wait for: it must not turn into a failed session, nor keep qsh after
+    the output already on its way has arrived.
     """
     status, took, quiet, tail = exit_past_a_chatty_job(
         alice, server, "yes chatter-$((9190 + 1))", "chatter-9191", "yes chatter-9191", stall=PTY_DRAIN_GRACE + 0.5
@@ -271,37 +273,85 @@ def test_a_signal_that_ends_qsh_ends_the_remote_job_at_once(alice_fast, fast_ser
     marker = f"{7171 if terminal else 7272}.{number:02d}5"
     with a_session_running(alice_fast, fast_server, marker, terminal=terminal) as (argv, wait):
         assert alice_fast.node.kill_command("alice", argv, name), "no qsh to signal"
-        wait(timeout=10)
+        # Still 128+n, the status the README gives a death by signal n.
+        assert wait(timeout=10) == 128 + number
         # Well under server2's 8 s idle timeout: a close arrives at once.
         fast_server.node.wait_gone(f"sleep {marker}", timeout=3)
+
+
+@pytest.mark.plan("LIFE-10")
+@pytest.mark.xfail(
+    strict=True,
+    reason="FXX-LIFE-10-ctrl-c: without a terminal qsh only relays INT, so on a dead path Ctrl-C waits out the idle timeout",
+)
+def test_ctrl_c_ends_a_command_whose_path_has_gone_dark(alice_fast, fast_server, make_link):
+    """Ctrl-C, pressed until something happens, ends qsh even when the server cannot hear it.
+
+    Without a terminal qsh relays INT and TERM to the remote command instead
+    of exiting (EXEC-22), so that the command can clean up and its status
+    becomes qsh's. When the path has gone dark the relayed signal never
+    arrives, and nothing else ends qsh before its idle timeout: 8 s on
+    server2, 60 s on a default server. ssh exits on the first INT. Proposed:
+    an INT or TERM that arrives while an earlier one is still unanswered
+    ends qsh locally, with 128+n, so pressing Ctrl-C again gets the user out.
+    """
+    link = make_link("server2:2222")
+    alice_fast.pin(link.host, fast_server.fp, port=link.port)
+    marker = "7373.25"
+    argv = alice_fast.argv(link.host, "sleep", marker, port=link.port)
+    proc = alice_fast.node.popen(argv, user="alice")
+    try:
+        fast_server.node.wait_running(f"sleep {marker}", timeout=15)
+        link.blackhole(True)
+        begin = time.monotonic()
+        assert alice_fast.node.kill_command("alice", argv, "INT"), "no qsh to signal"
+        for _ in range(2):
+            time.sleep(1)
+            if proc.poll() is None:
+                alice_fast.node.kill_command("alice", argv, "INT")
+        status = proc.wait(timeout=FAST_IDLE_TIMEOUT + 15)
+        took = time.monotonic() - begin
+    finally:
+        if proc.poll() is None:
+            alice_fast.node.kill_command("alice", argv)
+            proc.wait(timeout=10)
+        alice_fast.subcommand("known-hosts", "remove", f"{link.host}:{link.port}")
+        fast_server.node.run(["pkill", "-u", "alice", "-f", f"^sleep {marker}$"])
+    print(f"qsh ended {took:.1f}s after the first Ctrl-C, status {status}")
+    # Well before server2's 8 s idle timeout, and before a fourth Ctrl-C would come.
+    assert took < 5, f"qsh ended {took:.1f}s after the first Ctrl-C"
+    assert status == 128 + signal.SIGINT
 
 
 # ---------------------------------------------------------------- LIFE-11
 
 
+# What LIFE-11 sends, and what is left of it when an outage cuts it.
+RSYNC_SIZE = 32 * 1024 * 1024
+
+
 @pytest.mark.plan("LIFE-11")
 @pytest.mark.parametrize(
-    "partial",
+    "partial,survives",
     [
-        pytest.param(
-            ("-P",),
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="FXX-LIFE-11: the old receiver's --partial cleanup moves its partial file over the retry's result",
-            ),
-            id="partial",
-        ),
-        pytest.param(("-P", "--partial-dir=.rsync-partial"), id="partial-dir"),
+        pytest.param(("-P",), False, id="partial"),
+        pytest.param(("-P", "--partial-dir=.rsync-partial"), True, id="partial-dir"),
     ],
 )
-def test_an_rsync_retried_at_once_survives_the_old_receivers_cleanup(alice_fast, fast_server, make_link, partial):
+def test_an_rsync_retried_at_once_meets_the_old_receivers_cleanup(alice_fast, fast_server, make_link, partial, survives):
     """An upload is cut by an outage, stopped with Ctrl-C, and re-run at once.
 
     The old receiver on server2 cannot hear that its client is gone: it lives
     until the idle timeout, then gets SIGHUP and an end of input, and rsync's
     `--partial` cleanup moves the file it was writing to the destination
-    name. A retry over a working path that finished in the meantime must keep
-    its complete result. The first run is throttled so that the outage lands
+    name, or with `--partial-dir` into that directory. That is rsync's doing,
+    on any transport whose server side outlives its client: under ssh the old
+    receiver lives until TCP gives up, minutes to hours later. What qsh adds
+    is the bound, the idle timeout, which this pins, together with what the
+    README is to say about it: with `-P` alone the partial replaces a retry
+    that finished in the meantime; with `--partial-dir` the retry's result
+    stays. A change that ended abandoned sessions some other way, or never,
+    fails one of the two. The first run is throttled so that the outage lands
     part way through, whatever the host's speed; the retry runs at full speed.
     """
     name = unique("retry")
@@ -313,7 +363,7 @@ def test_an_rsync_retried_at_once_survives_the_old_receivers_cleanup(alice_fast,
     old_receiver = f"^rsync --server .*--bwlimit=.* {re.escape(remote)}/$"
     first = None
     try:
-        alice_fast.shell(f"mkdir -p {local} && head -c 32M /dev/urandom > {local}/large.bin")
+        alice_fast.shell(f"mkdir -p {local} && head -c {RSYNC_SIZE} /dev/urandom > {local}/large.bin")
         fast_server.node.run(["mkdir", "-p", remote], user="alice", check=True)
         want = alice_fast.node.run(["sha256sum", f"{local}/large.bin"], check=True).stdout.split()[0]
         # In a session of its own, so that a Ctrl-C reaches rsync and its qsh
@@ -324,6 +374,7 @@ def test_an_rsync_retried_at_once_survives_the_old_receivers_cleanup(alice_fast,
         )
         fast_server.node.wait_for(f"find {remote} -maxdepth 1 -name '.large.bin.*' -size +4M | grep -q .", timeout=60)
         link.blackhole(True)
+        outage = time.monotonic()
         (leader,) = alice_fast.node.pids(f"rsync -e {qsh} ")
         alice_fast.node.run(["kill", "-INT", "--", f"-{leader}"], check=True)
         _, err = first.communicate(timeout=30)
@@ -341,11 +392,21 @@ def test_an_rsync_retried_at_once_survives_the_old_receivers_cleanup(alice_fast,
         assert got == want, "the retry did not produce the file"
 
         fast_server.node.wait_for(f"! pgrep -u alice -f '{old_receiver}'", timeout=FAST_IDLE_TIMEOUT + 15)
+        cleaned = time.monotonic() - outage
+        print(f"the old receiver was cleaned up {cleaned:.1f}s after the outage")
+        assert cleaned < FAST_IDLE_TIMEOUT + 10, f"the old receiver lived {cleaned:.1f}s after the outage"
         # And the first qsh, which waits out its own idle timeout.
         alice_fast.node.wait_gone(f"qsh -p {link.port} netsim rsync", timeout=FAST_IDLE_TIMEOUT + 15)
-        size = fast_server.node.run(["stat", "-c", "%s", f"{remote}/large.bin"], check=True).stdout.strip()
+        size = int(fast_server.node.run(["stat", "-c", "%s", f"{remote}/large.bin"], check=True).stdout)
         got = fast_server.node.run(["sha256sum", f"{remote}/large.bin"], check=True).stdout.split()[0]
-        assert got == want, f"after the old receiver's cleanup the destination has {size} of 33554432 bytes"
+        if survives:
+            assert got == want, f"after the old receiver's cleanup the destination has {size} of {RSYNC_SIZE} bytes"
+            kept = fast_server.node.run(["stat", "-c", "%s", f"{remote}/.rsync-partial/large.bin"])
+            assert kept.rc == 0 and 0 < int(kept.stdout) < RSYNC_SIZE, f"no partial in .rsync-partial/: {kept.describe()}"
+        else:
+            # The hazard the README is to describe: the old partial, in place
+            # of the retry's complete file.
+            assert got != want and 0 < size < RSYNC_SIZE, f"the destination has {size} of {RSYNC_SIZE} bytes"
     finally:
         if first is not None and first.poll() is None:
             alice_fast.node.run(["pkill", "-u", "alice", "-f", f"^rsync -e {re.escape(qsh)} "])
