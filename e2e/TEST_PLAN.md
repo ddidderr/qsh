@@ -519,9 +519,10 @@ fails until the mark is removed, so a fix cannot go unnoticed.
 - **Expected:** qsh exits 5 without an error message: the slow writer within 2 s + 3 s (measured 2.3 s), the flood without staying more than 1.5 s after its last output. The flood measured status 255 after 6.3–6.5 s, the last 3 s of it with nothing to print, and the message "the remote output could not be delivered in full" when it still fits in the queue: the output queue is full at the deadline, so the pump holds a chunk it cannot queue (`CutoffPending`), the session counts as incomplete, and the shell's process group gets SIGHUP, 2 s, SIGTERM, 2 s before the status goes out. Found FXX-LIFE-09.
 
 ### LIFE-10 — Client exits that send no close
-- **Status:** planned · **Priority:** P2 · **Needs:** pty, server2
-- **Why:** a closed terminal window (SIGHUP) or another fatal signal ends qsh without a CONNECTION_CLOSE, so the server keeps the session until its idle timeout.
-- **Expected:** document the delay, or send a close before exiting and check the remote job ends at once.
+- **Status:** automated · **Priority:** P2 · **Needs:** pty, server2
+- **Why:** a closed terminal window (SIGHUP) or another fatal signal can end qsh without a QUIC CONNECTION_CLOSE, and the server then keeps the session until its idle timeout. In a terminal qsh catches TERM, HUP, QUIT, INT, USR1, USR2 and ALRM, restores the terminal and calls `process::exit` without closing (`restore_on_fire`, `src/client.rs`); without one it catches only INT and TERM, to relay them (EXEC-22). Every other terminating signal takes its default action. ssh closes its TCP connection on HUP, INT, QUIT and TERM, and the kernel closes it on any other death, so sshd ends the session at once.
+- **Steps:** on server2 (8 s idle timeout), a session whose job is a distinctive `sleep`: a login shell with it in the foreground, or `qsh server2 sleep …`. Send qsh a signal: in a terminal HUP, TERM, INT, QUIT, USR1, USR2, ALRM, and VTALRM for those it does not catch; without one HUP and USR1.
+- **Expected:** after HUP qsh exits 129 within 2 s (measured 0.2 s) and the job is gone within the idle timeout plus a margin, as after `kill -9` (LIFE-01). Proposed: qsh sends a close before it exits, so that after each of these signals the job is gone within 3 s. Measured 8.8–9.3 s for every one, the idle timeout. Found FXX-LIFE-10.
 
 ### LIFE-11 — rsync `-P` cut by an outage and re-run at once
 - **Status:** planned · **Priority:** P2 · **Needs:** netsim

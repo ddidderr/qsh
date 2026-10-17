@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
+import signal
 import time
+from contextlib import contextmanager
 
 import pytest
 
@@ -183,3 +185,89 @@ def test_interactive_exit_past_a_background_job_that_floods_the_terminal(alice, 
     assert "could not be delivered" not in tail, tail[-300:]
     assert status == 5, tail[-300:]
     assert quiet < 1.5, f"qsh stayed {quiet:.1f}s after its last output"
+
+
+# ---------------------------------------------------------------- LIFE-10
+
+
+@contextmanager
+def a_session_running(client, server, marker: str, *, terminal: bool):
+    """A session on `server` whose remote job is `sleep <marker>`.
+
+    Yields the local qsh's command line and a function that waits for it to
+    exit and returns its status. With `terminal`, it is an interactive shell
+    with the job in the foreground; otherwise a plain `qsh host sleep ...`.
+    """
+    if terminal:
+        term = Terminal(client, server.host, timeout=30)
+        argv, wait = term.argv, term.wait_exit
+    else:
+        argv = client.argv(server.host, "sleep", marker)
+        proc = client.node.popen(argv, user=client.user)
+
+        def wait(timeout: float) -> int:
+            return proc.wait(timeout=timeout)
+
+    try:
+        if terminal:
+            term.set_prompt()
+            term.sendline(f"sleep {marker}")
+        server.node.wait_running(f"sleep {marker}", timeout=15)
+        yield argv, wait
+    finally:
+        if terminal:
+            term.close()
+        else:
+            client.node.kill_command(client.user, argv)
+            proc.wait(timeout=10)
+        server.node.run(["pkill", "-u", client.user, "-f", f"^sleep {marker}$"])
+
+
+@pytest.mark.plan("LIFE-10")
+@pytest.mark.parametrize("terminal", [True, False], ids=["terminal", "command"])
+def test_a_hangup_ends_qsh_at_once_and_the_idle_timeout_ends_its_job(alice_fast, fast_server, terminal):
+    """A closed terminal window: SIGHUP for qsh, interactive or not.
+
+    qsh exits at once with 128+1 (the terminal case restores the local
+    terminal first, PTY-15), and the server cleans up the remote job within
+    its idle timeout, as for a killed client (LIFE-01).
+    """
+    marker = "7070.25" if terminal else "7070.5"
+    with a_session_running(alice_fast, fast_server, marker, terminal=terminal) as (argv, wait):
+        begin = time.monotonic()
+        assert alice_fast.node.kill_command("alice", argv, "HUP"), "no qsh to signal"
+        assert wait(timeout=10) == 128 + signal.SIGHUP
+        assert time.monotonic() - begin < 2, "qsh did not exit at once"
+        fast_server.node.wait_gone(f"sleep {marker}", timeout=FAST_IDLE_TIMEOUT + 15)
+        assert time.monotonic() - begin < FAST_IDLE_TIMEOUT + 10
+
+
+@pytest.mark.plan("LIFE-10")
+@pytest.mark.xfail(
+    strict=True,
+    reason="FXX-LIFE-10: qsh ends on a signal without a CONNECTION_CLOSE; the job lives on for the idle timeout",
+)
+@pytest.mark.parametrize(
+    "terminal,name",
+    [
+        *(pytest.param(True, n, id=f"terminal-{n}") for n in ("HUP", "TERM", "INT", "QUIT", "USR1", "USR2", "ALRM", "VTALRM")),
+        *(pytest.param(False, n, id=f"command-{n}") for n in ("HUP", "USR1")),
+    ],
+)
+def test_a_signal_that_ends_qsh_ends_the_remote_job_at_once(alice_fast, fast_server, terminal, name):
+    """qsh tells the server it is leaving, so the job does not wait out the idle timeout.
+
+    In a terminal qsh catches TERM, HUP, QUIT, INT, USR1, USR2 and ALRM,
+    restores the terminal and exits (src/client.rs `restore_on_fire`);
+    VTALRM stands for the terminating signals it does not catch. Without a
+    terminal only INT and TERM are caught, and relayed (EXEC-22); HUP and
+    USR1 take their default action. ssh closes its TCP connection on all of
+    these, and sshd ends the session at once.
+    """
+    number = signal.Signals[f"SIG{name}"].value
+    marker = f"{7171 if terminal else 7272}.{number:02d}5"
+    with a_session_running(alice_fast, fast_server, marker, terminal=terminal) as (argv, wait):
+        assert alice_fast.node.kill_command("alice", argv, name), "no qsh to signal"
+        wait(timeout=10)
+        # Well under server2's 8 s idle timeout: a close arrives at once.
+        fast_server.node.wait_gone(f"sleep {marker}", timeout=3)
