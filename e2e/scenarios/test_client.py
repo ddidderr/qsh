@@ -73,3 +73,37 @@ def test_qsh_home_selects_the_identity_directory(make_client, server):
     since = server.cursor()
     assert client.node.run(["qsh", "server", "true"], user="alice", env={"QSH_HOME": client.identity}).rc == 0
     server.wait_journal(rf"key `{client.entry}`", since)
+
+
+@pytest.mark.plan("CLI-07")
+@pytest.mark.parametrize(
+    "option",
+    [
+        ("-o", "StrictHostKeyChecking=accept-new"),
+        ("-oStrictHostKeyChecking=accept-new",),
+        ("-o", "UserKnownHostsFile=/dev/null"),
+        ("-o", "ConnectTimeout 5"),
+        ("-v",),
+        ("-vvv",),
+        ("-C",),
+        ("-a",),
+        ("-x",),
+    ],
+)
+def test_ssh_options_are_refused_before_contacting_the_host(make_client, server, option):
+    """qsh is not ssh: an ssh option fails loudly instead of being ignored."""
+    client = make_client("alice", authorize_as="alice", pin=False)
+    since = server.cursor()
+    r = client.run("server", "true", options=option)
+    assert r.rc == 255 and f"unknown option: {option[0]}" in r.stderr, r.describe()
+    assert "server" not in client.subcommand("known-hosts", "list").stdout
+    assert f"key `{client.entry}`" not in server.journal(since)
+
+
+@pytest.mark.plan("CLI-07")
+def test_everything_after_the_host_is_the_remote_command(alice):
+    r = alice.run("server", "echo", "-p", "2222", "-o", "x")
+    assert r.rc == 0 and r.stdout.strip() == "-p 2222 -o x", r.describe()
+    # Unlike ssh, `-p` after the host is not a port: it is the program.
+    r = alice.run("server", "-p", "2222", "true")
+    assert r.rc == 127, r.describe()

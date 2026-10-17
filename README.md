@@ -9,6 +9,12 @@ nothing else:
   byte for byte,
 * **rsync** — because of the above, `rsync -e qsh` just works.
 
+qsh is not an ssh clone. It is new software with its own design decisions,
+and it is deliberately kept simple. Where it behaves like ssh, that is because
+the behaviour is right for qsh, not to match ssh: it accepts none of ssh's
+options or flags for compatibility's sake, and an ssh option it does not have
+is an error, never silently ignored.
+
 Everything runs over a single QUIC connection: TLS 1.3 by construction, one
 UDP port, no head-of-line blocking between sessions, and connection migration
 if your laptop changes network.
@@ -408,10 +414,16 @@ qsh [options] [user@]host [command [args...]]
 | `--refuse-new` | Never pin automatically |
 | `-4` / `-6` | Restrict to IPv4 / IPv6 |
 | `--connect-timeout SECS` | Deadline per address, default 10 |
-| `-o OPTION` | Ignored, for ssh compatibility; `StrictHostKeyChecking=accept-new\|yes` is honoured |
-| `-q`, `-v`, `-C` | Accepted for ssh compatibility |
+| `-n` | Send EOF without reading local stdin |
+| `-q`, `--quiet` | Suppress qsh's own messages |
 
 Subcommands: `qsh keygen`, `qsh fingerprint`, `qsh known-hosts list|add|remove`.
+
+Options go before the host: everything after it is the remote command, so
+`qsh host ls -l` runs `ls -l` and `qsh host -p 2222 true` runs `-p` remotely.
+There is no ssh-style `-o`, `-v`, `-C`, `-a` or `-x`; each is an unknown option
+like any other. Choose the host-key policy with `--accept-new` or
+`--refuse-new`.
 
 A host name that resolves to several addresses is tried with a 250 ms stagger,
 at most two attempts at once, and an interleaved IPv6/IPv4 order. Each address
@@ -457,10 +469,10 @@ the output and then finishes anyway, so `sleep 300 &` followed by `exit` still
 returns you to your prompt.
 
 qsh exits with the remote command's exit status, `128+n` if it died from
-signal `n`, and `255` for its own failures — the same convention as ssh, which
-is what makes it a drop-in for scripts and for rsync. As from a shell, a
-remote program that does not exist gives `127`, and one that cannot be
-executed, or that the key may not run, gives `126`.
+signal `n`, and `255` for its own failures — the convention scripts and rsync
+expect from a remote shell. As from a shell, a remote program that does not
+exist gives `127`, and one that cannot be executed, or that the key may not
+run, gives `126`.
 
 ## Running under systemd
 

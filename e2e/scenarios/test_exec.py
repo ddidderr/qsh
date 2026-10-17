@@ -232,11 +232,9 @@ def test_output_order_is_preserved(alice):
 
 
 @pytest.mark.plan("EXEC-20")
-def test_ssh_compatible_options_are_accepted(alice):
-    r = alice.run(
-        "server", "echo", "ok",
-        options=("-q", "-v", "-C", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-T"),
-    )
+@pytest.mark.parametrize("options", [("-q", "-T"), ("-qT",)])
+def test_qshs_own_flags_combine(alice, options):
+    r = alice.run("server", "echo", "ok", options=options)
     assert r.rc == 0, r.describe()
     assert r.stdout.strip() == "ok"
 

@@ -99,9 +99,7 @@ def test_the_first_contact_answer_is_not_case_sensitive(make_client, server, ans
     "options,pins",
     [
         (("--refuse-new",), False),
-        (("-o", "StrictHostKeyChecking=yes"), False),
         (("--accept-new",), True),
-        (("-o", "StrictHostKeyChecking=accept-new"), True),
     ],
 )
 def test_first_contact_policies_without_a_terminal(make_client, server, options, pins):

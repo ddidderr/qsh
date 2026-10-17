@@ -41,13 +41,10 @@ Options:
   -E, --setenv K=V       Send an environment variable (TERM, LANG, LC_*, QSH_*)
       --accept-new       Pin an unknown host key without asking
       --refuse-new       Never pin automatically
-  -o OPTION              Accepted for ssh compatibility; only
-                         StrictHostKeyChecking=accept-new|yes has an effect
   -4 / -6                Use IPv4 / IPv6 only
       --connect-timeout SECS
                          Deadline per address when connecting (default 10)
   -q, --quiet            Suppress qsh's own messages
-  -v, --verbose          Accepted for ssh compatibility (no extra output)
   -h, --help             Show this help
   -V, --version          Show the version
 
@@ -365,12 +362,11 @@ fn parse_connect(args: Vec<String>) -> Result<Cli> {
                     .context("--connect-timeout must be a number of seconds")?;
             }
             "-n" => p.no_stdin = true,
-            "-v" | "--verbose" | "-C" | "-a" | "-x" => {}
             a if a.starts_with('-')
                 && a.len() > 2
-                && a.chars().skip(1).all(|c| {
-                    matches!(c, 't' | 'T' | 'v' | 'q' | 'n' | 'C' | 'a' | 'x' | '4' | '6')
-                }) =>
+                && a.chars()
+                    .skip(1)
+                    .all(|c| matches!(c, 't' | 'T' | 'q' | 'n' | '4' | '6')) =>
             {
                 apply_short_flags(a, &mut p);
             }
@@ -380,13 +376,6 @@ fn parse_connect(args: Vec<String>) -> Result<Cli> {
             }
             "--accept-new" => p.policy = HostKeyPolicy::AcceptNew,
             "--refuse-new" => p.policy = HostKeyPolicy::Refuse,
-            "-o" | "--option" => {
-                let opt = it.next().context("-o needs an option")?;
-                apply_ssh_option(&opt, &mut p.policy);
-            }
-            a if split(a, "-o").is_some() => {
-                apply_ssh_option(&split(a, "-o").unwrap_or_default(), &mut p.policy);
-            }
             "-h" | "--help" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -425,20 +414,6 @@ fn apply_short_flags(flags: &str, p: &mut Parsed) {
             '6' => p.family = AddressFamily::V6,
             _ => {}
         }
-    }
-}
-
-/// Understand the handful of `-o` settings that map onto qsh behaviour.
-fn apply_ssh_option(opt: &str, policy: &mut HostKeyPolicy) {
-    let Some((key, value)) = opt.split_once('=') else {
-        return;
-    };
-    if key.eq_ignore_ascii_case("StrictHostKeyChecking") {
-        *policy = match value.to_ascii_lowercase().as_str() {
-            "accept-new" | "no" | "off" => HostKeyPolicy::AcceptNew,
-            "yes" | "on" => HostKeyPolicy::Refuse,
-            _ => *policy,
-        };
     }
 }
 
@@ -549,18 +524,20 @@ mod tests {
     }
 
     #[test]
-    fn ssh_compatibility_options_are_tolerated() {
-        let o = parse(&["-C", "-v", "-o", "Compression=yes", "h", "true"]);
-        assert_eq!(o.host, "h");
-        assert_eq!(o.command.unwrap(), vec!["true"]);
-        assert_eq!(o.host_key_policy, HostKeyPolicy::Ask);
+    fn ssh_only_flags_are_errors_not_no_ops() {
+        for flag in ["-v", "--verbose", "-C", "-a", "-x", "-vvv", "-qC"] {
+            let error = parse_connect(vec![flag.into(), "h".into()])
+                .err()
+                .unwrap()
+                .to_string();
+            assert_eq!(error, format!("unknown option: {flag}"));
+        }
     }
 
     #[test]
-    fn bundled_ssh_flags_and_attached_options_work() {
-        let o = parse(&["-tt", "-vvv", "-qn", "-oStrictHostKeyChecking=yes", "h"]);
+    fn bundled_flags_and_attached_options_work() {
+        let o = parse(&["-tt", "-qn", "h"]);
         assert_eq!(o.pty, PtyPolicy::Force);
-        assert_eq!(o.host_key_policy, HostKeyPolicy::Refuse);
         assert!(o.no_stdin && o.quiet);
         assert!(!parse(&["h"]).no_stdin);
         assert!(parse(&["-n", "h"]).no_stdin);
@@ -595,15 +572,26 @@ mod tests {
     }
 
     #[test]
-    fn strict_host_key_checking_maps_to_a_policy() {
+    fn host_key_policy_has_one_spelling_each() {
         assert_eq!(
-            parse(&["-o", "StrictHostKeyChecking=accept-new", "h"]).host_key_policy,
+            parse(&["--accept-new", "h"]).host_key_policy,
             HostKeyPolicy::AcceptNew
         );
         assert_eq!(
-            parse(&["-o", "stricthostkeychecking=yes", "h"]).host_key_policy,
+            parse(&["--refuse-new", "h"]).host_key_policy,
             HostKeyPolicy::Refuse
         );
+        // No ssh `-o`: an option qsh would only half honour is an error, not
+        // a silent no-op.
+        for args in [
+            &["-o", "StrictHostKeyChecking=accept-new", "h"][..],
+            &["-oStrictHostKeyChecking=yes", "h"],
+            &["-o", "UserKnownHostsFile=/dev/null", "h"],
+        ] {
+            let args = args.iter().map(|s| (*s).to_owned()).collect();
+            let error = parse_connect(args).err().unwrap().to_string();
+            assert!(error.starts_with("unknown option: -o"), "{error}");
+        }
     }
 
     #[test]

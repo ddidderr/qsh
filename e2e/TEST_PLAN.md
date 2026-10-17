@@ -157,10 +157,10 @@ fails until the mark is removed, so a fix cannot go unnoticed.
 - **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** `seq 1 200000` arrives complete and in order.
 
-### EXEC-20 — ssh-compatible options are accepted
+### EXEC-20 — qsh's own flags combine
 - **Status:** automated · **Priority:** P1 · **Needs:** —
-- **Steps:** `-q -v -C -o BatchMode=yes -o StrictHostKeyChecking=yes -T`.
-- **Expected:** the command runs normally (README client reference).
+- **Steps:** `-q -T`, and the same bundled as `-qT`.
+- **Expected:** the command runs normally (README client reference). ssh's flags are not qsh's; CLI-07 checks that they are refused.
 
 ### EXEC-21 — A closed local stderr ends qsh quietly
 - **Status:** automated · **Priority:** P1 · **Needs:** —
@@ -617,7 +617,7 @@ fails until the mark is removed, so a fix cannot go unnoticed.
 
 ### SEC-03 — First-contact policies without a terminal
 - **Status:** automated · **Priority:** P0 · **Needs:** —
-- **Expected:** `--refuse-new` and `StrictHostKeyChecking=yes` refuse and pin nothing; `--accept-new` and `StrictHostKeyChecking=accept-new` pin and connect.
+- **Expected:** `--refuse-new` refuses and pins nothing; `--accept-new` pins and connects.
 
 ### SEC-04 — Local users on the server cannot reach its secrets
 - **Status:** automated · **Priority:** P0 · **Needs:** —
@@ -730,8 +730,9 @@ fails until the mark is removed, so a fix cannot go unnoticed.
 - **Expected:** the session authenticates with that directory's key.
 
 ### CLI-07 — Divergences from OpenSSH that scripts may hit
-- **Status:** planned · **Priority:** P2 · **Needs:** —
-- **Why:** `-o 'Key Value'`, options after the host, `UserKnownHostsFile`, `ConnectTimeout` and `BatchMode` differ from ssh. Decide which to support or document, then pin them.
+- **Status:** automated · **Priority:** P2 · **Needs:** —
+- **Why:** qsh is not an ssh clone and takes no ssh options for compatibility (decided 2026-10-17; README). It used to accept every `-o` and honour only `StrictHostKeyChecking=…` in the `=` spelling, so `UserKnownHostsFile=/dev/null`, `ConnectTimeout`, `BatchMode` and `-o 'Key Value'` were silently ignored, as were `-v`, `-C`, `-a` and `-x`. Found F23.
+- **Expected:** any `-o`, attached or separate, and `-v`, `-C`, `-a`, `-x` fail with status 255 and `unknown option: …` before contacting the host, pinning nothing; `--accept-new`/`--refuse-new` are the host-key policy. Everything after the host is the remote command: `qsh server echo -p 2222` prints `-p 2222`, and `qsh server -p 2222 true` runs `-p` remotely (status 127), unlike ssh (README client reference).
 
 ---
 
@@ -761,6 +762,7 @@ that fixed each one carries its ID.
 | F20 | P2 | git cannot use qsh directly: it sends one command string for a shell; no documented way around | XFER-12 | fixed (docs) |
 | F21 | P2 | Undocumented: account expiry, locking and `/etc/nologin` do not gate qsh (no PAM) | AUTH-19 | fixed (docs) |
 | F22 | P2 | A narrowed policy ended sessions with `stream reset by peer: error 2` and no journal line | AUTH-18 | fixed |
+| F23 | P2 | `-o` accepted any ssh option and silently ignored all but `StrictHostKeyChecking=…`, including `UserKnownHostsFile`; `-v`, `-C`, `-a`, `-x` were no-ops | CLI-07 | fixed (all removed) |
 
 ### Open items
 
