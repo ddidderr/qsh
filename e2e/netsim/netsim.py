@@ -47,6 +47,17 @@ from dataclasses import asdict, dataclass, field
 
 CONTROL_DIR = "/run/netsim"
 
+# Receive and send buffer of every socket the relay opens. With the kernel's
+# default (208 KiB, about 140 full-size QUIC datagrams) a fast sender's burst
+# overflows the relay's receive buffer while Python catches up, and the kernel
+# drops datagrams that no impairment asked for: on a long path the sender's
+# congestion control then takes seconds to recover, and the relay, not the
+# path, sets the throughput. SO_RCVBUFFORCE needs CAP_NET_ADMIN, which the
+# netsim node has; without it the kernel caps the size at net.core.rmem_max.
+SOCKET_BUFFER = 16 * 1024 * 1024
+SO_RCVBUFFORCE = getattr(socket, "SO_RCVBUFFORCE", 33)  # the Linux values
+SO_SNDBUFFORCE = getattr(socket, "SO_SNDBUFFORCE", 32)
+
 # Impairment settings a `set` request may change, with their types.
 SETTINGS = {
     "loss": float,  # probability that a datagram is dropped, per direction
@@ -96,6 +107,20 @@ class Counters:
     reordered: int = 0
     oversized: int = 0  # dropped for exceeding the size limit
     largest: int = 0  # the largest datagram forwarded so far
+    # Bytes waiting out the delay now, and the most at any one time. All of
+    # them are in flight for the sender, so on a path whose delay dominates
+    # the round trip, max_delayed shows how far the sender's window opened.
+    delayed: int = 0
+    max_delayed: int = 0
+
+
+def enlarge_buffers(transport: asyncio.DatagramTransport) -> None:
+    sock = transport.get_extra_info("socket")
+    for forced, plain in ((SO_RCVBUFFORCE, socket.SO_RCVBUF), (SO_SNDBUFFORCE, socket.SO_SNDBUF)):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, forced, SOCKET_BUFFER)
+        except OSError:
+            sock.setsockopt(socket.SOL_SOCKET, plain, SOCKET_BUFFER)
 
 
 @dataclass
@@ -158,7 +183,15 @@ class Link:
             if delay <= 0:
                 send(data)
             else:
-                asyncio.get_running_loop().call_later(delay / 1000, send, data)
+                counters.delayed += len(data)
+                counters.max_delayed = max(counters.max_delayed, counters.delayed)
+                asyncio.get_running_loop().call_later(delay / 1000, self.release, counters, send, data)
+
+    @staticmethod
+    def release(counters: Counters, send, data: bytes) -> None:
+        """Send a datagram whose delay is over."""
+        counters.delayed -= len(data)
+        send(data)
 
     def from_client(self, data: bytes, addr: tuple[str, int]) -> None:
         flow = self.flows.get(addr)
@@ -201,6 +234,7 @@ class Flow:
         transport, _ = await loop.create_datagram_endpoint(
             lambda: Upstream(self), local_addr=local, remote_addr=self.link.target
         )
+        enlarge_buffers(transport)
         old, self.upstream = self.upstream, transport
         if old is not None:
             old.close()
@@ -317,9 +351,10 @@ async def serve(args: argparse.Namespace) -> None:
     link.source_ip = args.source_ip
 
     loop = asyncio.get_running_loop()
-    await loop.create_datagram_endpoint(
+    listener, _ = await loop.create_datagram_endpoint(
         lambda: Listener(link), local_addr=("0.0.0.0", args.listen)
     )
+    enlarge_buffers(listener)
     os.makedirs(CONTROL_DIR, exist_ok=True)
     path = control_path(args.name)
     if os.path.exists(path):

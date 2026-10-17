@@ -91,7 +91,10 @@ accounts `alice` (with supplementary group `project`), `bob`, `carol` and
   flow to a new source port or address (what a NAT rebinding or a roaming
   client looks like to the server). `--trace` logs every datagram with its
   size. Userspace, not `tc netem`, so it behaves the same on every kernel
-  Docker runs on.
+  Docker runs on. Its sockets have 16 MiB buffers, so the kernel does not
+  drop a fast sender's burst before the relay gets to it, and its counters
+  say how many bytes its delay held at once: on a long path, how far the
+  sender's window opened.
 
 The compose project name and subnet are chosen per run, so several runs can
 coexist on one Docker host.
