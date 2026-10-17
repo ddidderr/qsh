@@ -573,8 +573,10 @@ fails until the mark is removed, so a fix cannot go unnoticed.
 - **Expected:** after `keygen --force` and a restart the client refuses with status 255, naming both the pinned and the presented `sha256:` fingerprints and how to remove the old pin; after re-pinning it works. Found F9.
 
 ### OPS-12 — SIGHUP is not a reload
-- **Status:** planned · **Priority:** P2 · **Needs:** —
-- **Expected:** document and pin: SIGHUP stops the daemon; systemd restarts it only on failure.
+- **Status:** automated · **Priority:** P2 · **Needs:** server2
+- **Why:** administrators send SIGHUP to daemons out of habit, to reload them. qsh-server re-reads authorizations every second by itself and its configuration only at startup, and the README does not say what SIGHUP does.
+- **Steps:** `systemctl reload`; then `kill -HUP` the main process during a session.
+- **Expected:** pinned: `systemctl reload` is refused (`CanReload=no`: the unit has no `ExecReload=`) and leaves the daemon alone. SIGHUP ends the daemon, since only INT and TERM are handled (`shutdown_signal` in `src/bin/qsh-server.rs`); systemd counts death by SIGHUP as a clean exit, so the unit ends `inactive (dead)` with `Result=success` and `Restart=on-failure` does not start it again (checked past `RestartSec=2`); the session's job is gone (`KillMode=control-group`). Like a stop (OPS-04), SIGHUP should also close every connection and log `shutting down`. It does neither: the client reported `connection lost: timed out` 7.7 s later, server2's idle timeout (60 s with the defaults), and qsh-server wrote no line at all. Found FXX-OPS-12.
 
 ### OPS-13 — A stalled journald does not stop serving or revocation
 - **Status:** planned · **Priority:** P1 · **Needs:** —

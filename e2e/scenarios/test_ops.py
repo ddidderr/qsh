@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+from conftest import FAST_IDLE_TIMEOUT
 from harness.qsh import PORT, QshServer, parse_fingerprint
 
 
@@ -190,3 +191,91 @@ def test_rotating_the_host_key_is_refused_until_repinned(alice_fast, fast_server
         alice_fast.subcommand("known-hosts", "remove", "server2:2222", check=False)
         alice_fast.pin("server2", new_fp)
     assert alice_fast.run("server2", "true").rc == 0
+
+
+def unit_state(server: QshServer, *names: str) -> dict[str, str]:
+    """Properties of the server's unit, as `systemctl show` reports them."""
+    out = server.node.run(["systemctl", "show", server.unit, "--property=" + ",".join(names)], check=True).stdout
+    return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+
+
+def bring_back(server: QshServer) -> None:
+    """Start the unit again after a scenario stopped it, from whatever state it is in."""
+    server.node.run(["systemctl", "reset-failed", server.unit])
+    server.start()
+
+
+@pytest.mark.plan("OPS-12")
+def test_sighup_stops_the_daemon_and_systemd_leaves_it_stopped(alice_fast, fast_server):
+    """SIGHUP is not a reload: qsh-server exits, and stays down.
+
+    qsh-server has nothing to reload on a signal: authorizations are re-read
+    every second, the configuration only at startup. It handles INT and TERM
+    (`shutdown_signal` in src/bin/qsh-server.rs) and nothing else, so SIGHUP
+    takes its default action and ends the process. systemd counts death by
+    SIGHUP as a clean exit, like INT, TERM and PIPE, so the shipped
+    `Restart=on-failure` does not start it again, and the unit has no
+    `ExecReload=`, so `systemctl reload` is refused rather than turned into a
+    signal. An administrator's habitual `kill -HUP` takes the service down
+    until someone starts it.
+    """
+    node, unit = fast_server.node, fast_server.unit
+    pid = fast_server.main_pid()
+    r = node.run(["systemctl", "reload", unit])
+    assert r.rc != 0, r.describe()
+    assert unit_state(fast_server, "CanReload") == {"CanReload": "no"}
+    assert fast_server.main_pid() == pid, "a refused reload must leave the daemon alone"
+
+    marker = "7373.25"
+    argv = alice_fast.argv("server2", "sleep", marker)
+    proc = alice_fast.node.popen(argv, user="alice")
+    try:
+        node.wait_running(f"sleep {marker}", timeout=10)
+        node.run(["kill", "-HUP", str(pid)], check=True)
+        node.wait_for(f"! systemctl is-active --quiet {unit}", timeout=20)
+        # A restart would be scheduled RestartSec=2 after the exit. Proving
+        # that none comes takes waiting past that point.
+        time.sleep(5)
+        state = unit_state(fast_server, "ActiveState", "SubState", "Result", "MainPID")
+        assert state == {"ActiveState": "inactive", "SubState": "dead", "Result": "success", "MainPID": "0"}, state
+        assert node.run(["sh", "-c", f"ss -Hlun 'sport = :{PORT}' | grep -q ."]).rc != 0, "something still listens"
+        # KillMode=control-group took the session's job with the daemon.
+        node.wait_gone(f"sleep {marker}", timeout=10)
+    finally:
+        proc.kill()
+        alice_fast.node.kill_command("alice", argv)
+        bring_back(fast_server)
+    assert alice_fast.run("server2", "true").rc == 0
+
+
+@pytest.mark.plan("OPS-12")
+@pytest.mark.xfail(strict=True, reason="FXX-OPS-12: SIGHUP kills qsh-server silently; clients wait out the idle timeout")
+def test_sighup_tells_clients_and_the_journal_like_a_stop(alice_fast, fast_server):
+    """Whatever SIGHUP does, the daemon must not vanish without a word.
+
+    Since F8 a stop closes every connection: clients are told at once and the
+    journal says the server shut down (OPS-04). Killed by SIGHUP, the daemon
+    sends no close, so a client sits on the dead session until its idle
+    timeout (8 s on server2, 60 s by default) and then reports a timeout, and
+    nothing from qsh-server in the journal says what happened. Proposed:
+    `shutdown_signal` handles SIGHUP like SIGTERM.
+    """
+    node = fast_server.node
+    marker = "7374.25"
+    argv = alice_fast.argv("server2", "sleep", marker)
+    proc = alice_fast.node.popen(argv, user="alice")
+    try:
+        node.wait_running(f"sleep {marker}", timeout=10)
+        since = fast_server.cursor()
+        begin = time.monotonic()
+        node.run(["kill", "-HUP", str(fast_server.main_pid())], check=True)
+        _, err = proc.communicate(timeout=30)
+        took = time.monotonic() - begin
+        assert proc.returncode == 255, err.decode()
+        assert "shutting down" in err.decode(), f"after {took:.1f}s: {err.decode()}"
+        assert took < FAST_IDLE_TIMEOUT / 2, f"the client noticed after {took:.1f}s"
+        fast_server.wait_journal(r"qsh-server: shutting down", since, timeout=10)
+    finally:
+        proc.kill()
+        alice_fast.node.kill_command("alice", argv)
+        bring_back(fast_server)
