@@ -149,6 +149,8 @@ fn needs_identity_switch(user: &User) -> Result<bool> {
 pub(crate) struct PreparedIdentity {
     switch: bool,
     groups: Vec<libc::gid_t>,
+    /// Group for the session's terminal: `tty` where the system has one.
+    terminal_group: Option<Gid>,
 }
 
 /// Resolve the target's supplementary groups before spawning a child.
@@ -167,7 +169,21 @@ pub(crate) fn prepare_identity(user: &User) -> Result<PreparedIdentity> {
     } else {
         Vec::new()
     };
-    Ok(PreparedIdentity { switch, groups })
+    // A failed lookup must not refuse sessions, most of which need no
+    // terminal: like sshd, fall back to the user's own group.
+    let terminal_group = if switch {
+        nix::unistd::Group::from_name("tty")
+            .ok()
+            .flatten()
+            .map(|group| group.gid)
+    } else {
+        None
+    };
+    Ok(PreparedIdentity {
+        switch,
+        groups,
+        terminal_group,
+    })
 }
 
 /// Start the process described by `req` as `user`.
@@ -194,7 +210,11 @@ pub(crate) fn spawn_prepared(
     identity: PreparedIdentity,
     cgroup: Option<&SessionCgroup>,
 ) -> Result<Spawned> {
-    let PreparedIdentity { switch, groups } = identity;
+    let PreparedIdentity {
+        switch,
+        groups,
+        terminal_group,
+    } = identity;
     let cgroup_procs = cgroup.map(SessionCgroup::attach_fd).transpose()?;
 
     let home = home_of(user);
@@ -242,6 +262,9 @@ pub(crate) fn spawn_prepared(
 
     let master = if let Some(p) = &req.pty {
         let (master, slave) = pty::open(p.size)?;
+        if switch {
+            pty::assign(&slave, user.uid, user.gid, terminal_group)?;
+        }
         let slave_in = slave.try_clone().context("duplicating the PTY slave")?;
         let slave_out = slave.try_clone().context("duplicating the PTY slave")?;
         cmd.stdin(Stdio::from(slave_in))
