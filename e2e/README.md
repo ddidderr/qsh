@@ -120,6 +120,11 @@ pinned identities), `alice_fast` (alice's key on server2), `make_client`
 (a netsim relay, closed afterwards). The helpers in [harness/](harness/)
 run commands on nodes (`Node.run`, `Node.sh`, `Node.wait_for`), drive qsh
 (`QshServer`, `QshClient`, `NetLink`), and drive terminals (`Terminal`).
+The previous release is one argument away: `make_client(previous=True)`
+makes an identity with `qsh-1.0` and drives it with it (`PreviousQshClient`),
+and `QshServer(node, program="qsh-server-1.0", state_dir=...)` manages a
+store with 1.0's `qsh-server`, passing `--dir` for any directory but
+/etc/qsh.
 
 Scenarios share the environment, as tests on real machines would. Leave
 shared state as you found it: use your own identity from `make_client`, a
