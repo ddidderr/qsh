@@ -70,7 +70,10 @@ All five containers run one image, built by
 the image's Debian release, the shipped
 [systemd unit](../contrib/qsh-server.service), rsync, git, python3, strace, and
 the accounts `alice` (with supplementary group `project`), `bob`, `carol` and
-`dave`.
+`dave`. slapd, nslcd and the LDAP NSS module are there for AUTH-20's
+directory accounts, but off: nothing starts them at boot and nsswitch.conf
+does not name `ldap`. That scenario sets up a directory of its own on
+server2, points `server` at it, and takes both down again.
 
 The image also carries the previous release, for the upgrade and
 version-skew scenarios (OPS-14, OPS-16): `qsh-1.0` and `qsh-server-1.0` next

@@ -72,6 +72,10 @@ FROM ${BASE_IMAGE} AS node
 #
 # strace is for OPS-16, which stops a management command at an exact system
 # call to leave the state an interrupted one would.
+#
+# slapd, ldap-utils, nslcd and libnss-ldapd are for AUTH-20, which serves
+# accounts from a directory on server2. Installed, they must change nothing:
+# debconf is told to create no database and to leave nsswitch.conf alone.
 RUN --mount=type=secret,id=extra_ca,required=false,mode=0444 \
     set -eu; \
     if [ -n "${https_proxy:-}" ]; then \
@@ -81,12 +85,23 @@ RUN --mount=type=secret,id=extra_ca,required=false,mode=0444 \
             printf 'Acquire::https::CAInfo "/run/secrets/extra_ca";\n' >> /etc/apt/apt.conf.d/90e2e-proxy; \
         fi; \
     fi; \
+    printf '%s\n' \
+        'slapd slapd/no_configuration boolean true' \
+        'libnss-ldapd libnss-ldapd/nsswitch multiselect' \
+        | debconf-set-selections; \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         systemd systemd-sysv dbus \
         bash ca-certificates coreutils git iproute2 iputils-ping less \
-        ncurses-bin procps psmisc python3 rsync strace tar util-linux xxd; \
+        ncurses-bin procps psmisc python3 rsync strace tar util-linux xxd \
+        ldap-utils libnss-ldapd nslcd slapd; \
     rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/90e2e-proxy
+
+# The directory daemons stay off until AUTH-20 starts them, and no account
+# lookup goes to LDAP unless it says so: every other scenario sees the same
+# accounts, from /etc/passwd and /etc/group only, as before.
+RUN systemctl disable slapd.service nslcd.service \
+    && ! grep -qw ldap /etc/nsswitch.conf
 
 # systemd as PID 1 in a container: keep the units that make sense, mask the
 # ones that need real hardware or a console.
