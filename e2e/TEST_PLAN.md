@@ -65,109 +65,109 @@ commit that fixed it.
 ## EXEC — remote commands
 
 ### EXEC-01 — The remote exit status reaches the caller
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Why:** scripts and rsync act on qsh's status (README: "qsh exits with the remote command's exit status").
 - **Steps:** run `sh -c 'exit N'` for N in 0, 1, 42, 254.
 - **Expected:** qsh exits N.
 
 ### EXEC-02 — Death by signal is reported as 128+n
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Steps:** the remote shell kills itself with TERM, KILL, SEGV.
 - **Expected:** 143, 137, 139 (README: "`128+n` if it died from signal `n`").
 
 ### EXEC-03 — stdout and stderr stay separate and intact
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Steps:** interleave writes to both streams, with and without trailing newlines.
 - **Expected:** each local stream receives exactly its own bytes.
 
 ### EXEC-04 — Arguments arrive verbatim, without a shell
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Why:** README: the remote side executes argv with `execvp`, "no quoting layer to get wrong".
 - **Steps:** pass spaces, quotes, `$HOME`, backticks, `;|&`, `*`, newlines, tabs, an empty string, `-n`, non-ASCII and backslashes to a remote `python3` that prints its argv as JSON.
 - **Expected:** the remote argv equals the local one, element for element.
 
 ### EXEC-05 — 64 MiB of stdin streams byte for byte
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Expected:** the remote `sha256sum` of stdin equals the local digest.
 
 ### EXEC-06 — 64 MiB of stdout streams byte for byte
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Expected:** a remote `cat` of a random file arrives with the same digest.
 
 ### EXEC-07 — Every byte value survives a round trip
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Steps:** send all 256 byte values, `~.`, `~~`, CR LF, NUL, ^D and ^C through a remote `cat`.
 - **Expected:** identical bytes back; nothing is interpreted without a terminal (README: escapes are "disabled whenever there is no terminal").
 
 ### EXEC-08 — End of stdin reaches the remote process
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Expected:** `printf abc | qsh server wc -c` prints 3.
 
 ### EXEC-09 — `-n` never reads local stdin
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Steps:** call `qsh -n` inside a `while read` loop fed by a pipe.
 - **Expected:** every loop iteration runs; qsh consumed none of the loop's input.
 
 ### EXEC-10 — The session runs as the mapped account
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Expected:** user alice, groups alice and project, cwd and `HOME` `/home/alice`, `USER`/`LOGNAME` alice, `SHELL` from passwd, `PATH` the server's fixed one (`src/child.rs` `DEFAULT_PATH`).
 
 ### EXEC-11 — The environment is filtered by the server
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Steps:** `-E` LANG, LC_TIME, QSH_TRACE, FOO, LD_PRELOAD, PATH, HOME.
 - **Expected:** only LANG, LC_*, QSH_* arrive; PATH and HOME stay the server's (README: "The client cannot set arbitrary environment variables").
 
 ### EXEC-12 — A program that cannot run fails like a shell
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** a missing program exits 127 with a "command not found" message naming it; a file that is not executable exits 126 (README: "the same convention as ssh", which runs commands through a shell). Found F11.
 
 ### EXEC-13 — Exec has a terminal only when asked
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** without `-t`, stdin is not a tty; with `-t`, `tty` prints `/dev/pts/N`.
 
 ### EXEC-14 — A remote reader that stops early ends the session
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** `yes | qsh server head -n1` prints `y` and qsh exits 0 within seconds.
 
 ### EXEC-15 — A local reader that stops early ends qsh quietly
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Steps:** `qsh server sh -c 'exec yes X' | head -n1`.
 - **Expected:** qsh exits 141 like a local writer killed by SIGPIPE, prints nothing, and the remote `yes` is gone. Found F3.
 
 ### EXEC-16 — 1,000 arguments and a 16 KiB argument
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** both arrive intact (README limits: 1,024 arguments, 16 KiB each).
 
 ### EXEC-17 — A request over the limits is refused clearly
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Steps:** a 16 KiB + 1 argument; five 15,000-byte arguments (over 64 KiB); 1,025 arguments.
 - **Expected:** non-zero status (126 from the server or 255 from the client) with a message naming the limit; the next session works. Found F4.
 
 ### EXEC-18 — The requested account must match the authorization
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Expected:** `alice@server` and `-l alice` work; `bob@server` with alice's key is refused with a message naming bob.
 
 ### EXEC-19 — Output order is preserved
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** `seq 1 200000` arrives complete and in order.
 
 ### EXEC-20 — ssh-compatible options are accepted
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Steps:** `-q -v -C -o BatchMode=yes -o StrictHostKeyChecking=yes -T`.
 - **Expected:** the command runs normally (README client reference).
 
 ### EXEC-21 — A closed local stderr ends qsh quietly
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Steps:** `qsh server sh -c 'yes err >&2' 2>&1 | head -n1`.
 - **Expected:** status 141, no panic (a panic exits 101). Found F10.
 
 ### EXEC-22 — INT and TERM are relayed without a terminal
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Steps:** send INT or TERM to a local qsh running a remote shell that traps it.
 - **Expected:** the remote trap runs and its status (130, 143) becomes qsh's (`src/client.rs` `forward_signals`: without a terminal "local Ctrl-C must be relayed as a signal").
 
 ### EXEC-23 — An argument that is not UTF-8 is refused cleanly
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Why:** qsh/1 carries arguments as text; file names in other encodings exist, and rsync passes them on its command line unless given `-s`.
 - **Expected:** status 255 and a message saying the argument is not valid UTF-8 (with the `-s` hint), never a panic. Found F18.
 
