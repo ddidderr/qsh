@@ -288,14 +288,14 @@ against, the boundaries it promises, and the trade-offs already decided.
   than logged one line per attempt.
   Live diagnostics use a bounded queue and a dedicated writer. Peer-triggered
   detail, such as session errors, shares a global limit of 16 messages per
-  second, with periodic suppression counts. Logins, withdrawn authorizations,
-  admission counters, and failed `cgroup.kill` attempts do not draw on that
-  budget, so a flood of failing sessions cannot silence them. They still share
-  the bounded queue; a line that finds it full is dropped and counted as
-  suppressed. While stderr is blocked, the newest authorization-reload
-  warnings wait in a small backlog. Logging is best effort: a failed write is
-  not retried. A full log pipe cannot block session handling or authorization
-  reload.
+  second, with periodic suppression counts. Logins, withdrawn or narrowed
+  authorizations, admission counters, and failed `cgroup.kill` attempts do
+  not draw on that budget, so a flood of failing sessions cannot silence them.
+  They still share the bounded queue; a line that finds it full is dropped and
+  counted as suppressed. While stderr is blocked, the newest
+  authorization-reload warnings wait in a small backlog. Logging is best
+  effort: a failed write is not retried. A full log pipe cannot block session
+  handling or authorization reload.
 
   This is a fairness reservation, not a rate limit: nothing is remembered
   after an attempt ends, so there is no per-address table to grow or expire.
@@ -304,7 +304,11 @@ against, the boundaries it promises, and the trade-offs already decided.
   whatever the host already uses for the rest of its services.
 * A key's policy is re-read for every session, not captured when the
   connection was made, so revoking a key also cuts off the connections it
-  already has.
+  already has. A change that no longer allows a running session (shells or
+  commands switched off, its program dropped from `allowed_commands`, another
+  account or cleanup policy) ends that session at the next policy check: the
+  client prints that the key's permissions changed and exits 255, and the
+  server logs which key lost what.
 * qsh does not use PAM or the shadow file. An expired or locked account,
   `/etc/nologin` and login records (`utmp`, `wtmp`, `last`) play no part:
   a key's authorization is the only gate. Withdraw it with `qsh-server

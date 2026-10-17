@@ -465,8 +465,10 @@ fails until the mark is removed, so a fix cannot go unnoticed.
 - **Expected:** copying the revoked `.crt` and `.toml` back does not restore access; `authorize` does.
 
 ### AUTH-18 — Narrowing a policy tells the user why
-- **Status:** planned · **Priority:** P2 · **Needs:** —
-- **Why:** today the client only sees `stream reset by peer: error 2` and the server writes no line. Open: decide the message and the audit line, then test them.
+- **Status:** automated · **Priority:** P2 · **Needs:** pty
+- **Why:** a narrowed key keeps its connection, so unlike a revocation no connection close carries a reason. The client saw only `stream reset by peer: error 2`, and the server wrote no line.
+- **Steps:** take `allow_shell` away from a running shell; drop a running command's program from `allowed_commands`.
+- **Expected:** each session ends with status 255 and `qsh: the server ended this session: this key's permissions changed`; the journal says `<peer> (key `<name>`): ended a session its authorization no longer allows: login shells are no longer allowed` (or `` `sleep` is no longer an allowed command``), outside the peer diagnostic budget; the job is gone; commands the key may still run work. Found F22.
 
 ### AUTH-19 — Account controls outside qsh do not gate it
 - **Status:** automated · **Priority:** P1 · **Needs:** —
@@ -758,6 +760,7 @@ that fixed each one carries its ID.
 | F19 | P2 | Every exit, `~.` included, waited out QUIC's draining period: seconds on a long round trip | PTY-16 | fixed |
 | F20 | P2 | git cannot use qsh directly: it sends one command string for a shell; no documented way around | XFER-12 | fixed (docs) |
 | F21 | P2 | Undocumented: account expiry, locking and `/etc/nologin` do not gate qsh (no PAM) | AUTH-19 | fixed (docs) |
+| F22 | P2 | A narrowed policy ended sessions with `stream reset by peer: error 2` and no journal line | AUTH-18 | fixed |
 
 ### Open items
 
@@ -769,8 +772,6 @@ are not security findings under THREAT_MODEL.md.
   up to a keep-alive interval (15 s) away. With F1 fixed the session survives
   the stall. A shorter client keep-alive would shorten it at the cost of more
   idle traffic.
-- **Narrowed policies are silent** (AUTH-18): no reason for the client, no
-  journal line on the server.
 - **A chatty background job at interactive exit** (LIFE-09).
 - **Idle detection takes the idle timeout plus up to one keep-alive** (60–75 s
   by default), not exactly the idle timeout the README states.

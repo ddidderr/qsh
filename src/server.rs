@@ -894,24 +894,68 @@ impl RequestGrant {
     }
 }
 
-fn request_still_authorized(auth: &LiveAuthorization) -> bool {
+/// Where a running session stands after the authorization store changed.
+#[derive(Debug, PartialEq, Eq)]
+enum Standing {
+    Allowed,
+    /// The key is gone or expired. The connection watch closes the whole
+    /// connection with a reason and logs it; the session only has to stop.
+    Withdrawn,
+    /// The key may still connect, but no longer for this session.
+    Narrowed(Narrowed),
+}
+
+/// What an administrator's policy change took away from a running session.
+#[derive(Debug, PartialEq, Eq)]
+struct Narrowed {
+    key: String,
+    why: String,
+}
+
+/// What the client is told when its session ends because of [`Narrowed`].
+/// Deliberately generic: the key holder learns that its permissions changed,
+/// the server log says which.
+const NARROWED_NOTICE: &str = "the server ended this session: this key's permissions changed";
+
+fn standing(auth: &LiveAuthorization) -> Standing {
     let current = crate::sync::read(&auth.store);
-    current.lookup(&auth.fingerprint).is_some_and(|entry| {
-        entry.meta.user == auth.authorized_user
-            && entry.meta.kill_session_processes == auth.restricted
-            && !entry.meta.is_expired(unix_now())
-            && match &auth.grant {
-                RequestGrant::Shell => entry.meta.allow_shell,
-                RequestGrant::Exec(program) => {
-                    entry.meta.allow_exec
-                        && (entry.meta.allowed_commands.is_empty()
-                            || entry
-                                .meta
-                                .allowed_commands
-                                .iter()
-                                .any(|allowed| allowed == program))
-                }
+    let Some(entry) = current.lookup(&auth.fingerprint) else {
+        return Standing::Withdrawn;
+    };
+    if entry.meta.is_expired(unix_now()) {
+        return Standing::Withdrawn;
+    }
+    let meta = &entry.meta;
+    let why = if meta.user != auth.authorized_user {
+        format!(
+            "it now logs in as `{}`, not `{}`",
+            meta.user, auth.authorized_user
+        )
+    } else if meta.kill_session_processes != auth.restricted {
+        "its session cleanup policy changed".to_owned()
+    } else {
+        match &auth.grant {
+            RequestGrant::Shell if !meta.allow_shell => {
+                "login shells are no longer allowed".to_owned()
             }
+            RequestGrant::Exec(_) if !meta.allow_exec => {
+                "commands are no longer allowed".to_owned()
+            }
+            RequestGrant::Exec(program)
+                if !meta.allowed_commands.is_empty()
+                    && !meta
+                        .allowed_commands
+                        .iter()
+                        .any(|allowed| allowed == program) =>
+            {
+                format!("`{program}` is no longer an allowed command")
+            }
+            _ => return Standing::Allowed,
+        }
+    };
+    Standing::Narrowed(Narrowed {
+        key: entry.name.clone(),
+        why,
     })
 }
 
@@ -1136,33 +1180,49 @@ async fn run_session(
 
     // Observe exit without reaping: a zombie keeps the leader's PID reserved
     // until every possible process-group signal has been sent.
+    // `Err(Some(_))`: a policy change took this session away; `Err(None)`:
+    // the client, the connection or the key is gone.
     let leader_exited = loop {
         tokio::select! {
             exited = wait_for_leader_exit(pid) => {
                 if let Err(error) = exited {
                     diagnostics.emit(|| format!("qsh-server: could not observe child exit: {error:#}"));
-                    break None;
+                    break Err(None);
                 }
-                break Some(());
+                break Ok(());
             }
-            _ = &mut control => break None,
-            _ = conn.closed() => break None,
+            _ = &mut control => break Err(None),
+            _ = conn.closed() => break Err(None),
             event = events_rx.recv() => {
                 if let Some(event) = event {
                     apply_control_event(event, pty_fd.as_ref(), pid);
                 } else {
-                    break None;
+                    break Err(None);
                 }
             }
-            _ = policy_tick.tick() => {
-                if !request_still_authorized(&authorization) {
-                    break None;
-                }
-            }
+            _ = policy_tick.tick() => match standing(&authorization) {
+                Standing::Allowed => {}
+                Standing::Withdrawn => break Err(None),
+                Standing::Narrowed(narrowed) => break Err(Some(narrowed)),
+            },
         }
     };
-    if leader_exited.is_none() {
+    if let Err(narrowed) = leader_exited {
         control.stop().await;
+        if let Some(narrowed) = narrowed {
+            let peer = conn.remote_address();
+            return end_narrowed(
+                &mut guard,
+                &mut child,
+                outputs,
+                tx,
+                writer,
+                peer,
+                narrowed,
+                diagnostics,
+            )
+            .await;
+        }
         writer.stop().await;
         return abandon(&mut guard, &mut child, outputs).await;
     }
@@ -1188,28 +1248,45 @@ async fn run_session(
         tokio::pin!(pending);
         loop {
             tokio::select! {
-                result = &mut pending => break Some(result),
-                _ = &mut control => break None,
-                _ = conn.closed() => break None,
+                result = &mut pending => break Ok(result),
+                _ = &mut control => break Err(None),
+                _ = conn.closed() => break Err(None),
                 event = events_rx.recv() => {
                     if let Some(event) = event {
                         apply_control_event(event, pty_fd.as_ref(), pid);
                     } else {
-                        break None;
+                        break Err(None);
                     }
                 }
-                _ = policy_tick.tick() => {
-                    if !request_still_authorized(&authorization) {
-                        break None;
-                    }
-                }
+                _ = policy_tick.tick() => match standing(&authorization) {
+                    Standing::Allowed => {}
+                    Standing::Withdrawn => break Err(None),
+                    Standing::Narrowed(narrowed) => break Err(Some(narrowed)),
+                },
             }
         }
     };
-    let Some(drained) = drained else {
-        control.stop().await;
-        writer.stop().await;
-        return abandon(&mut guard, &mut child, outputs).await;
+    let drained = match drained {
+        Ok(drained) => drained,
+        Err(narrowed) => {
+            control.stop().await;
+            if let Some(narrowed) = narrowed {
+                let peer = conn.remote_address();
+                return end_narrowed(
+                    &mut guard,
+                    &mut child,
+                    outputs,
+                    tx,
+                    writer,
+                    peer,
+                    narrowed,
+                    diagnostics,
+                )
+                .await;
+            }
+            writer.stop().await;
+            return abandon(&mut guard, &mut child, outputs).await;
+        }
     };
     control.stop().await;
 
@@ -1295,11 +1372,14 @@ async fn run_session(
             tokio::select! {
                 () = &mut delivery => break true,
                 _ = conn.closed() => break false,
-                _ = policy_tick.tick() => {
-                    if !request_still_authorized(&authorization) {
+                _ = policy_tick.tick() => match standing(&authorization) {
+                    Standing::Allowed => {}
+                    Standing::Withdrawn => break false,
+                    Standing::Narrowed(narrowed) => {
+                        record_narrowed(diagnostics, conn.remote_address(), &narrowed);
                         break false;
                     }
-                }
+                },
             }
         }
     } else {
@@ -1313,6 +1393,58 @@ async fn run_session(
         writer.stop().await;
     }
     Ok(())
+}
+
+/// A policy change took this session away while the key may still connect.
+///
+/// A withdrawn key's connection is closed with a reason; this session ends on
+/// its own, so it says why in-band before the job is stopped. A bare stream
+/// reset would tell the user nothing, and the administrator would find no
+/// trace of what their change ended.
+#[allow(clippy::too_many_arguments)]
+async fn end_narrowed(
+    guard: &mut ProcessGroupGuard,
+    child: &mut tokio::process::Child,
+    outputs: Vec<Pump>,
+    tx: mpsc::Sender<Frame>,
+    mut writer: AbortOnDrop<()>,
+    peer: SocketAddr,
+    narrowed: Narrowed,
+    diagnostics: &Diagnostics,
+) -> Result<()> {
+    record_narrowed(diagnostics, peer, &narrowed);
+    // No more output after the notice: the pumps hold the other senders.
+    stop_outputs(outputs).await;
+    let notice = async {
+        let _ = tx.send(Frame::Error(NARROWED_NOTICE.to_owned())).await;
+        let _ = tx
+            .send(Frame::Exit(ExitStatus {
+                code: 255,
+                signal: None,
+            }))
+            .await;
+        drop(tx);
+        let _ = (&mut writer).await;
+    };
+    if tokio::time::timeout(SHUTDOWN_GRACE, notice).await.is_err() {
+        writer.stop().await;
+    }
+    let stopped = guard.terminate().await;
+    let _ = child.wait().await;
+    stopped?;
+    guard.clean_cgroup().await?;
+    Ok(())
+}
+
+/// The audit line for [`Narrowed`]: an administrator's change ended a session,
+/// which, like a withdrawn authorization, must not share the peer budget.
+fn record_narrowed(diagnostics: &Diagnostics, peer: SocketAddr, narrowed: &Narrowed) {
+    diagnostics.record(|| {
+        format!(
+            "qsh-server: {peer} (key `{}`): ended a session its authorization no longer allows: {}",
+            narrowed.key, narrowed.why
+        )
+    });
 }
 
 /// The client is gone: kill the job, reap it, and stop.
@@ -1982,12 +2114,99 @@ mod tests {
             authorized_user: "guest".into(),
             restricted: false,
         };
-        assert!(request_still_authorized(&live));
+        assert_eq!(standing(&live), Standing::Allowed);
 
         meta.kill_session_processes = true;
         std::fs::write(&policy, toml::to_string(&meta).unwrap()).unwrap();
         *crate::sync::write(&store) = AuthStore::load(dir.path()).unwrap();
-        assert!(!request_still_authorized(&live));
+        assert_eq!(
+            standing(&live),
+            Standing::Narrowed(Narrowed {
+                key: "client".into(),
+                why: "its session cleanup policy changed".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_narrowed_policy_names_what_it_took_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pem, _) = crypto::generate_identity("client", &["client".into()], 30).unwrap();
+        std::fs::write(dir.path().join("client.crt"), &pem).unwrap();
+        let fingerprint = Fingerprint::of_cert(&crypto::cert_from_pem(&pem).unwrap()).unwrap();
+        let policy = dir.path().join("client.toml");
+        let store = Arc::new(RwLock::new(AuthStore::default()));
+        let live = |grant| LiveAuthorization {
+            store: Arc::clone(&store),
+            fingerprint,
+            grant,
+            authorized_user: "guest".into(),
+            restricted: false,
+        };
+        let why = |meta: &AuthMeta, grant| {
+            std::fs::write(&policy, toml::to_string(meta).unwrap()).unwrap();
+            *crate::sync::write(&store) = AuthStore::load(dir.path()).unwrap();
+            match standing(&live(grant)) {
+                Standing::Narrowed(narrowed) => {
+                    assert_eq!(narrowed.key, "client");
+                    Some(narrowed.why)
+                }
+                Standing::Allowed => None,
+                Standing::Withdrawn => panic!("the key is still authorized"),
+            }
+        };
+        let base = AuthMeta {
+            user: "guest".into(),
+            key_fingerprint: Some(fingerprint.to_string()),
+            ..Default::default()
+        };
+        let exec = || RequestGrant::Exec("rsync".into());
+
+        assert_eq!(why(&base, RequestGrant::Shell), None);
+        assert_eq!(why(&base, exec()), None);
+        let no_shell = AuthMeta {
+            allow_shell: false,
+            ..base.clone()
+        };
+        assert_eq!(
+            why(&no_shell, RequestGrant::Shell).unwrap(),
+            "login shells are no longer allowed"
+        );
+        assert_eq!(why(&no_shell, exec()), None);
+        let no_exec = AuthMeta {
+            allow_exec: false,
+            ..base.clone()
+        };
+        assert_eq!(
+            why(&no_exec, exec()).unwrap(),
+            "commands are no longer allowed"
+        );
+        let only_tar = AuthMeta {
+            allowed_commands: vec!["tar".into()],
+            ..base.clone()
+        };
+        assert_eq!(
+            why(&only_tar, exec()).unwrap(),
+            "`rsync` is no longer an allowed command"
+        );
+        let only_rsync = AuthMeta {
+            allowed_commands: vec!["rsync".into()],
+            ..base.clone()
+        };
+        assert_eq!(why(&only_rsync, exec()), None);
+        let other_user = AuthMeta {
+            user: "admin".into(),
+            ..base.clone()
+        };
+        assert_eq!(
+            why(&other_user, exec()).unwrap(),
+            "it now logs in as `admin`, not `guest`"
+        );
+
+        std::fs::remove_file(&policy).unwrap();
+        std::fs::remove_file(dir.path().join("client.crt")).unwrap();
+        *crate::sync::write(&store) = AuthStore::load(dir.path()).unwrap();
+        assert_eq!(standing(&live(exec())), Standing::Withdrawn);
     }
 
     /// Start a job that ignores the polite signals, in its own process group.

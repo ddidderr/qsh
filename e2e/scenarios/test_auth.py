@@ -288,6 +288,64 @@ def test_a_revocation_tombstone_blocks_restored_files(make_client, server):
     assert member.run("server", "true").rc == 0
 
 
+NARROWED = "the server ended this session: this key's permissions changed"
+
+# Rewrites `allowed_commands`, whichever way the array is laid out.
+SET_ALLOWED = (
+    "import re, sys\n"
+    "path, value = sys.argv[1], sys.argv[2]\n"
+    "text = open(path).read()\n"
+    "text = re.sub(r'(?ms)^allowed_commands = \\[.*?\\]', 'allowed_commands = ' + value, text)\n"
+    "open(path, 'w').write(text)\n"
+)
+
+
+@pytest.mark.plan("AUTH-18")
+def test_a_narrowed_policy_says_why_it_ended_a_session(make_client, server):
+    """The user reads why the session ended; the journal says what was taken away."""
+    member = make_client("alice", authorize_as="alice")
+    toml = f"/etc/qsh/authorized/{member.entry}.toml"
+    marker = "5454.25"
+    term = Terminal(member, "server")
+    try:
+        term.set_prompt()
+        term.sendline(f"sleep {marker}")
+        server.node.wait_running(f"sleep {marker}", timeout=10)
+        since = server.cursor()
+        server.node.sh(f"sed -i 's/^allow_shell = true/allow_shell = false/' {toml}")
+        term.expect(re.escape(NARROWED), timeout=RELOAD_SETTLE + 5)
+        assert term.wait_exit() == 255
+    finally:
+        term.close()
+    server.wait_journal(
+        rf"key `{re.escape(member.entry)}`\): ended a session its authorization no longer allows: "
+        r"login shells are no longer allowed",
+        since,
+    )
+    server.node.wait_gone(f"sleep {marker}", timeout=10)
+    assert member.run("server", "true").rc == 0
+
+
+@pytest.mark.plan("AUTH-18")
+def test_dropping_a_running_program_from_the_allowed_commands_says_why(make_client, server):
+    member = make_client(
+        "alice", authorize_as="alice", options=("--no-shell", "--command", "sleep", "--command", "true")
+    )
+    toml = f"/etc/qsh/authorized/{member.entry}.toml"
+    marker = "5455.25"
+    proc = member.node.popen(member.argv("server", "sleep", marker), user="alice")
+    server.node.wait_running(f"sleep {marker}", timeout=10)
+    since = server.cursor()
+    server.node.run(["python3", "-c", SET_ALLOWED, toml, '["true"]'], check=True)
+    _, err = proc.communicate(timeout=RELOAD_SETTLE + 10)
+    assert proc.returncode == 255, err.decode()
+    assert NARROWED in err.decode(), err.decode()
+    server.wait_journal(r"ended a session its authorization no longer allows: `sleep` is no longer an allowed command", since)
+    server.node.wait_gone(f"sleep {marker}", timeout=10)
+    assert member.run("server", "true").rc == 0
+    assert member.run("server", "sleep", "0").rc == 126
+
+
 @pytest.mark.plan("AUTH-19")
 def test_account_controls_outside_qsh_do_not_gate_it(make_client, server):
     """Documented: no PAM, so account expiry and /etc/nologin do not apply."""
