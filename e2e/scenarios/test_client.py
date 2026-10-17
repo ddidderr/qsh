@@ -92,14 +92,23 @@ def test_qsh_home_selects_the_identity_directory(make_client, server):
 
 # What git (GIT_SSH_COMMAND with protocol v2), `scp -O -S` and Ansible put on
 # the command line of the ssh they run, settings users add for ssh, and one
-# no ssh has.
+# no ssh has. Ansible's ssh connection, with its default ssh_args, quotes
+# values as ssh_config(5) allows (`ansible -vvv` shows `-o 'User="alice"'`
+# and `-o 'ControlPath="…"'`); its account is the key's own.
 TOOL_OPTIONS = (
-    "-x",
+    # git
     "-o", "SendEnv=GIT_PROTOCOL",
-    "-oPermitLocalCommand=no", "-oClearAllForwardings=yes", "-oRemoteCommand=none",
+    # scp -O -S
+    "-x", "-oPermitLocalCommand=no", "-oClearAllForwardings=yes", "-oRemoteCommand=none",
     "-oRequestTTY=no", "-oControlMaster=no", "-oForwardAgent=no",
-    "-o", "ControlPersist=60s", "-o", "ServerAliveInterval=15", "-o", "LogLevel=ERROR",
-    "-o", "NoSuchOption=1",
+    # Ansible
+    "-C", "-o", "ControlMaster=auto", "-o", "ControlPersist=60s",
+    "-o", "KbdInteractiveAuthentication=no",
+    "-o", "PreferredAuthentications=gssapi-with-mic,gssapi-keyex,hostbased,publickey",
+    "-o", "PasswordAuthentication=no", "-o", 'User="alice"', "-o", "ConnectTimeout=10",
+    "-o", 'ControlPath="/home/alice/.ansible/cp/3c0ffee"',
+    # users, and no ssh
+    "-o", "ServerAliveInterval=15", "-o", "LogLevel=ERROR", "-o", "NoSuchOption=1",
 )
 
 # A fingerprint no server has.
@@ -137,29 +146,39 @@ def test_ssh_options_that_only_tune_ssh_are_ignored(alice):
 
     ssh refuses a keyword it does not know ("Bad configuration option");
     qsh accepts any, so the options tools add for ssh do not break it.
+    Ansible's `User="alice"` names the key's own account, so the command
+    runs as alice whether qsh ignores the setting, as today, or honours it
+    (FXX-CLI-07-userport), which has to take the quotes off first.
     """
-    r = alice.run("server", "echo", "ok", options=TOOL_OPTIONS)
+    r = alice.run("server", "id", "-un", options=TOOL_OPTIONS)
     assert r.rc == 0, r.describe()
-    assert r.stdout == "ok\n" and r.stderr == "", r.describe()
+    assert r.stdout == "alice\n" and r.stderr == "", r.describe()
 
 
 @pytest.mark.plan("CLI-07")
-def test_strict_host_key_checking_no_still_refuses_a_changed_key(make_client, server):
+@pytest.mark.parametrize("pinned", [None, WRONG_FP], ids=["unknown", "changed"])
+def test_strict_host_key_checking_no_is_accept_new(make_client, server, pinned):
     """`StrictHostKeyChecking=no` is accept-new in qsh, never "accept anything".
 
-    ssh with `=no` also connects to a host whose key has changed, with
-    passwords and forwarding turned off. qsh pins unknown hosts but still
-    fails hard on a changed one (THREAT_MODEL.md actor 2): stricter than ssh.
-    The key is authorized, so a qsh that let the changed key through would
-    run the command and exit 0.
+    As in ssh, `=no` pins an unknown host without asking, so it works
+    without a terminal. ssh with `=no` also connects to a host whose key has
+    changed, with passwords and forwarding turned off; qsh still fails hard
+    on a changed key (THREAT_MODEL.md actor 2): stricter than ssh. The key is
+    authorized, so a qsh that let the changed key through would run the
+    command and exit 0.
     """
     client = make_client("alice", authorize_as="alice", pin=False)
-    client.pin("server", WRONG_FP)
+    if pinned is not None:
+        client.pin("server", pinned)
     r = client.run("server", "true", options=("-o", "StrictHostKeyChecking=no"))
-    assert r.rc == 255, r.describe()
-    assert "has changed" in r.stderr and WRONG_FP in r.stderr and server.fp in r.stderr, r.describe()
     listing = known_hosts(client)
-    assert WRONG_FP in listing and server.fp not in listing, listing
+    if pinned is None:
+        assert r.rc == 0, r.describe()
+        assert server.fp in listing, listing
+    else:
+        assert r.rc == 255, r.describe()
+        assert "has changed" in r.stderr and pinned in r.stderr and server.fp in r.stderr, r.describe()
+        assert pinned in listing and server.fp not in listing, listing
 
 
 @pytest.mark.plan("CLI-07")
@@ -329,8 +348,9 @@ ACCOUNT_OR_PORT = pytest.mark.xfail(
 @pytest.mark.parametrize(
     "options,named",
     [
-        pytest.param(("-l", "bob"), "bob", id="-l"),
-        pytest.param(("-o", "User=bob"), "bob", marks=ACCOUNT_OR_PORT, id="User"),
+        pytest.param(("-l", "bob"), "`bob`", id="-l"),
+        pytest.param(("-o", "User=bob"), "`bob`", marks=ACCOUNT_OR_PORT, id="User"),
+        pytest.param(("-o", 'User="bob"'), "`bob`", marks=ACCOUNT_OR_PORT, id="User_quoted"),
         pytest.param(("-p", "2999", "--refuse-new"), "server:2999", id="-p"),
         pytest.param(("-o", "Port=2999", "--refuse-new"), "server:2999", marks=ACCOUNT_OR_PORT, id="Port"),
     ],
@@ -342,7 +362,9 @@ def test_ssh_options_that_choose_the_account_or_the_port_are_not_ignored(alice, 
     and nothing tells the caller. alice's key maps to alice and is pinned
     for server:2222 only, so honouring either option must fail, naming what
     was asked for: bob is not alice's account (EXEC-18), and server:2999
-    has no pin under `--refuse-new`.
+    has no pin under `--refuse-new`. Ansible writes the account in double
+    quotes, which ssh_config(5) takes off: the refusal names `bob`, not
+    `"bob"`.
     """
     r = alice.run("server", "id", "-un", options=options)
     assert r.rc != 0 and r.stdout == "", r.describe()
