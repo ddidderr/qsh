@@ -827,13 +827,15 @@ FIRST_SUCCESS = r"""
 import json, subprocess, sys, time
 deadline, argv = time.monotonic() + float(sys.argv[1]), sys.argv[2:]
 print("polling", flush=True)
-tries = 0
+tries, longest = 0, 0.0
 while time.monotonic() < deadline:
     tries += 1
+    at, begin = time.time(), time.monotonic()
     rc = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
     if rc == 0:
-        print(json.dumps({"at": time.time(), "tries": tries}))
+        print(json.dumps({"at": at, "tries": tries, "longest_refusal": longest}))
         break
+    longest = max(longest, time.monotonic() - begin)
 """
 
 
@@ -847,10 +849,12 @@ def login_times(client: QshClient, host: str, n: int = 15) -> list[float]:
 
 
 def authorization_delay(server: QshServer, newcomer: QshClient) -> float:
-    """Seconds from `qsh-server authorize` returning to the newcomer's first session.
+    """Seconds from `qsh-server authorize` returning to the start of the newcomer's first session.
 
-    The newcomer retries from the moment before the authorization; both
-    clocks are the one kernel clock every container shares.
+    The newcomer retries from the moment before the authorization, so the
+    authorization took effect at most one refused try (about 0.1 s) before
+    the first try that worked began; both clocks are the one kernel clock
+    every container shares.
     """
     poller = newcomer.node.popen(
         ["python3", "-c", FIRST_SUCCESS, "30", *newcomer.argv(server.host, "true")], user=newcomer.user
@@ -869,6 +873,7 @@ def authorization_delay(server: QshServer, newcomer: QshClient) -> float:
     assert out.strip(), "the newcomer was not let in within 30 s"
     result = json.loads(out)
     assert result["tries"] > 1, "the newcomer was let in before it was authorized"
+    assert result["longest_refusal"] < 1, f"a refused try took {result['longest_refusal']:.2f}s"
     return result["at"] - float(done.stdout)
 
 
@@ -921,7 +926,8 @@ def test_a_large_authorization_store_keeps_its_bounds(make_client, fast_server):
     `qsh-server authorize` reads it whole too. The same three measurements
     are taken on the store as it is and with 2,000 more keys. server2's store
     is put back exactly as it was: revoking 2,000 keys would leave 2,000
-    tombstones.
+    tombstones. Against a build whose reload took 0.7 ms per key (1.4 s with
+    the large store), the authorization bound below failed at 2.1 s.
     """
     node = fast_server.node
     store = "/etc/qsh/authorized"
@@ -945,7 +951,9 @@ def test_a_large_authorization_store_keeps_its_bounds(make_client, fast_server):
             f"mkdir -p {keys} && for i in $(seq 2000); do qsh keygen --identity {keys}/$i >/dev/null; done"
             f" && for i in $(seq 2000); do"
             f" qsh-server authorize {keys}/$i/id.crt --user dave --name {prefix}-$i >/dev/null; done",
-            timeout=900,
+            # Well inside pytest's 600 s, so that this ends the loop in the
+            # node, not just the local `docker exec`.
+            timeout=400,
         )
         filled = time.monotonic() - begin
         listed = fast_server.list().count(f"{prefix}-")
@@ -968,13 +976,18 @@ def test_a_large_authorization_store_keeps_its_bounds(make_client, fast_server):
         # Logins: no documented bound, so against the small store's, with room for a busy host.
         assert statistics.median(large["login"]) < statistics.median(small["login"]) + 0.25, report
         assert max(large["login"]) < 2, report
-        # "Within a second": the next once-a-second reload, which must not take long itself.
-        assert large["authorize"] < RELOAD_SETTLE, report
-        # "Normally within two seconds", plus the revoke command and a margin.
-        assert large["revoke"] < 4, report
-        # The reload of 2,000 entries every second must not eat the server.
-        assert large["cpu"] < 0.5, report
+        # "Within a second": up to one reload interval, the reload itself
+        # (about 50 ms here) and one refused try, plus 0.35 s for a busy host.
+        assert large["authorize"] < 1.5, report
+        # "Normally within two seconds": the reload, then the connection's
+        # own once-a-second check; plus the revoke command and a margin.
+        assert large["revoke"] < 3, report
+        # The reload of 2,000 entries every second must not eat the server
+        # (5% of a CPU here): a reload of 250 ms would.
+        assert large["cpu"] < 0.25, report
     finally:
+        # A fill loop cut short must not go on adding keys to the restored store.
+        node.run(["pkill", "-f", f"[{keys[0]}]{keys[1:]}"])
         # Under the store's lock, so no reload sees it half restored.
         node.sh(f"flock {store}.lock sh -c 'rm -rf {store} && cp -a {backup} {store}' && rm -rf {backup} {keys}")
         fast_server.restart()
