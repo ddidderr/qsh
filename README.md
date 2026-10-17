@@ -150,6 +150,26 @@ rsync sends the paths inside its own protocol instead:
 rsync -e qsh -s -av ./data/ 'server:/backup/my data/'
 ```
 
+## git
+
+git hands its ssh program the remote command as one string,
+`git-upload-pack '/srv/repo.git'`, for a remote shell to parse. qsh starts
+no shell, so give git a wrapper that asks for one:
+
+```
+#!/bin/bash
+# qsh-git: git passes the remote command as one string, for a shell.
+exec qsh "${@:1:$#-1}" sh -c "${@: -1}"
+```
+
+```
+export GIT_SSH_COMMAND=qsh-git GIT_SSH_VARIANT=ssh
+git clone server:repo.git
+git clone ssh://server:2222/srv/repo.git
+```
+
+`GIT_SSH_VARIANT=ssh` makes git pass the port of an `ssh://` URL as `-p`.
+
 ## Security model
 
 There is no password authentication, no PKI, and no CA. Both sides hold a
