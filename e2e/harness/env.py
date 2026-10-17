@@ -29,6 +29,15 @@ class CommandFailed(AssertionError):
     """A command that was expected to succeed did not. Carries its output."""
 
 
+class Unmet(Exception):
+    """What a strict-xfail scenario expects and qsh does not do yet.
+
+    Raised for that one expectation only, and named in the mark's `raises`,
+    so a broken precondition fails the test instead of passing as the
+    expected failure.
+    """
+
+
 @dataclass
 class Result:
     argv: list[str]

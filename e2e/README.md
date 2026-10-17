@@ -157,8 +157,7 @@ Some lessons the first scenarios taught:
   later scenarios down with it.
 - A strict xfail turns every failure inside it into the expected one. Raise
   a dedicated exception for the unmet expectation and name it in the mark's
-  `raises`, so a broken precondition still fails (see `Unmet` in
-  `test_ops.py`).
+  `raises`, so a broken precondition still fails (`harness.env.Unmet`).
 - To leave the state an interrupted management command leaves, interrupt a
   real one: `strace -P FILE -e inject=unlink,unlinkat:error=EIO:signal=KILL`
   kills it just as it would delete FILE.

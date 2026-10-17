@@ -9,6 +9,7 @@ import time
 
 import pytest
 
+from harness.env import Unmet
 from harness.qsh import (
     PORT,
     PREVIOUS_QSH_SERVER,
@@ -215,15 +216,6 @@ UNIT_FILE = "/etc/systemd/system/qsh-server.service"
 PREVIOUS_UNIT_FILE = f"/usr/local/share/qsh-e2e/qsh-server-{PREVIOUS_VERSION}.service"
 SAVED = "/var/lib/qsh-e2e-saved"
 PAYLOAD = bytes(range(256)) * 4096  # 1 MiB with every byte value
-
-
-class Unmet(Exception):
-    """What a strict-xfail scenario expects and qsh does not do yet.
-
-    Raised for that one expectation only, and named in the mark's `raises`,
-    so a broken precondition fails the test instead of passing as the
-    expected failure.
-    """
 
 
 def replace_binary(node, source: str, target: str = UNIT_BINARY) -> None:
