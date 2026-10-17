@@ -134,6 +134,9 @@ Some lessons the first scenarios taught:
   from a plain `sh`, or a broken qsh passes.
 - A regression test is only one if it fails without its fix. Run new
   scenarios against an image built from the commit before the fix.
+- pexpect searches its whole buffer again after every small read, so a
+  terminal that prints megabytes slows the reader, and qsh behind it, to a
+  crawl. Read such output with `Terminal.drain_exit`.
 - Put shared state back in `finally`: a scenario that fails half way
   through (a rotated host key, an edited configuration) must not take
   later scenarios down with it.
