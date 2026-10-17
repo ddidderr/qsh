@@ -64,6 +64,14 @@ RUN systemctl mask \
         systemd-firstboot.service systemd-remount-fs.service \
     && systemctl set-default multi-user.target
 
+# systemd 258 and later ship a login profile that prints OSC 3008 context
+# sequences around every prompt and command of an interactive bash, and a
+# tmpfiles rule that links it back in at boot. Terminal scenarios compare
+# exactly what a session prints, so leave it out.
+RUN rm -f /etc/profile.d/80-systemd-osc-context.sh \
+    && mkdir -p /etc/tmpfiles.d \
+    && ln -sf /dev/null /etc/tmpfiles.d/20-systemd-osc-context.conf
+
 # Accounts used by the scenarios. Fixed IDs keep file ownership stable across
 # nodes; `project` gives alice a supplementary group to check after the
 # privilege drop.
