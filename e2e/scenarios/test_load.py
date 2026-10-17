@@ -109,12 +109,12 @@ def test_the_global_session_budget_across_five_keys(make_client, bob):
 # over that limit without a word, and the client sends it again when its
 # retransmission timer fires: about 1 s later (quinn's first RTT estimate is
 # 333 ms), then 2, 4 and 8 s after that. A crowd behind one NAT therefore gets
-# in four at a time, once per resend: four resends fit in the default 10 s
-# --connect-timeout. The fifth comes after quinn's 15 s Retry token lifetime,
-# and the server refuses it as an invalid token, so a longer timeout does not
-# let more in.
+# in four at a time, once per attempt: the first and three resends fit in the
+# default 10 s --connect-timeout. The next resend, at about 15 s, comes after
+# quinn's 15 s Retry token lifetime, and the server refuses it as an invalid
+# token, so a longer timeout does not let more in.
 PER_SOURCE_HANDSHAKES = 4
-RESENDS_THAT_COUNT = 4  # at about 1, 3, 7 and 15 s: the first four
+ATTEMPTS_THAT_COUNT = 4  # sent at about 0, 1, 3 and 7 s after the Retry
 CROWD = 32  # one key's connection limit
 # Each way: the client's Finished takes a 200 ms round trip to free a slot,
 # far longer than the crowd takes to start, so a slot cannot serve two
@@ -173,7 +173,7 @@ def test_a_crowd_behind_one_address_gets_in_four_at_a_time(connect_timeout, make
     assert r.rc == 0 and r.stdout == "ELSEWHERE\n", r.describe()
     assert elsewhere < 2, f"another address waited {elsewhere:.1f}s"
     assert all(len(g) <= PER_SOURCE_HANDSHAKES for g in groups), groups
-    assert len(logged_in) == PER_SOURCE_HANDSHAKES * RESENDS_THAT_COUNT, groups
+    assert len(logged_in) == PER_SOURCE_HANDSHAKES * ATTEMPTS_THAT_COUNT, groups
     assert len(logged_in) + len(failed) == CROWD, results
     for x in failed:
         assert x.rc == 255 and x.out == "", x
