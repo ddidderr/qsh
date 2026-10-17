@@ -475,35 +475,35 @@ commit that fixed it.
 ## LIFE — process lifecycle
 
 ### LIFE-01 — A killed client does not strand its remote job
-- **Status:** planned · **Priority:** P0 · **Needs:** server2
+- **Status:** automated · **Priority:** P0 · **Needs:** server2
 - **Expected:** after `kill -9` of the local qsh, the remote job is gone within the idle timeout plus a margin.
 
 ### LIFE-02 — An ordinary key may leave a detached job
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** a `setsid` job survives the session (a decided trade-off in THREAT_MODEL.md).
 
 ### LIFE-03 — A background writer keeps the session open, like ssh
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** `(sleep 3; echo late) & echo early` returns both lines after about 3 s.
 
 ### LIFE-04 — A restricted key kills every descendant at session end
-- **Status:** planned · **Priority:** P0 · **Needs:** cgroup-v2
+- **Status:** automated · **Priority:** P0 · **Needs:** cgroup-v2
 - **Expected:** with `--kill-session-processes`, a `setsid`, double-forked `sleep` is gone after a successful session, and no `session-*` cgroup is left behind.
 
 ### LIFE-05 — A restricted key kills descendants when the client vanishes
-- **Status:** planned · **Priority:** P0 · **Needs:** cgroup-v2, server2
+- **Status:** automated · **Priority:** P0 · **Needs:** cgroup-v2, server2
 - **Expected:** after `kill -9` of the client, the detached job is gone within the idle timeout plus a margin.
 
 ### LIFE-06 — Restricted sessions cannot gain privileges
-- **Status:** planned · **Priority:** P0 · **Needs:** cgroup-v2
+- **Status:** automated · **Priority:** P0 · **Needs:** cgroup-v2
 - **Expected:** `NoNewPrivs: 1` for a restricted key, 0 for an ordinary one.
 
 ### LIFE-07 — A restricted session runs in its own cgroup
-- **Status:** planned · **Priority:** P0 · **Needs:** cgroup-v2
+- **Status:** automated · **Priority:** P0 · **Needs:** cgroup-v2
 - **Expected:** `/proc/self/cgroup` shows `…/qsh-restricted/session-…`.
 
 ### LIFE-08 — Revoking mid-session kills the process group
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Expected:** the leader and its same-group background child are gone.
 
 ### LIFE-09 — Interactive exit with a chatty background job
