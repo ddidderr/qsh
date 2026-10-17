@@ -310,52 +310,52 @@ commit that fixed it.
 ## NET — network conditions
 
 ### NET-01 — Latency, loss, reordering and duplicates do not corrupt a session
-- **Status:** planned · **Priority:** P0 · **Needs:** netsim
+- **Status:** automated · **Priority:** P0 · **Needs:** netsim
 - **Steps:** 150 ms RTT, 20 ms jitter, 3% loss, 3% reordering, 2% duplicates; a ticking command and a 512 KiB upload.
 - **Expected:** every line in order, the right digest, status 0.
 
 ### NET-02 — A short outage is survived
-- **Status:** planned · **Priority:** P0 · **Needs:** netsim, server2
+- **Status:** automated · **Priority:** P0 · **Needs:** netsim, server2
 - **Steps:** black-hole the link for half the idle timeout mid-session.
 - **Expected:** the session completes with all output and status 0.
 
 ### NET-03 — An outage past the idle timeout ends both sides
-- **Status:** planned · **Priority:** P0 · **Needs:** netsim, server2
+- **Status:** automated · **Priority:** P0 · **Needs:** netsim, server2
 - **Expected:** the client exits 255 within the idle timeout plus a margin; the server kills the remote job (README: cleanup bounded by the idle timeout).
 
 ### NET-04 — NAT rebinding mid-session
-- **Status:** planned · **Priority:** P0 · **Needs:** netsim
+- **Status:** automated · **Priority:** P0 · **Needs:** netsim
 - **Steps:** move the flow to a new source port twice during a 12 s command.
 - **Expected:** the session continues; all output, status 0 (README: "connection migration"). Found F1 and F2.
 
 ### NET-05 — The client changes address mid-session
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Steps:** reconnect client1 to the network with a new IP during a 12 s command.
 - **Expected:** as NET-04.
 
 ### NET-06 — The relay's source address changes mid-session
-- **Status:** planned · **Priority:** P1 · **Needs:** netsim
+- **Status:** automated · **Priority:** P1 · **Needs:** netsim
 - **Expected:** as NET-04, with a new source IP rather than a new port.
 
 ### NET-07 — `--connect-timeout` against a silent peer
-- **Status:** planned · **Priority:** P1 · **Needs:** netsim
+- **Status:** automated · **Priority:** P1 · **Needs:** netsim
 - **Expected:** status 255 with "timed out" after about 3 s for `--connect-timeout 3`.
 
 ### NET-08 — Nothing listening fails within the timeout
-- **Status:** planned · **Priority:** P2 · **Needs:** —
+- **Status:** automated · **Priority:** P2 · **Needs:** —
 - **Expected:** status 255 within 10 s for `--connect-timeout 3`.
 
 ### NET-09 — An unknown host name fails fast
-- **Status:** planned · **Priority:** P2 · **Needs:** —
+- **Status:** automated · **Priority:** P2 · **Needs:** —
 - **Expected:** status 255 naming the host, within seconds.
 
 ### NET-10 — A server restart ends the session promptly
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Steps:** `systemctl restart qsh-server` during a session on the default 60 s idle timeout.
 - **Expected:** the client exits 255 within 10 s, the job is gone, new sessions work with the same host key. Found F8.
 
 ### NET-11 — A dead first address falls back to a live one
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Steps:** a name with an unreachable and a live address.
 - **Expected:** connects in under 5 s (README: 250 ms stagger, per-address timeout).
 
@@ -369,7 +369,7 @@ commit that fixed it.
 - **Expected:** document the loss level up to which a handshake reliably completes and the message when it does not.
 
 ### NET-14 — Outage tolerance with the default timeouts
-- **Status:** planned · **Priority:** P1 · **Needs:** netsim (marked `slow`)
+- **Status:** automated · **Priority:** P1 · **Needs:** netsim (marked `slow`)
 - **Expected:** a 30 s outage is survived; a 90 s one ends both sides. Detection takes idle timeout plus up to one keep-alive interval (60–75 s).
 
 ### NET-16 — One-way outages
