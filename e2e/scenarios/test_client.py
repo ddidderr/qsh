@@ -104,6 +104,25 @@ def test_ssh_options_are_refused_before_contacting_the_host(make_client, server,
 def test_everything_after_the_host_is_the_remote_command(alice):
     r = alice.run("server", "echo", "-p", "2222", "-o", "x")
     assert r.rc == 0 and r.stdout.strip() == "-p 2222 -o x", r.describe()
-    # Unlike ssh, `-p` after the host is not a port: it is the program.
-    r = alice.run("server", "-p", "2222", "true")
+
+
+@pytest.mark.plan("CLI-07")
+@pytest.mark.parametrize(
+    "words",
+    [("-p", "2222"), ("-l", "alice"), ("-t",), ("-n",), ("-o", "BatchMode=yes"), ("--",)],
+    ids=lambda words: words[0],
+)
+def test_options_after_the_host_are_the_remote_command(alice, words):
+    """Documented divergence: qsh reads options only up to the host.
+
+    ssh goes on reading options after the host until the first word that is
+    not one, so `ssh host -p 2222 uptime` uses port 2222. qsh hands every
+    word after the host to the server as the command (src/bin/qsh.rs:
+    "Options are parsed only up to the host argument"). The misplaced
+    option then fails loudly, as a program that does not exist, before the
+    remote side runs anything or qsh reads any input. That holds for `-o`
+    too, which qsh does not have.
+    """
+    r = alice.run("server", *words, "true")
     assert r.rc == 127, r.describe()
+    assert f"`{words[0]}`" in r.stderr, r.describe()

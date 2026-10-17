@@ -10,6 +10,7 @@ TIOCSWINSZ on the server's PTY.
 from __future__ import annotations
 
 import re
+import time
 
 import pexpect
 
@@ -101,6 +102,33 @@ class Terminal:
             self.child.expect(pexpect.EOF, timeout=timeout)
         except pexpect.TIMEOUT:
             raise AssertionError(f"qsh did not exit within {timeout}s; last output:\n{(self.child.before or '')[-2000:]}") from None
+        return self._status()
+
+    def drain_exit(self, timeout: float = 20, keep: int = 4000) -> tuple[int, str, float]:
+        """Read until qsh exits: its status, the last `keep` characters it
+        printed, and how many seconds it stayed after printing them.
+
+        For sessions that print megabytes on their way out: `wait_exit` keeps
+        everything in pexpect's buffer and searches all of it after every
+        small read, which slows the reader, and so qsh, to a crawl.
+        """
+        deadline = time.monotonic() + timeout
+        tail = ""
+        last = time.monotonic()
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise AssertionError(f"qsh did not exit within {timeout}s; last output:\n{tail[-2000:]}")
+            try:
+                tail = (tail + self.child.read_nonblocking(65536, timeout=left))[-keep:]
+                last = time.monotonic()
+            except pexpect.TIMEOUT:
+                continue
+            except pexpect.EOF:
+                quiet = time.monotonic() - last
+                return self._status(), tail, quiet
+
+    def _status(self) -> int:
         self.child.close()
         if self.child.signalstatus is not None:
             return 128 + self.child.signalstatus

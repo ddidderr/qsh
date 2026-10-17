@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import itertools
 import re
+import shlex
 import time
+from contextlib import ExitStack, contextmanager
 
 import pytest
 
@@ -288,64 +291,6 @@ def test_a_revocation_tombstone_blocks_restored_files(make_client, server):
     assert member.run("server", "true").rc == 0
 
 
-NARROWED = "the server ended this session: this key's permissions changed"
-
-# Rewrites `allowed_commands`, whichever way the array is laid out.
-SET_ALLOWED = (
-    "import re, sys\n"
-    "path, value = sys.argv[1], sys.argv[2]\n"
-    "text = open(path).read()\n"
-    "text = re.sub(r'(?ms)^allowed_commands = \\[.*?\\]', 'allowed_commands = ' + value, text)\n"
-    "open(path, 'w').write(text)\n"
-)
-
-
-@pytest.mark.plan("AUTH-18")
-def test_a_narrowed_policy_says_why_it_ended_a_session(make_client, server):
-    """The user reads why the session ended; the journal says what was taken away."""
-    member = make_client("alice", authorize_as="alice")
-    toml = f"/etc/qsh/authorized/{member.entry}.toml"
-    marker = "5454.25"
-    term = Terminal(member, "server")
-    try:
-        term.set_prompt()
-        term.sendline(f"sleep {marker}")
-        server.node.wait_running(f"sleep {marker}", timeout=10)
-        since = server.cursor()
-        server.node.sh(f"sed -i 's/^allow_shell = true/allow_shell = false/' {toml}")
-        term.expect(re.escape(NARROWED), timeout=RELOAD_SETTLE + 5)
-        assert term.wait_exit() == 255
-    finally:
-        term.close()
-    server.wait_journal(
-        rf"key `{re.escape(member.entry)}`\): ended a session its authorization no longer allows: "
-        r"login shells are no longer allowed",
-        since,
-    )
-    server.node.wait_gone(f"sleep {marker}", timeout=10)
-    assert member.run("server", "true").rc == 0
-
-
-@pytest.mark.plan("AUTH-18")
-def test_dropping_a_running_program_from_the_allowed_commands_says_why(make_client, server):
-    member = make_client(
-        "alice", authorize_as="alice", options=("--no-shell", "--command", "sleep", "--command", "true")
-    )
-    toml = f"/etc/qsh/authorized/{member.entry}.toml"
-    marker = "5455.25"
-    proc = member.node.popen(member.argv("server", "sleep", marker), user="alice")
-    server.node.wait_running(f"sleep {marker}", timeout=10)
-    since = server.cursor()
-    server.node.run(["python3", "-c", SET_ALLOWED, toml, '["true"]'], check=True)
-    _, err = proc.communicate(timeout=RELOAD_SETTLE + 10)
-    assert proc.returncode == 255, err.decode()
-    assert NARROWED in err.decode(), err.decode()
-    server.wait_journal(r"ended a session its authorization no longer allows: `sleep` is no longer an allowed command", since)
-    server.node.wait_gone(f"sleep {marker}", timeout=10)
-    assert member.run("server", "true").rc == 0
-    assert member.run("server", "sleep", "0").rc == 126
-
-
 @pytest.mark.plan("AUTH-19")
 def test_account_controls_outside_qsh_do_not_gate_it(make_client, server):
     """Documented: no PAM, so account expiry and /etc/nologin do not apply."""
@@ -359,3 +304,207 @@ def test_account_controls_outside_qsh_do_not_gate_it(make_client, server):
     # The authorization is the gate: revoking it is what ends access.
     server.revoke(member.entry)
     assert member.run("server", "true").rc == 255
+
+
+# ---------------------------------------------------------------- AUTH-18
+#
+# A running session is checked against its key's current policy once a
+# second (src/server.rs `standing`). A key that may still connect but no
+# longer for this session keeps its connection, so no connection close can
+# carry the reason. The session says it in-band instead, with an exit status
+# of 255, and the server records one line per session, with the peer and
+# the key, on the audit lane, which the peer diagnostic budget does not
+# limit. The client is told only that the key's permissions changed; the
+# journal says what changed.
+
+# What the client prints.
+NARROWED = "qsh: the server ended this session: this key's permissions changed"
+
+TOML = "/etc/qsh/authorized/{entry}.toml"
+
+# Words a message about a changed policy uses.
+CHANGED = r"\b(?:no longer|not any more|now|new|changed|narrowed)\b"
+
+
+def set_policy(line: str, new: str):
+    """A policy change: the `line` of the key's policy file becomes `new`."""
+
+    def change(server, member) -> None:
+        toml = TOML.format(entry=member.entry)
+        server.node.sh(f"sed -i {shlex.quote(f's|^{line}$|{new}|')} {toml} && grep -qxF {shlex.quote(new)} {toml}")
+
+    return change
+
+
+def reauthorize(*options: str):
+    """A policy change through the tool: `authorize --force` with `options`."""
+
+    def change(server, member) -> None:
+        server.authorize(member.cert(), user="alice", name=member.entry, options=("--force", *options), settle=False)
+
+    return change
+
+
+# Whether the session is a login shell, how its policy changes, and what a
+# message about the change must name.
+NARROWINGS = [
+    pytest.param(True, set_policy("allow_shell = true", "allow_shell = false"), r"shell", id="allow_shell"),
+    pytest.param(False, set_policy("allow_exec = true", "allow_exec = false"), r"command|execut", id="allow_exec"),
+    pytest.param(
+        False,
+        set_policy(r"allowed_commands = \[\]", 'allowed_commands = ["/usr/bin/true"]'),
+        r"`sleep`",
+        id="allowed_commands",
+    ),
+    pytest.param(False, set_policy('user = "alice"', 'user = "bob"'), r"`bob`", id="user"),
+    pytest.param(
+        False,
+        set_policy("kill_session_processes = false", "kill_session_processes = true"),
+        r"clean|kill|restrict",
+        id="kill_session_processes",
+    ),
+    pytest.param(True, reauthorize("--no-shell"), r"shell", id="authorize--no-shell"),
+]
+
+_narrowing_markers = itertools.count(1)
+
+
+@contextmanager
+def a_narrowable_session(member, server, *, shell: bool):
+    """A session of `member`'s key on `server` whose job is a distinctive `sleep`.
+
+    A login shell with the `sleep` in the foreground, or `qsh server sleep`.
+    Yields the marker and a function that waits for qsh to end and returns
+    its status and what it printed (on its stderr, or on the terminal).
+    """
+    marker = f"8181.{next(_narrowing_markers):02d}5"
+    if shell:
+        term = Terminal(member, "server", timeout=30)
+
+        def wait(timeout: float) -> tuple[int, str]:
+            status = term.wait_exit(timeout=timeout)
+            return status, term.child.before or ""
+
+    else:
+        argv = member.argv("server", "sleep", marker)
+        proc = member.node.popen(argv, user="alice")
+
+        def wait(timeout: float) -> tuple[int, str]:
+            _, err = proc.communicate(timeout=timeout)
+            return proc.returncode, err.decode(errors="replace")
+
+    try:
+        if shell:
+            term.set_prompt()
+            term.sendline(f"sleep {marker}")
+        server.node.wait_running(f"sleep {marker}", timeout=15)
+        yield marker, wait
+    finally:
+        if shell:
+            term.close()
+        else:
+            member.node.kill_command("alice", argv)
+            proc.wait(timeout=10)
+        server.node.run(["pkill", "-u", "alice", "-f", f"^sleep {marker}$"])
+
+
+@pytest.mark.plan("AUTH-18")
+@pytest.mark.parametrize("shell,change,reason", NARROWINGS)
+def test_a_narrowed_policy_ends_the_session_at_once_with_255(make_client, server, shell, change, reason):
+    """What already holds: the session ends within the policy check's period.
+
+    The reload and each session's policy check run once a second, so about
+    two seconds at worst (README: revocation "normally within two seconds");
+    the job goes with it, and qsh fails with 255 like a revoked session
+    (AUTH-03), not with a status the remote job could have produced.
+    """
+    member = make_client("alice", authorize_as="alice")
+    with a_narrowable_session(member, server, shell=shell) as (marker, wait):
+        change(server, member)
+        begin = time.monotonic()
+        status, said = wait(timeout=30)
+        took = time.monotonic() - begin
+        assert status == 255, said
+        assert took < 2 + 2, f"the narrowed session ended after {took:.1f}s"
+        server.node.wait_gone(f"sleep {marker}", timeout=10)
+
+
+def narrowing_line(entry: str, reason: str, prefix: str, peer: str | None = None) -> str:
+    """A regex for one line that starts with `prefix` and names the key,
+    the change, its reason and, if given, the peer's address, in any order."""
+    rest = r"[^\r\n]*"
+    where = rf"(?={rest}\b{re.escape(peer)}:\d+\b)" if peer else ""
+    return (
+        rf"{prefix}{where}(?={rest}`{re.escape(entry)}`)(?={rest}{CHANGED})(?={rest}(?:{reason}))"
+        rf"(?!{rest}authenticated as){rest}"
+    )
+
+
+@pytest.mark.plan("AUTH-18")
+@pytest.mark.parametrize("shell,change,reason", NARROWINGS)
+def test_a_narrowed_policy_tells_the_user_and_the_journal_why(make_client, server, shell, change, reason):
+    """The client says why the session ended; the server logs which key lost what.
+
+    The journal line is matched loosely: the peer, the key, a word for the
+    change and the reason, in any order.
+    """
+    member = make_client("alice", authorize_as="alice")
+    since = server.cursor()
+    with a_narrowable_session(member, server, shell=shell) as (_, wait):
+        change(server, member)
+        status, said = wait(timeout=30)
+    assert status == 255, said
+    assert "stream reset" not in said, said
+    assert NARROWED in said, said
+    server.wait_journal(narrowing_line(member.entry, reason, r"(?m)^qsh-server: ", member.node.ip), since, timeout=5)
+
+
+def exhausted(server, since: str) -> None:
+    """Skip unless the peer diagnostic budget ran out after `since`.
+
+    The server reports suppressed lines once a second, for the second before.
+    """
+    try:
+        server.wait_journal(r"suppressed \d+ diagnostic", since, timeout=10)
+    except AssertionError:
+        pytest.skip("the flood did not exhaust the peer diagnostic budget on this host")
+
+
+@pytest.mark.plan("AUTH-18")
+def test_the_narrowing_line_survives_a_flood_of_failing_sessions(make_client, server):
+    """THREAT_MODEL.md actor 3 cannot silence the audit lines by failing sessions.
+
+    bob's `--no-exec` key fails sessions from client2 as fast as it can,
+    which exhausts the peer diagnostic budget (16 lines a second, the rest
+    "suppressed"). Meanwhile alice's key loses `allow_exec` under three
+    running commands: each of the three sessions must still get its line.
+    A line on the peer budget would be lost in most of those seconds.
+    """
+    member = make_client("alice", authorize_as="alice")
+    flooder = make_client("bob", node="client2", authorize_as="bob", options=("--no-exec",))
+    stop = f"/tmp/{flooder.entry}.stop"
+    flood_qsh = shlex.join(flooder.argv("server", "true"))
+    # Four at a time: the per-source handshake limit is four.
+    flood_script = (
+        f"for i in 1 2 3 4; do (while [ ! -e {stop} ]; do {flood_qsh} 2>/dev/null; done) & done; wait"
+    )
+    flood = None
+    with ExitStack() as stack:
+        sessions = [stack.enter_context(a_narrowable_session(member, server, shell=False)) for _ in range(3)]
+        try:
+            since = server.cursor()
+            flood = flooder.node.popen(["timeout", "60", "bash", "-c", flood_script], user="bob")
+            exhausted(server, since)
+            during = server.cursor()
+            set_policy("allow_exec = true", "allow_exec = false")(server, member)
+            for _, wait in sessions:
+                wait(timeout=30)
+            exhausted(server, during)
+        finally:
+            flooder.node.run(["touch", stop])
+            if flood is not None:
+                flood.wait(timeout=30)
+            flooder.node.run(["rm", "-f", stop])
+    pattern = narrowing_line(member.entry, r"command|execut", r"(?m)^qsh-server: ", member.node.ip)
+    lines = re.findall(pattern, server.journal(during))
+    assert len(lines) == 3, f"{len(lines)} of 3 narrowing lines:\n" + "\n".join(lines)
