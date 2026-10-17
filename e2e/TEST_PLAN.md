@@ -174,71 +174,71 @@ commit that fixed it.
 ## PTY — interactive sessions
 
 ### PTY-01 — A login shell on a real terminal
-- **Status:** planned · **Priority:** P0 · **Needs:** pty
+- **Status:** automated · **Priority:** P0 · **Needs:** pty
 - **Expected:** `tty` is `/dev/pts/N`, `$0` is `-bash`, `login_shell` is set, cwd is home, `TERM` is forwarded, `exit` gives 0.
 
 ### PTY-02 — The initial window size is the local one
-- **Status:** planned · **Priority:** P1 · **Needs:** pty
+- **Status:** automated · **Priority:** P1 · **Needs:** pty
 - **Expected:** `stty size` reports the local 31×101.
 
 ### PTY-03 — A local resize reaches the remote program
-- **Status:** planned · **Priority:** P1 · **Needs:** pty
+- **Status:** automated · **Priority:** P1 · **Needs:** pty
 - **Steps:** trap WINCH remotely; resize the local terminal.
 - **Expected:** the trap fires with the new size; `stty size` agrees.
 
 ### PTY-04 — Ctrl-C interrupts the foreground job only
-- **Status:** planned · **Priority:** P0 · **Needs:** pty
+- **Status:** automated · **Priority:** P0 · **Needs:** pty
 - **Expected:** `sleep 100` is interrupted (`$?` 130); the shell survives.
 
 ### PTY-05 — The shell's exit status becomes qsh's
-- **Status:** planned · **Priority:** P1 · **Needs:** pty
+- **Status:** automated · **Priority:** P1 · **Needs:** pty
 - **Expected:** `exit 7` makes qsh exit 7.
 
 ### PTY-06 — `~.` disconnects at once and the server cleans up
-- **Status:** planned · **Priority:** P0 · **Needs:** pty
+- **Status:** automated · **Priority:** P0 · **Needs:** pty
 - **Expected:** qsh exits 255 within 3 s while a remote job runs; the job is gone on the server within seconds (README: `~.` "does not wait for the remote process").
 
 ### PTY-07 — `~~` sends one literal tilde
-- **Status:** planned · **Priority:** P1 · **Needs:** pty
+- **Status:** automated · **Priority:** P1 · **Needs:** pty
 - **Expected:** a remote `cat` echoes `~hello` for `~~hello`.
 
 ### PTY-08 — Raw-mode programs receive control bytes as data
-- **Status:** planned · **Priority:** P1 · **Needs:** pty
+- **Status:** automated · **Priority:** P1 · **Needs:** pty
 - **Expected:** a remote program in raw mode reads ^A ^C ^Z `z` as bytes `01 03 1a 7a`.
 
 ### PTY-09 — A forced terminal for a command uses the local size
-- **Status:** planned · **Priority:** P2 · **Needs:** pty
+- **Status:** automated · **Priority:** P2 · **Needs:** pty
 - **Expected:** `qsh -t server stty size` prints the local 33×99.
 
 ### PTY-10 — `-T` runs the shell without a terminal
-- **Status:** planned · **Priority:** P2 · **Needs:** pty
+- **Status:** automated · **Priority:** P2 · **Needs:** pty
 - **Expected:** `tty` says "not a tty"; `exit 3` gives 3.
 
 ### PTY-11 — A background job does not hold the session open
-- **Status:** planned · **Priority:** P1 · **Needs:** pty
+- **Status:** automated · **Priority:** P1 · **Needs:** pty
 - **Expected:** after `sleep 300 &` and `exit`, qsh exits 0 within 8 s (README: "waits two seconds for the rest of the output and then finishes anyway").
 
 ### PTY-12 — A large burst of terminal output arrives complete
-- **Status:** planned · **Priority:** P1 · **Needs:** pty
+- **Status:** automated · **Priority:** P1 · **Needs:** pty
 - **Expected:** `seq 1 200000` ends with `200000`; the shell stays responsive.
 
 ### PTY-13 — The local terminal is restored after the session
-- **Status:** planned · **Priority:** P0 · **Needs:** pty
+- **Status:** automated · **Priority:** P0 · **Needs:** pty
 - **Steps:** from a plain local `sh`, `stty -g` before and after `qsh server`, ending with `exit` and with `~.`. (Not an interactive bash: it restores the modes itself after a job dies of a signal.)
 - **Expected:** identical settings both times.
 
 ### PTY-14 — A resize during session setup is not lost
-- **Status:** planned · **Priority:** P2 · **Needs:** pty, netsim
+- **Status:** automated · **Priority:** P2 · **Needs:** pty, netsim
 - **Steps:** connect across 1.5 s each way; resize as soon as the server logs the login, while its answer is still on the way back.
 - **Expected:** the remote `stty size` is the new size. Found F12.
 
 ### PTY-15 — A signal from outside still restores the terminal
-- **Status:** planned · **Priority:** P1 · **Needs:** pty
+- **Status:** automated · **Priority:** P1 · **Needs:** pty
 - **Steps:** `pkill -INT|-USR1|-HUP|-TERM qsh` during an interactive session started from a plain local `sh`.
 - **Expected:** the local terminal's settings are as before. Found F14.
 
 ### PTY-16 — `~.` returns promptly over a long round trip
-- **Status:** planned · **Priority:** P2 · **Needs:** pty, netsim
+- **Status:** automated · **Priority:** P2 · **Needs:** pty, netsim
 - **Steps:** a session across 600 ms RTT, then `~.`; then a plain `qsh netsim true`.
 - **Expected:** the prompt is back within 2 s of `~.`, and the short command does not linger seconds after finishing (README: `~.` "does not wait for the remote process or server"). Found F19.
 
