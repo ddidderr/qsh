@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import shlex
+import subprocess
 import time
 
 import pytest
@@ -371,3 +372,115 @@ def test_a_one_way_outage_ends_both_sides(dead, alice_fast, fast_server, make_li
     assert server_gone is not None and server_gone < ONE_WAY_LIMIT, times
     assert proc.returncode == 255, err.decode()
     assert "timed out" in err.decode(), err.decode()
+
+
+# quinn's path-MTU discovery starts at QUIC's 1,200-byte minimum and probes up
+# to its 1,452-byte ceiling within milliseconds of the handshake (`netsim
+# --trace` shows the 1,326, 1,389, 1,420 and 1,452-byte probes on this
+# network). A path that then shrinks to 1,252-byte datagrams, a 1,280-byte IPv4
+# MTU, cuts the size in use but still carries QUIC's minimum. netsim drops the
+# oversized datagrams silently, as a router that sends no ICMP does.
+QUIC_MIN_DATAGRAM = 1200
+SHRUNK_DATAGRAM = 1252
+SEQ_COUNT = 4_000_000  # `seq 1 4000000` writes 30.9 MB
+
+
+def seq_digest(count: int) -> str:
+    return hashlib.sha256("".join(f"{i}\n" for i in range(1, count + 1)).encode()).hexdigest()
+
+
+@pytest.mark.plan("NET-17")
+@pytest.mark.parametrize("direction", ["down", "up"])
+def test_bulk_data_survives_a_path_mtu_drop(direction, alice, server, make_link):
+    """30.9 MB in one direction; part way through, that direction's path MTU shrinks.
+
+    The sender must notice the black hole from its losses alone, fall back to
+    1,200-byte datagrams and finish the stream intact.
+    """
+    link = make_link("server:2222", delay_ms=5)
+    alice.pin(link.host, server.fp, port=link.port)
+    if direction == "down":
+        remote = alice.argv("netsim", "seq", "1", str(SEQ_COUNT), port=link.port)
+        script = f"{shlex.join(remote)} | sha256sum"
+    else:
+        remote = alice.argv("netsim", "sha256sum", port=link.port)
+        script = f"seq 1 {SEQ_COUNT} | {shlex.join(remote)}"
+    proc = pipeline(alice, script)
+    try:
+        # A few MB at full size first: 3,000 of the transfer's 22,000 datagrams.
+        deadline = time.monotonic() + 30
+        while (moved := link.stats()["stats"][direction])["forwarded"] < 3000:
+            assert proc.poll() is None, proc.communicate()[1].decode()
+            assert time.monotonic() < deadline, moved
+            time.sleep(0.05)
+        assert moved["largest"] > SHRUNK_DATAGRAM, f"datagrams never grew past {SHRUNK_DATAGRAM} bytes: {moved}"
+        link.set(**{f"max_datagram_{direction}": SHRUNK_DATAGRAM})
+        cut = time.monotonic()
+        assert proc.poll() is None, "the transfer ended before the path shrank"
+        try:
+            out, err = proc.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            pytest.fail(f"the transfer stalled after the path shrank: {link.stats()['stats']}")
+        took = time.monotonic() - cut
+    finally:
+        if proc.poll() is None:
+            alice.node.kill_command(alice.user, remote)
+    after = link.stats()["stats"][direction]
+    print(f"{direction}: {moved['largest']}-byte datagrams before the drop, the rest took {took:.1f}s, {after}")
+    assert proc.returncode == 0, err.decode()
+    assert out.decode().split()[0] == seq_digest(SEQ_COUNT)
+    # Datagrams of the old size really were sent into the shrunken path.
+    assert after["oversized"] > 0, after
+
+
+@pytest.mark.plan("NET-17")
+def test_a_path_below_the_quic_minimum_fails_to_connect_clearly(alice, server, make_link):
+    """1,150-byte datagrams at most: no QUIC handshake fits through.
+
+    A client pads every datagram that carries its Initial to 1,200 bytes
+    (RFC 9000, section 14.1), so not one of them reaches the server.
+    """
+    link = make_link("server:2222", max_datagram=QUIC_MIN_DATAGRAM - 50)
+    alice.pin(link.host, server.fp, port=link.port)
+    begin = time.monotonic()
+    r = alice.run("netsim", "true", port=link.port, options=("--connect-timeout", "3"), timeout=60)
+    took = time.monotonic() - begin
+    assert r.rc == 255, r.describe()
+    assert "timed out after 3s" in r.stderr, r.describe()
+    assert took < 8, f"took {took:.1f}s"
+    up = link.stats()["stats"]["up"]
+    assert up["oversized"] > 0 and up["forwarded"] == 0, up
+
+
+@pytest.mark.plan("NET-17")
+def test_bulk_output_on_a_path_that_falls_below_the_minimum_ends_at_the_idle_timeout(
+    alice_fast, fast_server, make_link
+):
+    """An established session whose path shrinks to 1,150-byte datagrams mid-output.
+
+    quinn falls back to 1,200 bytes, which still do not fit, and nothing tells
+    it why: every full datagram is lost, and only the idle timeout ends the
+    session, on both sides, as an outage would. It must end, not stall.
+    """
+    link = make_link("server2:2222")
+    alice_fast.pin(link.host, fast_server.fp, port=link.port)
+    remote = alice_fast.argv("netsim", "seq", "1", "4848025", port=link.port)
+    proc = pipeline(alice_fast, f"{shlex.join(remote)} >/dev/null")
+    try:
+        deadline = time.monotonic() + 30
+        while link.stats()["stats"]["down"]["forwarded"] < 3000:
+            assert proc.poll() is None, proc.communicate()[1].decode()
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        link.set(max_datagram=QUIC_MIN_DATAGRAM - 50)
+        cut = time.monotonic()
+        _, err = proc.communicate(timeout=FAST_IDLE_TIMEOUT + 30)
+        gone = time.monotonic() - cut
+    finally:
+        if proc.poll() is None:
+            alice_fast.node.kill_command(alice_fast.user, remote)
+    assert proc.returncode == 255, err.decode()
+    assert "timed out" in err.decode(), err.decode()
+    assert gone < FAST_IDLE_TIMEOUT + 10, f"the client took {gone:.1f}s to give up"
+    fast_server.node.wait_gone("seq 1 4848025", timeout=FAST_IDLE_TIMEOUT + 10)
+    print(f"client gone after {gone:.1f}s, remote job after {time.monotonic() - cut:.1f}s")
