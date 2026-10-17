@@ -5,6 +5,7 @@ Each scenario names the actor from THREAT_MODEL.md it plays.
 
 from __future__ import annotations
 
+import re
 import time
 
 import pytest
@@ -219,7 +220,8 @@ def test_unauthenticated_noise_does_not_disturb_service(make_client, alice, serv
     # Failures are summarized in a few lines per second, never one per
     # attempt: fewer lines than the 20 handshakes alone.
     assert journal.count("\n") < 20, journal
-    assert flood.ip not in journal, journal
+    # As an address, not a substring: 172.30.0.2 is a prefix of 172.30.0.243.
+    assert not re.search(rf"(?<![\d.]){re.escape(flood.ip)}(?![\d.])", journal), journal
     assert server.is_active()
 
 
