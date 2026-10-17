@@ -20,7 +20,9 @@ use crate::net::transport_config;
 use crate::proto::{
     read_frame, write_frame, ExitStatus, Frame, PtyRequest, Request, CHUNK, PROTOCOL_VERSION,
 };
-use std::os::fd::RawFd;
+use std::os::fd::{AsFd, RawFd};
+
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 
 use crate::pty::{self, RawMode};
 
@@ -582,9 +584,59 @@ async fn session(conn: &quinn::Connection, opts: &Options) -> Result<i32> {
         None
     };
 
+    let blocking = BlockingStdio::enable();
     let result = pump(send, recv, use_pty, opts.no_stdin).await;
     drop(raw);
+    drop(blocking);
     result
+}
+
+/// The standard streams, switched to blocking mode for one session.
+///
+/// rsync starts any remote shell other than rsh with non-blocking pipes: its
+/// `--blocking-io` documentation notes that ssh prefers them. tokio reads and
+/// writes the standard streams on a blocking helper thread, where a full
+/// non-blocking pipe is an `EAGAIN` error instead of a wait, so a pull failed
+/// as soon as rsync fell behind. The flags belong to open file descriptions
+/// that may be shared with whoever started qsh, so they are put back after.
+struct BlockingStdio {
+    stdin: Option<OFlag>,
+    stdout: Option<OFlag>,
+    stderr: Option<OFlag>,
+}
+
+impl BlockingStdio {
+    fn enable() -> Self {
+        Self {
+            stdin: make_blocking(std::io::stdin()),
+            stdout: make_blocking(std::io::stdout()),
+            stderr: make_blocking(std::io::stderr()),
+        }
+    }
+}
+
+impl Drop for BlockingStdio {
+    fn drop(&mut self) {
+        restore_flags(std::io::stdin(), self.stdin);
+        restore_flags(std::io::stdout(), self.stdout);
+        restore_flags(std::io::stderr(), self.stderr);
+    }
+}
+
+/// Clear `O_NONBLOCK`; returns the flags to restore if anything changed.
+fn make_blocking(stream: impl AsFd) -> Option<OFlag> {
+    let flags = OFlag::from_bits_retain(fcntl(&stream, FcntlArg::F_GETFL).ok()?);
+    if !flags.contains(OFlag::O_NONBLOCK) {
+        return None;
+    }
+    fcntl(&stream, FcntlArg::F_SETFL(flags - OFlag::O_NONBLOCK)).ok()?;
+    Some(flags)
+}
+
+fn restore_flags(stream: impl AsFd, flags: Option<OFlag>) {
+    if let Some(flags) = flags {
+        let _ = fcntl(stream, FcntlArg::F_SETFL(flags));
+    }
 }
 
 /// Frames the input tasks want to put on the wire.
