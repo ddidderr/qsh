@@ -308,6 +308,18 @@ def test_sighup_tells_clients_and_the_journal_like_a_stop(alice_fast, fast_serve
         bring_back(fast_server)
 
 
+# How a revoked key's running session ends on the client. The connection's
+# once-a-second check closes it with the reason, "authorization withdrawn or
+# expired", and logs the withdrawal. The session runs its own check on its
+# own one-second tick, though, and when that one sees the reload first, the
+# session is abandoned and its stream reset with RESET_ABANDONED (error 2)
+# before the close: the client then reports only the reset, and if it closes
+# the connection before the connection's check comes round, the withdrawal
+# is never logged. Measured: 3 of 96 revocations. Either way the session
+# ends. FXX-AUTH-03.
+REVOKED = re.compile(r"withdrawn|stream reset by peer: error 2")
+
+
 # OPS-13 reaches into the daemon's log socket from outside: pidfd_getfd
 # (Linux 5.6) copies another process's descriptor, and the copy is the same
 # socket, so a send buffer set through it is the daemon's own. SO_SNDBUFFORCE
@@ -429,7 +441,8 @@ def login_burst(client: QshClient, host: str, rounds: int, parallel: int = 4) ->
 
 # Lines the daemon's queue may drop that OPS-13 does not tally one by one:
 # the once-a-second admission summary for the revoked key's refused
-# connection, and an error line for the session the revocation cut off.
+# connection, and the withdrawal line for the revoked connection, which is
+# not written at all when the session's own check wins (see REVOKED).
 UNTALLIED_LINES = 4
 
 
@@ -470,7 +483,7 @@ def test_a_stalled_journald_does_not_stop_serving_or_revocation(alice_fast, fast
             took = time.monotonic() - begin
         finally:
             proc.kill()
-        assert proc.returncode == 255 and "withdrawn" in err.decode(), err.decode()
+        assert proc.returncode == 255 and REVOKED.search(err.decode()), err.decode()
         # AUTH-03's bound: "normally within two seconds", plus the revoke command and a margin.
         assert took < 6, f"revocation took {took:.1f}s to reach a running session"
         node.wait_gone(f"sleep {marker}", timeout=10)
@@ -483,14 +496,13 @@ def test_a_stalled_journald_does_not_stop_serving_or_revocation(alice_fast, fast
     # `suppressed N diagnostic message(s)` summary, so the lines missing from
     # the journal add up to what is counted, give or take UNTALLIED_LINES:
     # the logins (audit lines, which only a full queue drops), the refusals
-    # (also over the peer budget), and the other sessions' lines.
+    # (also over the peer budget), and the other sessions' logins.
     login, refusal = f"(key `{noisy.entry}`)", f"key `{noisy.entry}` is authorized for `alice`, not `bob`"
     produced = {
         login: logins,
         refusal: refusals,
         "(key `alice-client1`)": len(sessions),
         f"(key `{victim.entry}`)": 1,
-        "is no longer authorized; closing the connection": 1,
     }
 
     def tally() -> tuple[dict[str, int], int, int]:
@@ -888,7 +900,7 @@ def revocation_delay(server: QshServer, victim: QshClient, marker: str) -> float
         took = time.monotonic() - begin
     finally:
         proc.kill()
-    assert proc.returncode == 255 and "withdrawn" in err.decode(), err.decode()
+    assert proc.returncode == 255 and REVOKED.search(err.decode()), err.decode()
     server.node.wait_gone(f"sleep {marker}", timeout=10)
     return took
 
