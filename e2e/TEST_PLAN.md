@@ -582,8 +582,10 @@ fails until the mark is removed, so a fix cannot go unnoticed.
 - **Expected:** sessions and revocation work throughout (THREAT_MODEL: the log sink must never block serving).
 
 ### OPS-14 — The upgrade path: replace the binary and restart
-- **Status:** planned · **Priority:** P1 · **Needs:** —
-- **Expected:** keys, authorizations and pins keep working across a restart with a new binary.
+- **Status:** automated · **Priority:** P1 · **Needs:** server2, two builds
+- **Why:** an upgrade replaces the binary under the unit and restarts it; the README says nothing more is needed, only that policies written "before `key_fingerprint` existed remain accepted with a warning for upgrade compatibility".
+- **Steps:** server2 set up from scratch by qsh-server 1.0 (`keygen`, `authorize`) with three keys: one made by the current client; one made and pinned by qsh 1.0 itself, held to `--no-shell --command id`; one that 1.0's `authorize --force` left under two names. Replace `/usr/local/bin/qsh-server` as a package manager does (a new file renamed over the old one), check that the running 1.0 daemon still serves, `systemctl restart`. Rebind a 1.0 policy with `authorize`. Then the same upgrade on a host that kept the unit file 1.0 shipped.
+- **Expected:** the host fingerprint is unchanged and no client re-pins: the current client, qsh 1.0, and the current client on the identity 1.0 wrote (`id.crt`, `id.key`, `known_hosts`) all log in. The 1.0 policy still refuses `sh`, and now also `/usr/bin/id`, because `argv[0]` is matched whole (1.0 matched the basename; THREAT_MODEL: "exact match, never basename"). The key under two names gets neither policy: refused, both names listed as `CONFLICT`, the journal names both. Each 1.0 policy is accepted with the warning "does not record which key it is for; re-run `qsh-server authorize`", at startup and from `list`. A plain re-run of `authorize` is refused ("pass --force"); with `--force` and the same options it writes `key_fingerprint`, the warning stops and the policy still restricts. Under the unit 1.0 shipped, whose `ProtectSystem=full` makes /etc read-only for the daemon, the upgraded server must still start; it never does: "opening /etc/qsh/authorized.lock: Read-only file system", restarted until systemd gives up. Found FXX-OPS-14.
 
 ### OPS-15 — A host reboot
 - **Status:** planned · **Priority:** P1 · **Needs:** —

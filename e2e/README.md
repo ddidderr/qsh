@@ -152,3 +152,7 @@ Some lessons the first scenarios taught:
 - Put shared state back in `finally`: a scenario that fails half way
   through (a rotated host key, an edited configuration) must not take
   later scenarios down with it.
+- A strict xfail turns every failure inside it into the expected one. Raise
+  a dedicated exception for the unmet expectation and name it in the mark's
+  `raises`, so a broken precondition still fails (see `Unmet` in
+  `test_ops.py`).

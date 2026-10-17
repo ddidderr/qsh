@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
+import contextlib
+import re
 import time
 
 import pytest
 
-from harness.qsh import PORT, QshServer, parse_fingerprint
+from harness.qsh import (
+    PORT,
+    PREVIOUS_QSH_SERVER,
+    PREVIOUS_VERSION,
+    RELOAD_SETTLE,
+    QshClient,
+    QshServer,
+    parse_fingerprint,
+)
 
 
 def stat(node, path: str) -> str:
@@ -190,3 +200,201 @@ def test_rotating_the_host_key_is_refused_until_repinned(alice_fast, fast_server
         alice_fast.subcommand("known-hosts", "remove", "server2:2222", check=False)
         alice_fast.pin("server2", new_fp)
     assert alice_fast.run("server2", "true").rc == 0
+
+
+# ---------------------------------------------------------------- upgrades
+#
+# The previous release is installed next to the current binaries as qsh-1.0
+# and qsh-server-1.0 (e2e/run pins its commit). OPS-14 upgrades a server that
+# 1.0 set up.
+
+UNIT_BINARY = "/usr/local/bin/qsh-server"
+UNIT_FILE = "/etc/systemd/system/qsh-server.service"
+PREVIOUS_UNIT_FILE = f"/usr/local/share/qsh-e2e/qsh-server-{PREVIOUS_VERSION}.service"
+SAVED = "/var/lib/qsh-e2e-saved"
+
+
+class Unmet(Exception):
+    """What a strict-xfail scenario expects and qsh does not do yet.
+
+    Raised for that one expectation only, and named in the mark's `raises`,
+    so a broken precondition fails the test instead of passing as the
+    expected failure.
+    """
+
+
+def replace_binary(node, source: str, target: str = UNIT_BINARY) -> None:
+    """Install `source` at `target` the way a package manager does.
+
+    The new file is written beside the old one and renamed over it: a running
+    daemon keeps the image it started from, the next start runs the new one.
+    """
+    node.sh(f"install -m 0755 {source} {target}.new && mv -f {target}.new {target}")
+
+
+def legacy_warning(name: str) -> str:
+    """What this build says about a policy written before `key_fingerprint`."""
+    return f"{name}.toml does not record which key it is for; re-run `qsh-server authorize` for `{name}`"
+
+
+def listed(listing: str, name: str, fingerprint: str, rest: str) -> bool:
+    """Whether `qsh-server list` has a line for `name` as alice, then `rest`."""
+    return re.search(rf"^{re.escape(name)} +alice +{fingerprint}{rest}", listing, re.M) is not None
+
+
+@contextlib.contextmanager
+def set_up_by_previous_release(server: QshServer, unit_file: str | None = None):
+    """server2 freshly installed with qsh-server 1.0, until the block ends.
+
+    The unit runs 1.0 from the unit's own path, with an empty state directory
+    for the scenario to `keygen` and `authorize` into as 1.0's administrator
+    did; `unit_file` replaces the unit file as well. Afterwards server2 gets
+    back the current binary, its own state directory and configuration and
+    its unit, and runs again, whatever the scenario left behind.
+    """
+    node = server.node
+    try:
+        node.run(["systemctl", "stop", server.unit], check=True)
+        node.sh(
+            f"mkdir -p {SAVED}\n"
+            f"cp -p {UNIT_BINARY} {SAVED}/qsh-server\n"
+            f"cp -p {UNIT_FILE} {SAVED}/qsh-server.service\n"
+            f"mv {server.state_dir} {SAVED}/state\n"
+        )
+        replace_binary(node, f"/usr/local/bin/{PREVIOUS_QSH_SERVER}")
+        if unit_file is not None:
+            node.sh(f"cp {unit_file} {UNIT_FILE} && systemctl daemon-reload")
+        yield
+    finally:
+        node.run(["systemctl", "stop", server.unit])
+        node.sh(
+            f"if [ -e {SAVED}/qsh-server ]; then\n"
+            f"    install -m 0755 {SAVED}/qsh-server {UNIT_BINARY}.new\n"
+            f"    mv -f {UNIT_BINARY}.new {UNIT_BINARY}\n"
+            f"fi\n"
+            f"if [ -e {SAVED}/qsh-server.service ]; then cp -p {SAVED}/qsh-server.service {UNIT_FILE}; fi\n"
+            f"if [ -d {SAVED}/state ]; then rm -rf {server.state_dir} && mv {SAVED}/state {server.state_dir}; fi\n"
+            f"rm -rf {SAVED}\n"
+            f"systemctl daemon-reload\n"
+            f"systemctl reset-failed {server.unit} || true\n"
+        )
+        server.start()
+
+
+@pytest.mark.plan("OPS-14")
+def test_an_upgrade_keeps_keys_authorizations_and_pins(make_client, fast_server):
+    """Upgrade a server that qsh 1.0 set up: replace the binary, restart.
+
+    1.0's administrator ran its `keygen` and `authorize`. One client made its
+    identity with this build's qsh; one made and pinned it with qsh 1.0
+    (`id.crt`, `id.key` and `known_hosts` all written by 1.0) and is held to
+    `--no-shell --command id`; one key 1.0's `authorize --force` left under
+    two names. After the upgrade the host key, every pin and every policy
+    must hold, and 1.0's policies must still restrict what they restricted.
+    """
+    node = fast_server.node
+    with set_up_by_previous_release(fast_server):
+        host_key = fast_server.keygen()
+        modern = make_client("alice", pin=False)
+        veteran = make_client("alice", pin=False, previous=True)
+        twice = make_client("alice", pin=False)
+        restricted = ("--no-shell", "--command", "id")
+        fast_server.authorize(modern.cert(), user="alice", name=modern.entry, settle=False)
+        fast_server.authorize(veteran.cert(), user="alice", name=veteran.entry, options=restricted, settle=False)
+        # 1.0's `--force` under a new name adds an entry and keeps the old one.
+        aliases = (f"{twice.entry}-a", f"{twice.entry}-b")
+        fast_server.authorize(twice.cert(), user="alice", name=aliases[0], settle=False)
+        fast_server.authorize(twice.cert(), user="alice", name=aliases[1], options=("--force",), settle=False)
+        for client in (modern, veteran, twice):
+            client.pin("server2", host_key)
+        fast_server.start()
+        assert modern.run("server2", "id", "-un").stdout == "alice\n"
+        # 1.0 compared a command filter with the basename of argv[0].
+        assert veteran.run("server2", "/usr/bin/id", "-un").rc == 0
+        assert twice.run("server2", "true").rc == 0
+
+        replace_binary(node, f"{SAVED}/qsh-server")
+        r = modern.run("server2", "true")
+        assert r.rc == 0, f"the running daemon stopped serving when its file was replaced\n{r.describe()}"
+        since = fast_server.cursor()
+        fast_server.restart()
+
+        assert fast_server.fingerprint() == host_key
+        # 1.0's identity files, read by this build's client, and 1.0's client.
+        upgraded = QshClient(veteran.node, "alice", identity=veteran.identity)
+        for client in (modern, upgraded, veteran):
+            r = client.run("server2", "id", "-un")
+            assert r.rc == 0 and r.stdout == "alice\n", f"{client.program}: {r.describe()}"
+        # 1.0's policy still restricts: no shell, no other program...
+        r = upgraded.run("server2", "sh", "-c", "true")
+        assert r.rc == 126 and "may not execute `sh`" in r.stderr, r.describe()
+        # ... and argv[0] is now compared whole, so a path no longer passes.
+        r = upgraded.run("server2", "/usr/bin/id")
+        assert r.rc == 126 and "may not execute `/usr/bin/id`" in r.stderr, r.describe()
+        # A key 1.0 left under two names gets neither policy.
+        r = twice.run("server2", "true")
+        assert r.rc == 255, r.describe()
+        journal = fast_server.wait_journal(
+            re.escape(f"refusing duplicate authorizations for {twice.fingerprint}: {aliases[0]}, {aliases[1]}"), since
+        )
+        # Policies 1.0 wrote are accepted, each with a warning that names it.
+        for name in (modern.entry, veteran.entry):
+            assert legacy_warning(name) in journal, journal
+        listing = fast_server.admin("list")
+        assert listed(listing.stdout, modern.entry, modern.fingerprint, "$"), listing.stdout
+        assert listed(listing.stdout, veteran.entry, veteran.fingerprint, r"  \[no-shell commands=id\]$"), listing.stdout
+        for name in aliases:
+            assert listed(listing.stdout, name, twice.fingerprint, r"  \[CONFLICT"), listing.stdout
+        assert legacy_warning(veteran.entry) in listing.stderr, listing.stderr
+
+        # Binding a 1.0 policy to its key: running `authorize` again needs
+        # --force, and rewrites the policy from the options given.
+        cert = f"{fast_server.state_dir}/authorized/{veteran.entry}.crt"
+        rebind = ("authorize", cert, "--user", "alice", "--name", veteran.entry, *restricted)
+        again = fast_server.admin(*rebind, check=False)
+        assert again.rc != 0 and "pass --force" in again.stderr, again.describe()
+        fast_server.admin(*rebind, "--force")
+        policy = node.read(f"{fast_server.state_dir}/authorized/{veteran.entry}.toml").decode()
+        assert f'key_fingerprint = "{veteran.fingerprint}"' in policy, policy
+        time.sleep(RELOAD_SETTLE)
+        assert legacy_warning(veteran.entry) not in fast_server.admin("list").stderr
+        r = upgraded.run("server2", "id", "-un")
+        assert r.rc == 0 and r.stdout == "alice\n", r.describe()
+        r = upgraded.run("server2", "sh", "-c", "true")
+        assert r.rc == 126 and "may not execute `sh`" in r.stderr, r.describe()
+
+
+@pytest.mark.plan("OPS-14")
+@pytest.mark.xfail(
+    strict=True,
+    raises=Unmet,
+    reason="FXX-OPS-14: under the unit 1.0 shipped (ProtectSystem=full) the upgraded server "
+    "cannot open /etc/qsh/authorized.lock for writing and never starts",
+)
+def test_an_upgrade_keeps_serving_under_the_unit_1_0_shipped(make_client, fast_server):
+    """The same upgrade on a host that kept the unit file 1.0 shipped.
+
+    Replacing the binary is what a package or `cargo install` does; the unit
+    file installed from 1.0's contrib/qsh-server.service stays. It has
+    `ProtectSystem=full`, which makes /etc read-only for the daemon, and 1.0
+    never writes there while serving. The upgraded server must start and
+    serve the same keys.
+    """
+    with set_up_by_previous_release(fast_server, unit_file=PREVIOUS_UNIT_FILE):
+        host_key = fast_server.keygen()
+        client = make_client("alice", pin=False)
+        fast_server.authorize(client.cert(), user="alice", name=client.entry, settle=False)
+        client.pin("server2", host_key)
+        fast_server.start()
+        assert client.run("server2", "true").rc == 0, "1.0 does not serve under its own unit"
+        replace_binary(fast_server.node, f"{SAVED}/qsh-server")
+        since = fast_server.cursor()
+        fast_server.node.run(["systemctl", "restart", fast_server.unit], check=True)
+        try:
+            fast_server.wait_listening(timeout=15)
+        except AssertionError as exc:
+            raise Unmet(f"the upgraded server never listened:\n{fast_server.journal(since)[-3000:]}") from exc
+        r = client.run("server2", "true")
+        if r.rc != 0:
+            raise Unmet(r.describe())
+
