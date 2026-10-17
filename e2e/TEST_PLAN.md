@@ -734,7 +734,7 @@ that fixed each one carries its ID.
 
 | ID | Severity | Finding | Scenario | Status |
 |---|---|---|---|---|
-| F1 | P0 | Output still in flight when the remote command exits was abandoned after 2 s + 2 s: truncated output and status 255 on slow or briefly interrupted paths | XFER-11, NET-04–06 | open |
+| F1 | P0 | Output still in flight when the remote command exits was abandoned after 2 s + 2 s: truncated output and status 255 on slow or briefly interrupted paths | XFER-11, NET-04–06 | fixed |
 | F2 | P1 | After a NAT rebinding or address change a quiet client sends nothing until its 15 s keep-alive, so the session stalls that long | NET-04–06 | open, see below |
 | F3 | P2 | `qsh host cmd \| head` printed "Broken pipe" and exited 255 | EXEC-15 | open |
 | F4 | P2 | An oversized request failed with the encoder's "serialize buffer is full" | EXEC-17 | open |

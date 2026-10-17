@@ -1248,19 +1248,45 @@ async fn run_session(
         }
     }
 
-    let _ = tokio::time::timeout(SHUTDOWN_GRACE, tx.send(Frame::Exit(exit))).await;
-    drop(tx);
-
     // The writer finishes the stream itself once the channel closes. If it is
     // still stuck on a peer that is not reading, cancel it and wait for that
     // to take effect: dropping the handle would detach a task that still owns
     // the stream, and quinn treats a dropped `SendStream` as a graceful finish
     // that goes on retransmitting. `SessionStream` resets it on the way out
     // instead, which is the honest ending for a session nobody is listening to.
-    if tokio::time::timeout(SHUTDOWN_GRACE, &mut writer)
-        .await
-        .is_err()
-    {
+    let delivered = if matches!(drained, Drained::Fully) {
+        // Every byte the job wrote has been read; what remains is putting it
+        // on the wire, and the frame queue and QUIC's send buffer can hold
+        // megabytes that a slow or briefly interrupted path takes far longer
+        // than any fixed grace to carry. Cutting that short is the truncation
+        // `drain` refuses for pipes, so wait as long as the connection lives
+        // and the key may still use it; the idle timeout decides when the
+        // peer is gone.
+        let delivery = async {
+            let _ = tx.send(Frame::Exit(exit)).await;
+            drop(tx);
+            let _ = (&mut writer).await;
+        };
+        tokio::pin!(delivery);
+        loop {
+            tokio::select! {
+                () = &mut delivery => break true,
+                _ = conn.closed() => break false,
+                _ = policy_tick.tick() => {
+                    if !request_still_authorized(&authorization) {
+                        break false;
+                    }
+                }
+            }
+        }
+    } else {
+        let _ = tokio::time::timeout(SHUTDOWN_GRACE, tx.send(Frame::Exit(exit))).await;
+        drop(tx);
+        tokio::time::timeout(SHUTDOWN_GRACE, &mut writer)
+            .await
+            .is_ok()
+    };
+    if !delivered {
         writer.stop().await;
     }
     Ok(())
