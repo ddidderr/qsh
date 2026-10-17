@@ -371,8 +371,26 @@ fails until the mark is removed, so a fix cannot go unnoticed.
 - **Expected:** with an IPv6 network and the server on `[::]:2222`, `-6` connects.
 
 ### NET-13 — Handshakes over a very lossy link vs the 5 s handshake deadline
-- **Status:** planned · **Priority:** P2 · **Needs:** netsim
-- **Expected:** document the loss level up to which a handshake reliably completes and the message when it does not.
+- **Status:** automated · **Priority:** P2 · **Needs:** netsim
+- **Why:** the server gives a handshake 5 s from the first Initial that passed its Retry check (`HANDSHAKE_GRACE` in `src/server.rs`; README: "a handshake has 5 seconds to finish"), the client 10 s from its first datagram (`--connect-timeout`, default 10). A lost flight costs a retransmission timeout that starts near 1 s and doubles. The client finishes its side of the handshake one flight before the server does.
+- **Measured:** pinned logins (`qsh netsim echo …`, so handshake, command and exit) over 50 ms each way with independent loss in each direction, a link with its own `--seed` per attempt, default timeouts:
+
+  | Loss each way | Logins | Median, slowest | Failures |
+  |---|---|---|---|
+  | 10% | 50/50 | 0.8 s, 4.8 s | — |
+  | 15% | 40/40 | 1.3 s, 4.0 s | — |
+  | 20% | 50/50 | 1.8 s, 12.2 s | — |
+  | 30% | 9/10 | 4.1 s, 25.6 s | 1 (c) |
+  | 40% | 6/10 | 4.3 s, 7.4 s | 3 (a), 1 (c) |
+  | 50% | 5/10 | 6.9 s, 19.5 s | 4 (a), 1 (c) |
+  | 60% | 2/10 | 6.7 s, 11.5 s | 6 (a), 1 (b), 1 (d) after 61 s |
+  | 70% | 0/10 | — | 7 (a), 1 (d) after 61 s, 2 still running at 90 s |
+  | 80% | 0/10 | — | 9 (a), 1 (b) after 6.3 s |
+  | 90% | 0/10 | — | 10 (a) |
+
+  (a) `connecting to netsim (ADDR) timed out after 10s`: the client's deadline. (b) `cannot connect to netsim (ADDR): aborted by peer: the application or application protocol caused the connection to be closed during the handshake`: the server's 5 s deadline dropped the handshake (quinn closes a dropped connection with application error 0) and the close got through. (c) the same text after `connection lost:`, when the client had already finished its side and sent its request. (d) `connection lost: timed out` at the client's 60 s idle timeout: as (c), with the close lost too. From 60% on, a login whose handshake did complete can crawl for minutes, because any datagram that gets through restarts the idle timer: a rerun of one 70% attempt that outlived 90 s ended after 225 s, and the server had logged the login.
+- **Steps:** (1) 10% loss each way and 50 ms each way, seeds 1 to 8; (2) 90% loss, seed 1; (3) two paths on which every handshake outlives the server's deadline, without randomness: "slow", 3 s each way with `--connect-timeout 20` (the client's Finished arrives 6 s after the deadline started), and "big", which drops datagrams over 1,150 bytes towards the client only (the server's padded first flight never arrives, its short close does).
+- **Expected:** (1) all eight log in (measured 0.7 to 4.6 s each over two runs: a seed fixes the loss pattern, not the timers). (2) status 255 with `timed out after 10s` within 15 s (measured 10.1 s). (3) status 255, no output, no `authenticated as` line on the server, within 25 s (measured: "big" 5.1 s, "slow" 17.3 s). A path with a round trip of 5 s or more cannot log in at all (measured: 4 s logs in, 6 s never does). The message should say that the server ended a handshake that took too long; today it is quinn's generic text, (b) or (c). Found FXX-NET-13.
 
 ### NET-14 — Outage tolerance with the default timeouts
 - **Status:** automated · **Priority:** P1 · **Needs:** netsim (marked `slow`)

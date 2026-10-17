@@ -186,6 +186,102 @@ def test_a_dead_first_address_falls_back_to_a_live_one(alice, server, env):
         alice.node.edit_hosts(remove="multihomed")
 
 
+# The server gives a handshake 5 s from the first Initial that passed its
+# address check (HANDSHAKE_GRACE in src/server.rs, after the Retry round trip),
+# the client 10 s from its first datagram (--connect-timeout). Lost datagrams
+# cost a handshake time through QUIC's retransmission timer, which starts near
+# 1 s and doubles. TEST_PLAN.md has the measured success rates.
+LOSSY_DELAY_MS = 50
+CONNECT_TIMEOUT = 10  # the client's default
+
+
+def timed_login(client, link, *options):
+    begin = time.monotonic()
+    r = client.run("netsim", "echo", "LOGIN-OK", port=link.port, options=options, timeout=120)
+    return r, time.monotonic() - begin
+
+
+@pytest.mark.plan("NET-13")
+def test_handshakes_complete_over_a_lossy_link(alice, server, make_link):
+    """10% loss each way and 50 ms each way: every one of eight logins completes.
+
+    Each login has a link of its own with its own seed, so a failure names a
+    reproducible loss pattern.
+    """
+    times = []
+    for seed in range(1, 9):
+        link = make_link("server:2222", seed=seed, loss=0.1, delay_ms=LOSSY_DELAY_MS)
+        alice.pin(link.host, server.fp, port=link.port)
+        r, took = timed_login(alice, link)
+        assert r.rc == 0 and r.stdout == "LOGIN-OK\n", f"seed {seed}: {r.describe()}"
+        times.append(round(took, 1))
+    print(f"logins took {times} s")
+
+
+@pytest.mark.plan("NET-13")
+def test_a_hopeless_link_fails_within_the_connect_timeout(alice, server, make_link):
+    """90% loss each way: no handshake, and qsh says so when its timeout expires."""
+    link = make_link("server:2222", seed=1, loss=0.9, delay_ms=LOSSY_DELAY_MS)
+    alice.pin(link.host, server.fp, port=link.port)
+    r, took = timed_login(alice, link)
+    print(f"status {r.rc} after {took:.1f}s: {r.stderr.strip()}")
+    assert r.rc == 255, r.describe()
+    assert f"timed out after {CONNECT_TIMEOUT}s" in r.stderr, r.describe()
+    assert took < CONNECT_TIMEOUT + 5, f"took {took:.1f}s"
+
+
+# Two paths on which every handshake outlives the server's 5 s deadline, with
+# no randomness. "slow": 3 s each way, so the client's Finished reaches the
+# server 6 s after the deadline started; the client, done with its side of the
+# handshake at 12 s, has already sent its request when the server's close
+# arrives. "big": the path drops datagrams over 1,150 bytes towards the client
+# only, so the server's padded first flight never arrives but its short close
+# does, after 5 s.
+DEADLINE_PATHS = {
+    "slow": ({"delay_ms": 3000}, ("--connect-timeout", "20")),
+    "big": ({"max_datagram_down": 1150}, ()),
+}
+
+
+def login_past_the_deadline(path, alice, server, make_link):
+    impairment, options = DEADLINE_PATHS[path]
+    link = make_link("server:2222", **impairment)
+    alice.pin(link.host, server.fp, port=link.port)
+    since = server.cursor()
+    r, took = timed_login(alice, link, *options)
+    print(f"{path}: status {r.rc} after {took:.1f}s: {r.stderr.strip()}")
+    return r, took, server.journal(since)
+
+
+@pytest.mark.plan("NET-13")
+@pytest.mark.parametrize("path", sorted(DEADLINE_PATHS))
+def test_a_handshake_past_the_server_deadline_fails(path, alice, server, make_link):
+    r, took, journal = login_past_the_deadline(path, alice, server, make_link)
+    assert r.rc == 255, r.describe()
+    assert "LOGIN-OK" not in r.stdout
+    assert took < 25, f"took {took:.1f}s"
+    assert "authenticated as" not in journal, journal
+
+
+@pytest.mark.plan("NET-13")
+@pytest.mark.parametrize("path", sorted(DEADLINE_PATHS))
+@pytest.mark.xfail(strict=True, reason="FXX-NET-13: the server's handshake deadline is reported as quinn's generic application close")
+def test_a_handshake_past_the_server_deadline_is_named(path, alice, server, make_link):
+    """The user learns that the server ended a handshake that took too long.
+
+    Today the client prints quinn's text for a peer's application close during
+    the handshake ("the application or application protocol caused the
+    connection to be closed during the handshake"), prefixed with "connection
+    lost" when the client had finished its side: it reads like a refusal or a
+    dropped session, not like a path too slow for the 5 s deadline.
+    """
+    r, _, _ = login_past_the_deadline(path, alice, server, make_link)
+    assert r.rc == 255, r.describe()
+    assert "the application or application protocol" not in r.stderr, r.describe()
+    assert "connection lost" not in r.stderr, r.describe()
+    assert "handshake" in r.stderr, r.describe()
+
+
 @pytest.mark.plan("NET-14")
 @pytest.mark.slow
 def test_outage_tolerance_with_the_default_timeouts(alice, server, make_link):
