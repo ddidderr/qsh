@@ -598,58 +598,58 @@ commit that fixed it.
 ## SEC — threat-model boundaries
 
 ### SEC-01 — An impostor under a pinned name is refused
-- **Status:** planned · **Priority:** P0 · **Needs:** server2
+- **Status:** automated · **Priority:** P0 · **Needs:** server2
 - **Actor:** 2, on-path attacker.
 - **Steps:** pin `bank` to the real server, then point `bank` at server2.
 - **Expected:** status 255 naming both fingerprints; the pin is unchanged. server2 has the victim's key authorized, yet logs no login: the client refused before presenting its identity. Found F9.
 
 ### SEC-02 — First contact asks, and "no" pins nothing
-- **Status:** planned · **Priority:** P0 · **Needs:** pty
+- **Status:** automated · **Priority:** P0 · **Needs:** pty
 - **Expected:** the prompt shows the fingerprint; "no" exits 255 with nothing pinned; "yes" pins and connects; the next connection does not ask.
 
 ### SEC-03 — First-contact policies without a terminal
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Expected:** `--refuse-new` and `StrictHostKeyChecking=yes` refuse and pin nothing; `--accept-new` and `StrictHostKeyChecking=accept-new` pin and connect.
 
 ### SEC-04 — Local users on the server cannot reach its secrets
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Actor:** 4, local user on the server host.
 - **Expected:** bob cannot read `server.key`, cannot write `authorized/`, cannot open the lock file (0600 root).
 
 ### SEC-05 — Local users on the client cannot reach alice's identity
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Actor:** 5, local user on the client host.
 - **Expected:** `id.key` is 0600; bob can neither read it nor append to alice's `known_hosts`.
 
 ### SEC-06 — A readable private key is refused
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** with `id.key` 0640, qsh exits 255 naming the file.
 
 ### SEC-07 — A root daemon's session keeps no privilege
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Actor:** 3, authenticated client.
 - **Expected:** real, effective, saved and filesystem UID and GID all alice's; groups alice and project; inheritable, permitted, effective and ambient capabilities empty.
 
 ### SEC-08 — A session inherits only its standard streams
-- **Status:** planned · **Priority:** P0 · **Needs:** —
+- **Status:** automated · **Priority:** P0 · **Needs:** —
 - **Expected:** with and without `-t`, the remote process has descriptors 0, 1, 2 only.
 
 ### SEC-09 — A session's terminal belongs to its user alone
-- **Status:** planned · **Priority:** P1 · **Needs:** pty
+- **Status:** automated · **Priority:** P1 · **Needs:** pty
 - **Expected:** the PTY is alice:tty 0620 as sshd leaves it; alice can open it by name (screen, pinentry, `write`); bob cannot write to it. Found F7.
 
 ### SEC-10 — Unauthenticated noise does not disturb service
-- **Status:** planned · **Priority:** P0 · **Needs:** two-clients
+- **Status:** automated · **Priority:** P0 · **Needs:** two-clients
 - **Actor:** 1, unauthenticated network peer.
 - **Steps:** 3,000 junk datagrams and 20 concurrent unauthorized handshakes from client2.
 - **Expected:** alice is served within seconds meanwhile; every stranger gets 255; failures appear as a few summary lines, not one per attempt.
 
 ### SEC-11 — The first-contact answer is not case-sensitive
-- **Status:** planned · **Priority:** P2 · **Needs:** pty
+- **Status:** automated · **Priority:** P2 · **Needs:** pty
 - **Expected:** `YES`, `Yes` and `y` accept the key, as ssh accepts any case. Found F17.
 
 ### SEC-12 — Capabilities added to the unit never reach sessions
-- **Status:** planned · **Priority:** P1 · **Needs:** server2
+- **Status:** automated · **Priority:** P1 · **Needs:** server2
 - **Steps:** a unit drop-in with `AmbientCapabilities=CAP_NET_RAW CAP_SYS_ADMIN`; check that the daemon really has them.
 - **Expected:** sessions start and have no inheritable, permitted, effective or ambient capabilities (THREAT_MODEL actor 3).
 
