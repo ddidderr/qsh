@@ -45,6 +45,12 @@ Expected behaviour cites the README, `THREAT_MODEL.md` or the code. When a
 scenario found a bug, the [findings log](#findings-log) records it and the
 commit that fixed it.
 
+A scenario whose expected behaviour qsh does not meet yet is still
+`automated`: its test asserts the expected behaviour and is marked
+`@pytest.mark.xfail(strict=True, reason="F<n>: …")`, naming the open
+finding. It reports as an expected failure until the fix lands, and then
+fails until the mark is removed, so a fix cannot go unnoticed.
+
 ## Areas
 
 | Area | What it covers | Scenarios |

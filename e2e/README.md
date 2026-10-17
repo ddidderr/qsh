@@ -52,6 +52,11 @@ set, `e2e/run build` builds with the host's network so a proxy on
 during the build only. The test containers themselves never need the
 internet.
 
+A proxy that refuses Debian's mirrors can still build the suite on another
+apt-based release: `QSH_E2E_BASE_IMAGE=ubuntu:26.04 e2e/run build`. The
+binaries are still compiled on Debian, so the base needs the same or a newer
+glibc. CI and the scenarios' expectations assume the pinned Debian.
+
 ## The environment
 
 ```

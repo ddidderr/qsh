@@ -15,6 +15,9 @@
 #   QSH_E2E_SKIP_BUILD=1   test the image as it is
 #   QSH_E2E_CA_BUNDLE  extra CA certificate for builds behind a TLS-intercepting
 #                      proxy (default: $SSL_CERT_FILE when a proxy is set)
+#   QSH_E2E_BASE_IMAGE another apt-based base for the nodes, for build hosts
+#                      that cannot reach Debian's mirrors (default: the
+#                      Dockerfile's pinned Debian)
 set -euo pipefail
 
 E2E_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -34,6 +37,9 @@ build() {
     need docker "install Docker (with the buildx/BuildKit and compose plugins)"
     local args=(build -f "$E2E_DIR/docker/Dockerfile" -t "$IMAGE"
         --build-arg "PROFILE=${QSH_E2E_PROFILE:-release}")
+    if [ -n "${QSH_E2E_BASE_IMAGE:-}" ]; then
+        args+=(--build-arg "BASE_IMAGE=$QSH_E2E_BASE_IMAGE")
+    fi
     # A proxy on the build host is only reachable from the build container
     # through the host's network namespace.
     local proxy=${https_proxy:-${HTTPS_PROXY:-}}

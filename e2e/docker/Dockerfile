@@ -43,7 +43,7 @@ FROM ${BASE_IMAGE} AS node
 RUN --mount=type=secret,id=extra_ca,required=false,mode=0444 \
     set -eu; \
     if [ -n "${https_proxy:-}" ]; then \
-        sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources; \
+        sed -i 's|http://|https://|g' /etc/apt/sources.list.d/*.sources; \
         printf 'Acquire::https::Proxy "%s";\n' "$https_proxy" > /etc/apt/apt.conf.d/90e2e-proxy; \
         if [ -s /run/secrets/extra_ca ]; then \
             printf 'Acquire::https::CAInfo "/run/secrets/extra_ca";\n' >> /etc/apt/apt.conf.d/90e2e-proxy; \
