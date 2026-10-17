@@ -192,7 +192,13 @@ fn encode_control<T: Serialize>(value: &T, limit: usize) -> io::Result<Vec<u8>> 
     // causing an unbounded temporary allocation before write_frame rejects it.
     let mut buffer = vec![0; limit];
     let length = postcard::to_slice(value, &mut buffer)
-        .map_err(|error| invalid(error.to_string()))?
+        .map_err(|error| match error {
+            // The buffer is exactly the limit; say which limit was hit.
+            postcard::Error::SerializeBufferFull => {
+                invalid(format!("encoded payload exceeds limit {limit}"))
+            }
+            other => invalid(other.to_string()),
+        })?
         .len();
     buffer.truncate(length);
     Ok(buffer)

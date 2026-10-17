@@ -221,9 +221,16 @@ async fn aggregate_request_budget_is_enforced_on_read_and_write() {
         .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     let mut outgoing = Vec::new();
-    assert!(write_frame(&mut outgoing, &Frame::Request(req))
+    let error = write_frame(&mut outgoing, &Frame::Request(req))
         .await
-        .is_err());
+        .unwrap_err();
+    // The sender's refusal names the limit, not the encoder's buffer.
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("exceeds limit {MAX_REQUEST}")),
+        "{error}"
+    );
     assert!(outgoing.is_empty());
 }
 
