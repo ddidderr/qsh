@@ -501,7 +501,10 @@ fn accept_new_host(host_key: &str, fp: Fingerprint, opts: &Options) -> Result<bo
     tty.flush()?;
     let mut answer = String::new();
     std::io::BufRead::read_line(&mut std::io::BufReader::new(&tty), &mut answer)?;
-    Ok(matches!(answer.trim(), "yes" | "y"))
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "yes" | "y"
+    ))
 }
 
 /// Should this session allocate a remote terminal?
