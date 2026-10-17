@@ -666,24 +666,24 @@ commit that fixed it.
 ## LOAD — concurrency and budgets
 
 ### LOAD-01 — Concurrent sessions from two machines
-- **Status:** planned · **Priority:** P0 · **Needs:** two-clients
+- **Status:** automated · **Priority:** P0 · **Needs:** two-clients
 - **Expected:** 16 simultaneous 4 MiB round trips all succeed byte for byte.
 
 ### LOAD-02 — One key is capped and other keys keep working
-- **Status:** planned · **Priority:** P0 · **Needs:** two-clients
+- **Status:** automated · **Priority:** P0 · **Needs:** two-clients
 - **Steps:** 40 simultaneous connections on one key.
 - **Expected:** exactly 32 run; the server closes the other 8 with "key connection limit reached" once they authenticate, and they exit 255; bob is served promptly meanwhile.
 
 ### LOAD-03 — Hundreds of short sessions leak nothing
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Expected:** after 300 sessions the daemon's descriptor count is within 4 of where it started; no zombies.
 
 ### LOAD-04 — A long transfer survives alongside churn
-- **Status:** planned · **Priority:** P1 · **Needs:** two-clients
+- **Status:** automated · **Priority:** P1 · **Needs:** two-clients
 - **Expected:** a 256 MiB upload completes while bob opens and closes 50 sessions.
 
 ### LOAD-05 — The global session budget (128) across five keys
-- **Status:** planned · **Priority:** P1 · **Needs:** —
+- **Status:** automated · **Priority:** P1 · **Needs:** —
 - **Steps:** 26 sessions on each of five keys, launched slightly staggered so the per-source handshake cap does not interfere.
 - **Expected:** exactly 128 sessions run; the other two are refused (status 255).
 
