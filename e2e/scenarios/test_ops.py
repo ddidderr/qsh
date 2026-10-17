@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import re
 import time
+from collections import Counter
 
 import pytest
 
 from conftest import FAST_IDLE_TIMEOUT
-from harness.qsh import PORT, QshServer, parse_fingerprint
+from harness.qsh import PORT, QshClient, QshServer, parse_fingerprint
 
 
 def stat(node, path: str) -> str:
@@ -278,4 +280,220 @@ def test_sighup_tells_clients_and_the_journal_like_a_stop(alice_fast, fast_serve
     finally:
         proc.kill()
         alice_fast.node.kill_command("alice", argv)
+        bring_back(fast_server)
+
+
+# OPS-13 reaches into the daemon's log socket from outside: pidfd_getfd
+# (Linux 5.6) copies another process's descriptor, and the copy is the same
+# socket, so a send buffer set through it is the daemon's own. SO_SNDBUFFORCE
+# (32) goes past net.core.wmem_max, as systemd itself does for this socket.
+SOCKET_BUFFER = r"""
+import ctypes, os, socket, sys
+pid, fd = int(sys.argv[1]), int(sys.argv[2])
+libc = ctypes.CDLL(None, use_errno=True)
+copy = libc.syscall(438, os.pidfd_open(pid), fd, 0)  # SYS_pidfd_getfd
+if copy < 0:
+    raise OSError(ctypes.get_errno(), "pidfd_getfd")
+sock = socket.socket(fileno=copy)
+if len(sys.argv) > 3:
+    sock.setsockopt(socket.SOL_SOCKET, 32, int(sys.argv[3]))
+print(sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF))
+"""
+
+
+class JournalStall:
+    """systemd-journald stopped on a server, and qsh-server's log stream full.
+
+    systemd connects the daemon's stdout and stderr to journald through a
+    stream socket with an 8 MiB send buffer, which the kernel doubles. Each
+    line is two writes (the text, then the newline) of about 770 bytes of
+    socket memory each, so the buffer holds about 11,000 lines: filling it
+    with logins would take a couple of minutes, close to journald's 3-minute
+    watchdog. A stopped journald leaves that socket just as full whatever its
+    size, so the stall shrinks this one socket's buffer to 8 KiB, and a few
+    hundred lines then fill it and the daemon's 256-line queue behind it.
+    Leaving puts the buffer back and resumes journald, whatever happened.
+    Every step taken during a stall is bounded well inside the watchdog, so
+    that a qsh that does block fails the scenario before journald is killed.
+    """
+
+    def __init__(self, server: QshServer) -> None:
+        self.server = server
+        self.node = server.node
+
+    def __enter__(self) -> JournalStall:
+        node = self.node
+        self.pid = self.server.main_pid()
+        task = node.run(["sh", "-c", f"grep -lx qsh-diagnostics /proc/{self.pid}/task/*/comm"], check=True).stdout
+        self.writer = int(task.split("/")[4])
+        link = node.run(["readlink", f"/proc/{self.pid}/fd/2"], check=True).stdout.strip()
+        match = re.fullmatch(r"socket:\[(\d+)\]", link)
+        assert match, f"qsh-server's stderr is {link}, not journald's stream socket"
+        self.inode = match.group(1)
+        self.journald = node.run(["pidof", "systemd-journald"], check=True).stdout.strip()
+        node.run(["kill", "-STOP", self.journald], check=True)
+        try:
+            self.buffer = int(self._send_buffer().stdout)
+            self._send_buffer(4096)
+        except BaseException:
+            node.run(["kill", "-CONT", self.journald])
+            raise
+        return self
+
+    def __exit__(self, *exc) -> None:
+        try:
+            if self.node.exists(f"/proc/{self.pid}/task/{self.writer}"):
+                # The kernel doubles what it is given.
+                self._send_buffer(self.buffer // 2)
+        finally:
+            if self.node.run(["kill", "-CONT", self.journald]).rc != 0:
+                # journald's watchdog killed it and systemd started another.
+                # The daemon's stream died with the old one: give it a new
+                # one, or later scenarios find nothing in server2's journal.
+                self.server.restart()
+                raise AssertionError("journald stayed stopped past its 3-minute watchdog")
+
+    def _send_buffer(self, size: int | None = None):
+        argv = ["python3", "-c", SOCKET_BUFFER, str(self.pid), "2"]
+        return self.node.run([*argv, str(size)] if size else argv, check=True)
+
+    def writer_blocked(self) -> tuple[bool, str]:
+        """Whether the diagnostics writer is stuck writing to journald, and the evidence.
+
+        Asleep in a system call on descriptor 2, with the socket's queued
+        memory at its send buffer: a full stream, not an idle writer (which
+        waits on its queue, a futex).
+        """
+        task = f"/proc/{self.pid}/task/{self.writer}"
+        state = self.node.read(f"{task}/stat").decode().rsplit(")", 1)[1].split()[0]
+        syscall = self.node.read(f"{task}/syscall").decode().split()
+        wchan = self.node.read(f"{task}/wchan").decode()
+        sockets = self.node.run(["ss", "-xmH"], check=True).stdout
+        match = re.search(rf"\*\s+{self.inode}\s+\*\s+\d+.*?skmem:\(r\d+,rb\d+,t(\d+),tb(\d+)", sockets)
+        queued, limit = (int(n) for n in match.groups()) if match else (0, 0)
+        evidence = (
+            f"qsh-diagnostics thread {self.writer}: state {state}, syscall {' '.join(syscall[:2])}, "
+            f"wchan {wchan}; stderr socket {queued} of {limit} bytes queued"
+        )
+        return state == "S" and syscall[1:2] == ["0x2"] and limit > 0 and queued >= limit, evidence
+
+
+def login_burst(client: QshClient, host: str, rounds: int, parallel: int = 4) -> int:
+    """Log in 2 x `rounds` times in each of `parallel` loops; half the sessions are refused.
+
+    Every connection writes a login line before its session is judged, and
+    each refusal (the key is alice's, the request is for bob) adds a session
+    error under the 16-a-second peer budget. Returns how many connections
+    authenticated. Four loops, because one address may hold only four
+    handshakes at once. Bounded at a minute, which is ten times what it takes.
+    """
+    qsh = client.qsh_command
+    script = (
+        f"for j in $(seq {parallel}); do ( for i in $(seq {rounds}); do "
+        f"{qsh} {host} true >/dev/null 2>&1; echo $?; "
+        f"{qsh} -l bob {host} true >/dev/null 2>&1; echo $?; "
+        "done ) & done; wait"
+    )
+    # Plain bash, not `shell`: a refused session must not end its loop.
+    r = client.node.run(["bash", "-c", script], user=client.user, timeout=60, check=True)
+    codes = Counter(r.stdout.split())
+    assert set(codes) <= {"0", "126"}, f"sessions failed during the burst: {codes}"
+    return codes["0"] + codes["126"]
+
+
+@pytest.mark.plan("OPS-13")
+def test_a_stalled_journald_does_not_stop_serving_or_revocation(alice_fast, fast_server, make_client):
+    """journald stops reading; sessions and revocation carry on regardless.
+
+    THREAT_MODEL.md: "a blocked or failing stderr/journald must never block
+    serving". README: a bounded queue and a dedicated writer, so "a full log
+    pipe cannot block session handling or authorization reload". The writer
+    is shown stuck in write(2) before and after the checks, so they ran while
+    the log was blocked; afterwards, the lines the full queue dropped must be
+    counted.
+    """
+    node = fast_server.node
+    noisy = make_client("alice", authorize_as="alice", on=fast_server)
+    victim = make_client("alice", authorize_as="alice", on=fast_server)
+    since = fast_server.cursor()
+    marker = "7474.25"
+    with JournalStall(fast_server) as stall:
+        logins = login_burst(noisy, "server2", rounds=40)
+        blocked, evidence = stall.writer_blocked()
+        assert blocked, evidence
+        sessions = []
+        for i in range(3):
+            begin = time.monotonic()
+            r = alice_fast.run("server2", "echo", f"served-{i}", timeout=15)
+            sessions.append(time.monotonic() - begin)
+            assert r.rc == 0 and r.stdout.strip() == f"served-{i}", r.describe()
+            assert sessions[-1] < 5, f"a session took {sessions[-1]:.1f}s"
+        proc = victim.node.popen(victim.argv("server2", "sleep", marker), user="alice")
+        try:
+            node.wait_running(f"sleep {marker}", timeout=10)
+            begin = time.monotonic()
+            fast_server.revoke(victim.entry, settle=False)
+            _, err = proc.communicate(timeout=30)
+            took = time.monotonic() - begin
+        finally:
+            proc.kill()
+        assert proc.returncode == 255 and "withdrawn" in err.decode(), err.decode()
+        # AUTH-03's bound: "normally within two seconds", plus the revoke command and a margin.
+        assert took < 6, f"revocation took {took:.1f}s to reach a running session"
+        node.wait_gone(f"sleep {marker}", timeout=10)
+        assert victim.run("server2", "true").rc == 255
+        blocked, evidence = stall.writer_blocked()
+        assert blocked, f"the writer recovered before the checks were done: {evidence}"
+
+    # The writer catches up. Whatever the full queue turned away is reported
+    # as suppressed, in the once-a-second summary.
+    deadline = time.monotonic() + 20
+    while True:
+        journal = fast_server.journal(since)
+        seen = journal.count(f"(key `{noisy.entry}`)")
+        suppressed = sum(int(n) for n in re.findall(r"suppressed (\d+) diagnostic message", journal))
+        if seen and suppressed >= logins - seen:
+            break
+        assert time.monotonic() < deadline, f"{logins} logins, {seen} logged, {suppressed} counted:\n{journal[-3000:]}"
+        time.sleep(0.5)
+    print(
+        f"sessions {', '.join(f'{t:.2f}s' for t in sessions)}; revocation {took:.2f}s; "
+        f"{seen} of {logins} logins logged, {suppressed} lines counted as suppressed"
+    )
+    assert seen < logins, "nothing was dropped: the queue never filled"
+    # And the daemon's log stream works again.
+    since = fast_server.cursor()
+    assert alice_fast.run("server2", "true").rc == 0
+    fast_server.wait_journal(r"authenticated as `alice` \(key `alice-client1`\)", since)
+
+
+@pytest.mark.plan("OPS-13")
+@pytest.mark.xfail(strict=True, reason="FXX-OPS-13: the shutdown line waits on the blocked log writer, so a restart hangs")
+def test_a_restart_during_a_journald_stall_is_not_held_up(alice_fast, fast_server, make_client):
+    """A restart while journald is stalled must still restart.
+
+    The writer thread holds Rust's stderr lock while it is blocked in
+    write(2). On SIGTERM the daemon prints "shutting down" with `eprintln!`
+    on the runtime's main thread (`serve` in src/bin/qsh-server.rs) before
+    it closes the endpoint, and waits for that lock: no close is sent, the
+    accept loop stops, and the unit sits in `deactivating (stop-sigterm)`
+    until journald recovers or systemd's 90 s stop timeout kills it. Serving
+    is blocked for that long. Proposed: log the line through the diagnostics
+    queue, or after the close.
+    """
+    noisy = make_client("alice", authorize_as="alice", on=fast_server)
+    try:
+        with JournalStall(fast_server) as stall:
+            login_burst(noisy, "server2", rounds=40)
+            blocked, evidence = stall.writer_blocked()
+            assert blocked, evidence
+            begin = time.monotonic()
+            r = fast_server.node.run(["systemctl", "restart", fast_server.unit], timeout=15)
+            took = time.monotonic() - begin
+            assert r.rc == 0 and took < 10, f"`systemctl restart` exited {r.rc} after {took:.1f}s"
+            fast_server.wait_listening()
+            r = alice_fast.run("server2", "echo", "restarted", timeout=15)
+            assert r.rc == 0 and r.stdout.strip() == "restarted", r.describe()
+    finally:
+        # A restart cut short by the timeout carries on once journald runs again.
         bring_back(fast_server)
