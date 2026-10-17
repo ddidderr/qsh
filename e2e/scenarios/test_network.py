@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import re
 import shlex
 import subprocess
 import time
@@ -15,6 +16,7 @@ import time
 import pytest
 
 from conftest import FAST_IDLE_TIMEOUT
+from harness.qsh import NetLink
 
 
 def ticker(count: int, interval: float = 0.25) -> tuple[str, ...]:
@@ -213,7 +215,8 @@ def test_handshakes_complete_over_a_lossy_link(alice, server, make_link):
     """10% loss each way and 50 ms each way: every one of eight logins completes.
 
     Each login has a link of its own with its own seed, so a failure names a
-    reproducible loss pattern.
+    seed to retry with. A seed fixes netsim's random draws, not which
+    datagrams they fall on: that depends on quinn's timers.
     """
     times = []
     for seed in range(1, 9):
@@ -243,50 +246,78 @@ def test_a_hopeless_link_fails_within_the_connect_timeout(alice, server, make_li
 # handshake at 12 s, has already sent its request when the server's close
 # arrives. "big": the path drops datagrams over 1,150 bytes towards the client
 # only, so the server's padded first flight never arrives but its short close
-# does, after 5 s.
+# does, 5 s after the Retry round trip. On "big" the client's own 10 s timer
+# would end the login too, so it must have failed well before that timer: a
+# server without its deadline still fails a "big" login, at 10 s.
 DEADLINE_PATHS = {
-    "slow": ({"delay_ms": 3000}, ("--connect-timeout", "20")),
-    "big": ({"max_datagram_down": 1150}, ()),
+    # impairment, client options, the most seconds the failure may take
+    "slow": ({"delay_ms": 3000}, ("--connect-timeout", "20"), 25),
+    "big": ({"max_datagram_down": 1150}, (), CONNECT_TIMEOUT - 2),
 }
 
 
-def login_past_the_deadline(path, alice, server, make_link):
-    impairment, options = DEADLINE_PATHS[path]
-    link = make_link("server:2222", **impairment)
-    alice.pin(link.host, server.fp, port=link.port)
-    since = server.cursor()
-    r, took = timed_login(alice, link, *options)
-    print(f"{path}: status {r.rc} after {took:.1f}s: {r.stderr.strip()}")
-    return r, took, server.journal(since)
+@pytest.fixture(scope="module")
+def deadline_logins(env, alice, server):
+    """A login over each DEADLINE_PATHS path, made once for the tests that judge it.
+
+    Nothing random decides how one ends, and they take 5 and 17 s, so the
+    pinned test and the xfail test share them.
+    """
+    links, done = [], {}
+
+    def login(path):
+        if path not in done:
+            impairment, options, _ = DEADLINE_PATHS[path]
+            link = NetLink(env.node("netsim"), "server:2222", **impairment)
+            links.append(link)
+            alice.pin(link.host, server.fp, port=link.port)
+            since = server.cursor()
+            r, took = timed_login(alice, link, *options)
+            print(f"{path}: status {r.rc} after {took:.1f}s: {r.stderr.strip()}")
+            done[path] = (r, took, server.journal(since))
+        return done[path]
+
+    yield login
+    for link in links:
+        link.close()
 
 
 @pytest.mark.plan("NET-13")
 @pytest.mark.parametrize("path", sorted(DEADLINE_PATHS))
-def test_a_handshake_past_the_server_deadline_fails(path, alice, server, make_link):
-    r, took, journal = login_past_the_deadline(path, alice, server, make_link)
+def test_a_handshake_past_the_server_deadline_fails(path, deadline_logins):
+    """The server's 5 s handshake deadline ends a handshake that is too slow.
+
+    HANDSHAKE_GRACE in src/server.rs keeps a half-open attempt from holding
+    an admission slot: the login fails, nothing runs, nobody is logged in,
+    and it ends at the server's deadline, not at the client's.
+    """
+    r, took, journal = deadline_logins(path)
+    limit = DEADLINE_PATHS[path][2]
     assert r.rc == 255, r.describe()
-    assert "LOGIN-OK" not in r.stdout
-    assert took < 25, f"took {took:.1f}s"
+    assert r.stdout == "", r.describe()
+    assert took < limit, f"took {took:.1f}s, more than {limit}s"
+    assert not re.search(r"timed out after \d+s", r.stderr), r.describe()
     assert "authenticated as" not in journal, journal
 
 
 @pytest.mark.plan("NET-13")
 @pytest.mark.parametrize("path", sorted(DEADLINE_PATHS))
 @pytest.mark.xfail(strict=True, reason="FXX-NET-13: the server's handshake deadline is reported as quinn's generic application close")
-def test_a_handshake_past_the_server_deadline_is_named(path, alice, server, make_link):
+def test_a_handshake_past_the_server_deadline_is_named(path, deadline_logins):
     """The user learns that the server ended a handshake that took too long.
 
     Today the client prints quinn's text for a peer's application close during
     the handshake ("the application or application protocol caused the
     connection to be closed during the handshake"), prefixed with "connection
     lost" when the client had finished its side: it reads like a refusal or a
-    dropped session, not like a path too slow for the 5 s deadline.
+    dropped session, not like a path too slow for the 5 s deadline. quinn's
+    text may stay, as long as qsh says what ended the login; a session that
+    never started was not lost.
     """
-    r, _, _ = login_past_the_deadline(path, alice, server, make_link)
+    r, _, _ = deadline_logins(path)
     assert r.rc == 255, r.describe()
-    assert "the application or application protocol" not in r.stderr, r.describe()
+    assert re.search(r"\b5 ?s(econds)?\b|deadline|too (slow|long)", r.stderr), r.describe()
     assert "connection lost" not in r.stderr, r.describe()
-    assert "handshake" in r.stderr, r.describe()
 
 
 @pytest.mark.plan("NET-14")
@@ -385,10 +416,6 @@ SHRUNK_DATAGRAM = 1252
 SEQ_COUNT = 4_000_000  # `seq 1 4000000` writes 30.9 MB
 
 
-def seq_digest(count: int) -> str:
-    return hashlib.sha256("".join(f"{i}\n" for i in range(1, count + 1)).encode()).hexdigest()
-
-
 @pytest.mark.plan("NET-17")
 @pytest.mark.parametrize("direction", ["down", "up"])
 def test_bulk_data_survives_a_path_mtu_drop(direction, alice, server, make_link):
@@ -428,7 +455,7 @@ def test_bulk_data_survives_a_path_mtu_drop(direction, alice, server, make_link)
     after = link.stats()["stats"][direction]
     print(f"{direction}: {moved['largest']}-byte datagrams before the drop, the rest took {took:.1f}s, {after}")
     assert proc.returncode == 0, err.decode()
-    assert out.decode().split()[0] == seq_digest(SEQ_COUNT)
+    assert out.decode().split()[0] == alice.shell(f"seq 1 {SEQ_COUNT} | sha256sum").stdout.split()[0]
     # Datagrams of the old size really were sent into the shrunken path.
     assert after["oversized"] > 0, after
 
@@ -464,7 +491,10 @@ def test_bulk_output_on_a_path_that_falls_below_the_minimum_ends_at_the_idle_tim
     """
     link = make_link("server2:2222")
     alice_fast.pin(link.host, fast_server.fp, port=link.port)
-    remote = alice_fast.argv("netsim", "seq", "1", "4848025", port=link.port)
+    # 450 MB, far more than the path carries before the cut: the output is
+    # still flowing when the path shrinks. The count doubles as the marker.
+    producer = "seq 1 48480250"
+    remote = alice_fast.argv("netsim", *producer.split(), port=link.port)
     proc = pipeline(alice_fast, f"{shlex.join(remote)} >/dev/null")
     try:
         deadline = time.monotonic() + 30
@@ -474,6 +504,7 @@ def test_bulk_output_on_a_path_that_falls_below_the_minimum_ends_at_the_idle_tim
             time.sleep(0.05)
         link.set(max_datagram=QUIC_MIN_DATAGRAM - 50)
         cut = time.monotonic()
+        assert proc.poll() is None, "the output ended before the path shrank"
         _, err = proc.communicate(timeout=FAST_IDLE_TIMEOUT + 30)
         gone = time.monotonic() - cut
     finally:
@@ -482,5 +513,5 @@ def test_bulk_output_on_a_path_that_falls_below_the_minimum_ends_at_the_idle_tim
     assert proc.returncode == 255, err.decode()
     assert "timed out" in err.decode(), err.decode()
     assert gone < FAST_IDLE_TIMEOUT + 10, f"the client took {gone:.1f}s to give up"
-    fast_server.node.wait_gone("seq 1 4848025", timeout=FAST_IDLE_TIMEOUT + 10)
+    fast_server.node.wait_gone(producer, timeout=FAST_IDLE_TIMEOUT + 10)
     print(f"client gone after {gone:.1f}s, remote job after {time.monotonic() - cut:.1f}s")
