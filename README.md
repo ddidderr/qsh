@@ -493,15 +493,16 @@ expect from a remote shell. As from a shell, a remote program that does not
 exist gives `127`, and one that cannot be executed, or that the key may not
 run, gives `126`.
 
-When a signal ends qsh, qsh restores the terminal and closes the connection
-first, so the server ends the remote command at once, and it exits with
-`128+n`. Without a terminal, INT and TERM (Ctrl-C, or a supervisor stopping
-qsh) go to the remote command instead, and its status becomes qsh's. A second
-INT or TERM before the command has ended ends qsh, so pressing Ctrl-C again
-gets you out even when the network has gone. The same signal again within
-0.2 s counts as the first: `timeout` sends its signal to qsh and to qsh's
-process group. Without a terminal, a signal that was ignored when qsh started
-stays ignored: `nohup qsh host cmd` survives a hangup.
+When a signal ends qsh once the session has started, qsh restores the
+terminal and closes the connection first, so the server ends the remote
+command at once, and it exits with `128+n`. Without a terminal, INT and TERM
+(Ctrl-C, or a supervisor stopping qsh) go to the remote command instead, and
+its status becomes qsh's. A second INT or TERM before the command has ended
+ends qsh, so pressing Ctrl-C again gets you out even when the network has
+gone. The same signal again within 0.2 s counts as the first: `timeout` sends
+its signal to qsh and to qsh's process group. Without a terminal, any other
+signal that was ignored when qsh started stays ignored: `nohup qsh host cmd`
+survives a hangup.
 
 ## Running under systemd
 

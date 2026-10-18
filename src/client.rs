@@ -933,8 +933,9 @@ impl FatalSignals {
     /// for a spawned task to be polled would leave a window with the terminal
     /// already in raw mode and nothing watching.
     ///
-    /// Without a terminal, a signal that was ignored when qsh started stays
-    /// ignored, so that `nohup qsh host cmd` survives the hangup.
+    /// Without a terminal, INT and TERM are caught to be relayed. Any other
+    /// signal that was ignored when qsh started stays ignored, so that
+    /// `nohup qsh host cmd` survives the hangup.
     fn install(terminal: bool) -> Result<Self> {
         let mut signals = Vec::new();
         for number in terminating_signals() {
@@ -1032,6 +1033,8 @@ async fn until_fatal(caught: &mut mpsc::Receiver<Caught>, tx: Outbound) -> Optio
 /// The signals whose default action ends qsh and that a handler can catch.
 /// Not the faults (SEGV, BUS, FPE, ILL) or TRAP: those come from qsh's own
 /// instructions, and a handler that returns would only run into them again.
+/// Nor Linux's STKFLT, which nothing sends and libc lacks on some
+/// architectures.
 fn terminating_signals() -> Vec<libc::c_int> {
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut signals = vec![
