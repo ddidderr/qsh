@@ -706,7 +706,7 @@ async fn pump(
             disconnected,
         ) => result,
     };
-    // From here on, a further signal exits at once.
+    // From here on, a further signal exits, once the close has had its time.
     drop(caught);
     tasks.shutdown().await;
     let _ = recv.stop(0u32.into());
@@ -975,6 +975,11 @@ impl FatalSignals {
         loop {
             let caught = self.recv().await;
             if session.send(caught).await.is_err() {
+                // `run` is closing the connection: a closed terminal window
+                // sends HUP and ends the input at once, and either can end the
+                // session. Exiting before the close has left would keep the
+                // remote command until the server's idle timeout.
+                tokio::time::sleep(CLOSE_GRACE).await;
                 if let Some((fd, saved)) = &terminal {
                     pty::restore_termios(*fd, saved);
                 }

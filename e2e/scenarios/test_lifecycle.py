@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
+import shlex
 import signal
+import subprocess
 import time
 from contextlib import contextmanager
 
@@ -274,6 +276,50 @@ def test_a_hangup_ends_qsh_and_its_job_at_once(alice_fast, fast_server, terminal
         assert wait(timeout=10) == 128 + signal.SIGHUP
         assert time.monotonic() - begin < 2, "qsh did not exit at once"
         fast_server.node.wait_gone(f"sleep {marker}", timeout=3)
+
+
+# A terminal window: an interactive bash in a pty, which runs the command it
+# is given and is closed once the test writes a line.
+TERMINAL_WINDOW = r"""
+import os, pty, sys
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp("bash", ["bash", "--norc", "--noprofile", "-i"])
+os.write(fd, sys.argv[1].encode() + b"\r")
+sys.stdin.readline()
+os.close(fd)
+os.waitpid(pid, 0)
+"""
+
+
+@pytest.mark.plan("LIFE-10")
+def test_closing_the_terminal_window_ends_the_remote_job_at_once(alice_fast, fast_server):
+    """The window qsh runs in is closed, five times.
+
+    qsh's input ends, bash passes the hangup on to it, and the kernel sends
+    another when bash, the session leader, exits. Whichever ends the session,
+    the close must leave before a later HUP ends qsh: when it did not, about
+    one window in four left its job running until the idle timeout.
+    """
+    for i in range(5):
+        marker = f"7575.{i}5"
+        argv = alice_fast.argv(fast_server.host, "sleep", marker, options=("-t",))
+        # With SIGHUP at its default, as a login shell leaves it (e2e/README.md).
+        window = ["env", "--default-signal=HUP", "python3", "-c", TERMINAL_WINDOW, shlex.join(argv)]
+        proc = alice_fast.node.popen(window, user="alice", stdin=subprocess.PIPE)
+        try:
+            fast_server.node.wait_running(f"sleep {marker}", timeout=15)
+            begin = time.monotonic()
+            proc.communicate(b"close\n", timeout=10)
+            # Well under server2's 8 s idle timeout: a close arrives at once.
+            fast_server.node.wait_gone(f"sleep {marker}", timeout=3)
+            print(f"window {i}: the job was gone {time.monotonic() - begin:.1f}s after it closed")
+            alice_fast.node.wait_gone(" ".join(argv), timeout=3)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            alice_fast.node.kill_command("alice", argv)
+            fast_server.node.run(["pkill", "-u", "alice", "-f", f"^sleep {marker}$"])
 
 
 @pytest.mark.plan("LIFE-10")
