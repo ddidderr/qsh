@@ -576,25 +576,26 @@ async fn session(conn: &quinn::Connection, opts: &Options) -> Result<i32> {
         None => bail!("server closed the session without a reply"),
     }
 
-    let raw = if use_pty && !opts.no_stdin && std::io::stdin().is_terminal() {
-        // Register the handlers *before* touching the terminal. `Drop` covers
-        // the ordinary paths, but a fatal signal does not unwind, and a signal
-        // arriving between changing the termios and the handler being ready
-        // would take the default action and leave the terminal raw — no echo,
-        // no line editing, and no obvious way back.
-        let signals = FatalSignals::install()?;
-        let guard = RawMode::enable(stdin_fd).context("switching the terminal to raw mode")?;
-        // Tokio installs a process-wide signal disposition that is not restored
-        // when a Signal stream is dropped. Keep this watcher for the process
-        // lifetime so an embedding process still terminates on a later signal.
-        tokio::spawn(signals.restore_on_fire(stdin_fd, guard.saved()));
-        Some(guard)
+    let terminal = use_pty && !opts.no_stdin && std::io::stdin().is_terminal();
+    // Register the handlers *before* touching the terminal. A signal
+    // arriving between changing the termios and the handler being ready
+    // would take the default action and leave the terminal raw — no echo,
+    // no line editing, and no obvious way back.
+    let signals = FatalSignals::install(terminal)?;
+    let raw = if terminal {
+        Some(RawMode::enable(stdin_fd).context("switching the terminal to raw mode")?)
     } else {
         None
     };
+    // Tokio installs a process-wide signal disposition that is not restored
+    // when a Signal stream is dropped. Keep this watcher for the process
+    // lifetime so an embedding process still terminates on a later signal.
+    let (to_session, caught) = mpsc::channel(1);
+    let saved = raw.as_ref().map(|guard| (stdin_fd, guard.saved()));
+    tokio::spawn(signals.watch(to_session, saved));
 
     let blocking = BlockingStdio::enable();
-    let result = pump(send, recv, sent_size, opts.no_stdin).await;
+    let result = pump(send, recv, sent_size, opts.no_stdin, caught).await;
     drop(raw);
     drop(blocking);
     result
@@ -655,11 +656,15 @@ type Outbound = mpsc::Sender<Frame>;
 ///
 /// A cancelled codec must never resume on a partially consumed stream. Local
 /// cancellation abandons the entire receive loop and shuts down every task.
+/// A signal that ends qsh ends the session here too, so that `run` still
+/// closes the connection and the server ends the remote command at once,
+/// not at its idle timeout.
 async fn pump(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     sent_size: Option<crate::proto::PtySize>,
     no_stdin: bool,
+    mut caught: mpsc::Receiver<Caught>,
 ) -> Result<i32> {
     let use_pty = sent_size.is_some();
     let (tx, mut rx) = mpsc::channel::<Frame>(64);
@@ -690,18 +695,19 @@ async fn pump(
     if let Some(sent) = sent_size {
         tasks.spawn(forward_winch(tx.clone(), sent));
     }
-    if !terminal_input {
-        tasks.spawn(forward_signals(tx.clone()));
-    }
-    drop(tx);
 
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
-    let result = until_disconnect(
-        receive_output(&mut recv, &mut stdout, &mut stderr),
-        disconnected,
-    )
-    .await;
+    let result = tokio::select! {
+        biased;
+        Some(status) = until_fatal(&mut caught, tx) => Ok(status),
+        result = until_disconnect(
+            receive_output(&mut recv, &mut stdout, &mut stderr),
+            disconnected,
+        ) => result,
+    };
+    // From here on, a further signal exits at once.
+    drop(caught);
     tasks.shutdown().await;
     let _ = recv.stop(0u32.into());
     result
@@ -908,35 +914,50 @@ impl EscapeState {
     }
 }
 
-/// The signals that would otherwise kill the client without unwinding.
+/// A caught signal: its number, and the name it is relayed under, if it is.
+type Caught = (libc::c_int, Option<&'static str>);
+
+/// The signals that would otherwise kill the client without unwinding: without
+/// closing the connection, so that the remote command runs on until the
+/// server's idle timeout, and in raw mode without restoring the terminal.
 ///
 /// `SIGINT` is among them: in raw mode Ctrl-C is a byte for the remote
 /// terminal, not a signal, so an INT can only come from outside (`kill -INT`,
-/// `timeout -s INT`, a supervisor), and its default action, like that of any
-/// other signal listed in `terminating_signals`, would leave the terminal raw.
-struct FatalSignals(Vec<(libc::c_int, tokio::signal::unix::Signal)>);
+/// `timeout -s INT`, a supervisor). Without a terminal, INT and TERM are
+/// relayed to the remote command instead.
+struct FatalSignals(Vec<(Caught, tokio::signal::unix::Signal)>);
 
 impl FatalSignals {
     /// Start listening. Registration happens here, synchronously, so that by
     /// the time this returns the disposition is already installed — waiting
     /// for a spawned task to be polled would leave a window with the terminal
     /// already in raw mode and nothing watching.
-    fn install() -> Result<Self> {
+    ///
+    /// Without a terminal, a signal that was ignored when qsh started stays
+    /// ignored, so that `nohup qsh host cmd` survives the hangup.
+    fn install(terminal: bool) -> Result<Self> {
         let mut signals = Vec::new();
         for number in terminating_signals() {
+            let relayed = match number {
+                _ if terminal => None,
+                libc::SIGINT => Some("INT"),
+                libc::SIGTERM => Some("TERM"),
+                _ if ignored(number) => continue,
+                _ => None,
+            };
             let kind = tokio::signal::unix::SignalKind::from_raw(number);
             let signal = tokio::signal::unix::signal(kind)
                 .with_context(|| format!("listening for signal {number}"))?;
-            signals.push((number, signal));
+            signals.push(((number, relayed), signal));
         }
         Ok(Self(signals))
     }
 
-    async fn recv(&mut self) -> libc::c_int {
+    async fn recv(&mut self) -> Caught {
         std::future::poll_fn(|cx| {
-            for (number, signal) in &mut self.0 {
+            for (caught, signal) in &mut self.0 {
                 if let std::task::Poll::Ready(Some(())) = signal.poll_recv(cx) {
-                    return std::task::Poll::Ready(*number);
+                    return std::task::Poll::Ready(*caught);
                 }
             }
             std::task::Poll::Pending
@@ -944,13 +965,38 @@ impl FatalSignals {
         .await
     }
 
-    /// Put the terminal back and exit when one of them arrives.
-    async fn restore_on_fire(mut self, fd: RawFd, saved: nix::sys::termios::Termios) {
-        let sig = self.recv().await;
-        pty::restore_termios(fd, &saved);
-        let mut stdout = tokio::io::stdout();
-        let _ = stdout.flush().await;
-        std::process::exit(128 + sig);
+    /// Hand each signal to the session. Once the session has ended, put the
+    /// terminal back, if there was one, and exit on the next.
+    async fn watch(
+        mut self,
+        session: mpsc::Sender<Caught>,
+        terminal: Option<(RawFd, nix::sys::termios::Termios)>,
+    ) {
+        loop {
+            let caught = self.recv().await;
+            if session.send(caught).await.is_err() {
+                if let Some((fd, saved)) = &terminal {
+                    pty::restore_termios(*fd, saved);
+                }
+                let mut stdout = tokio::io::stdout();
+                let _ = stdout.flush().await;
+                std::process::exit(128 + caught.0);
+            }
+        }
+    }
+}
+
+/// Relay INT and TERM to the remote command until a signal arrives that ends
+/// the session, and return 128+n for that one. The remote command decides
+/// what a relayed signal means, so that it can clean up and its status
+/// becomes qsh's.
+async fn until_fatal(caught: &mut mpsc::Receiver<Caught>, tx: Outbound) -> Option<i32> {
+    loop {
+        let (sig, relayed) = caught.recv().await?;
+        let Some(name) = relayed else {
+            return Some(128 + sig);
+        };
+        let _ = tx.send(Frame::Signal(name.into())).await;
     }
 }
 
@@ -984,6 +1030,22 @@ fn terminating_signals() -> Vec<libc::c_int> {
     signals
 }
 
+/// Whether a signal is ignored, as `nohup` leaves SIGHUP.
+#[allow(
+    unsafe_code,
+    reason = "sigaction with no new action only reads the disposition, and nix has no safe way to"
+)]
+fn ignored(number: libc::c_int) -> bool {
+    let mut old = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+    // SAFETY: a null new action changes nothing, and sigaction fills in the
+    // old one on success.
+    if unsafe { libc::sigaction(number, std::ptr::null(), old.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: sigaction returned success, so it initialized the old action.
+    unsafe { old.assume_init() }.sa_sigaction == libc::SIG_IGN
+}
+
 /// A forced PTY may receive piped input while output still goes to a terminal.
 fn terminal_size() -> crate::proto::PtySize {
     [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO]
@@ -1013,27 +1075,6 @@ async fn forward_winch(tx: Outbound, sent: crate::proto::PtySize) {
             }
         }
         if winch.recv().await.is_none() {
-            break;
-        }
-    }
-}
-
-/// Without a terminal, local Ctrl-C must be relayed as a signal.
-async fn forward_signals(tx: Outbound) {
-    let Ok(mut int) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-    else {
-        return;
-    };
-    let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    else {
-        return;
-    };
-    loop {
-        let name = tokio::select! {
-            _ = int.recv() => "INT",
-            _ = term.recv() => "TERM",
-        };
-        if tx.send(Frame::Signal(name.into())).await.is_err() {
             break;
         }
     }
@@ -1246,23 +1287,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_first_signal_to_arrive_is_reported() {
+    async fn relayed_signals_reach_the_remote_command_and_the_rest_end_the_session() {
+        let (signals, mut caught) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel(4);
+        let session = tokio::spawn(async move { until_fatal(&mut caught, tx).await });
+        for (number, name) in [(libc::SIGINT, "INT"), (libc::SIGTERM, "TERM")] {
+            signals.send((number, Some(name))).await.unwrap();
+            assert!(matches!(rx.recv().await, Some(Frame::Signal(sent)) if sent == name));
+        }
+        tokio::task::yield_now().await;
+        assert!(!session.is_finished(), "a relayed signal ended the session");
+        signals.send((libc::SIGHUP, None)).await.unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(1), session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, Some(128 + libc::SIGHUP));
+        assert!(rx.try_recv().is_err());
+
+        // Without a watcher, nothing ends the session.
+        let (signals, mut caught) = mpsc::channel::<Caught>(1);
+        drop(signals);
+        assert_eq!(until_fatal(&mut caught, mpsc::channel(1).0).await, None);
+    }
+
+    #[tokio::test]
+    async fn caught_signals_come_with_the_name_they_are_relayed_under() {
         use nix::sys::signal::{raise, Signal};
         // Both are ignored by default, so neither can end the test binary.
         let listen = |number| {
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(number)).unwrap()
         };
         let mut signals = FatalSignals(vec![
-            (libc::SIGURG, listen(libc::SIGURG)),
-            (libc::SIGWINCH, listen(libc::SIGWINCH)),
+            ((libc::SIGURG, Some("URG")), listen(libc::SIGURG)),
+            ((libc::SIGWINCH, None), listen(libc::SIGWINCH)),
         ]);
         let next = Duration::from_secs(1);
         raise(Signal::SIGWINCH).unwrap();
         let caught = tokio::time::timeout(next, signals.recv()).await.unwrap();
-        assert_eq!(caught, libc::SIGWINCH);
+        assert_eq!(caught, (libc::SIGWINCH, None));
         raise(Signal::SIGURG).unwrap();
         let caught = tokio::time::timeout(next, signals.recv()).await.unwrap();
-        assert_eq!(caught, libc::SIGURG);
+        assert_eq!(caught, (libc::SIGURG, Some("URG")));
     }
 
     #[test]
@@ -1314,6 +1380,13 @@ mod tests {
         ] {
             assert!(!caught.contains(&number), "signal {number} is caught");
         }
+    }
+
+    #[test]
+    fn an_ignored_signal_is_recognised() {
+        // The Rust runtime ignores SIGPIPE before `main`, as `nohup` does SIGHUP.
+        assert!(ignored(libc::SIGPIPE));
+        assert!(!ignored(libc::SIGWINCH));
     }
 
     fn verify(pem: &str) -> std::result::Result<ServerCertVerified, TlsError> {

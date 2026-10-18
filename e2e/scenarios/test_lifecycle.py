@@ -259,12 +259,13 @@ def a_session_running(client, server, marker: str, *, terminal: bool):
 
 @pytest.mark.plan("LIFE-10")
 @pytest.mark.parametrize("terminal", [True, False], ids=["terminal", "command"])
-def test_a_hangup_ends_qsh_at_once_and_the_idle_timeout_ends_its_job(alice_fast, fast_server, terminal):
+def test_a_hangup_ends_qsh_and_its_job_at_once(alice_fast, fast_server, terminal):
     """A closed terminal window: SIGHUP for qsh, interactive or not.
 
     qsh exits at once with 128+1 (the terminal case restores the local
-    terminal first, PTY-15), and the server cleans up the remote job within
-    its idle timeout, as for a killed client (LIFE-01).
+    terminal first, PTY-15). It closes the connection on its way out, so the
+    server ends the remote job at once, not at its idle timeout as for a
+    killed client (LIFE-01).
     """
     marker = "7070.25" if terminal else "7070.5"
     with a_session_running(alice_fast, fast_server, marker, terminal=terminal) as (argv, wait):
@@ -272,40 +273,38 @@ def test_a_hangup_ends_qsh_at_once_and_the_idle_timeout_ends_its_job(alice_fast,
         assert alice_fast.node.kill_command("alice", argv, "HUP"), "no qsh to signal"
         assert wait(timeout=10) == 128 + signal.SIGHUP
         assert time.monotonic() - begin < 2, "qsh did not exit at once"
-        fast_server.node.wait_gone(f"sleep {marker}", timeout=FAST_IDLE_TIMEOUT + 15)
-        assert time.monotonic() - begin < FAST_IDLE_TIMEOUT + 10
+        fast_server.node.wait_gone(f"sleep {marker}", timeout=3)
 
 
 @pytest.mark.plan("LIFE-10")
-@pytest.mark.xfail(
-    strict=True,
-    reason="F26: qsh ends on a signal without a CONNECTION_CLOSE; the job lives on for the idle timeout",
-)
 @pytest.mark.parametrize(
     "terminal,name",
     [
         *(pytest.param(True, n, id=f"terminal-{n}") for n in ("HUP", "TERM", "INT", "QUIT", "USR1", "USR2", "ALRM", "VTALRM")),
-        *(pytest.param(False, n, id=f"command-{n}") for n in ("HUP", "USR1")),
+        *(pytest.param(False, n, id=f"command-{n}") for n in ("HUP", "QUIT", "USR1", "ALRM", "VTALRM")),
     ],
 )
 def test_a_signal_that_ends_qsh_ends_the_remote_job_at_once(alice_fast, fast_server, terminal, name):
     """qsh tells the server it is leaving, so the job does not wait out the idle timeout.
 
-    In a terminal qsh catches TERM, HUP, QUIT, INT, USR1, USR2 and ALRM,
-    restores the terminal and exits (src/client.rs `restore_on_fire`);
-    VTALRM stands for the terminating signals it does not catch. Without a
-    terminal only INT and TERM are caught, and relayed (EXEC-22); HUP and
-    USR1 take their default action. ssh closes its TCP connection on all of
-    these, and sshd ends the session at once.
+    qsh catches every signal whose default action would end it, except the
+    faults and TRAP (src/client.rs `FatalSignals`). The session then ends
+    the ordinary way: the terminal is restored and the connection closed
+    before qsh exits. Without a terminal, INT and TERM are relayed instead
+    (EXEC-22), so they are not here. ssh closes its TCP connection on HUP,
+    INT, QUIT and TERM, and the kernel closes it on any other death, so sshd
+    ends the session at once too.
     """
     number = signal.Signals[f"SIG{name}"].value
     marker = f"{7171 if terminal else 7272}.{number:02d}5"
     with a_session_running(alice_fast, fast_server, marker, terminal=terminal) as (argv, wait):
+        begin = time.monotonic()
         assert alice_fast.node.kill_command("alice", argv, name), "no qsh to signal"
         # Still 128+n, the status the README gives a death by signal n.
         assert wait(timeout=10) == 128 + number
         # Well under server2's 8 s idle timeout: a close arrives at once.
         fast_server.node.wait_gone(f"sleep {marker}", timeout=3)
+        print(f"the job was gone {time.monotonic() - begin:.1f}s after SIG{name}")
 
 
 @pytest.mark.plan("LIFE-10")
@@ -350,6 +349,28 @@ def test_ctrl_c_ends_a_command_whose_path_has_gone_dark(alice_fast, fast_server,
     # Well before server2's 8 s idle timeout, and before a fourth Ctrl-C would come.
     assert took < 5, f"qsh ended {took:.1f}s after the first Ctrl-C"
     assert status == 128 + signal.SIGINT
+
+
+@pytest.mark.plan("LIFE-10")
+def test_nohup_keeps_a_command_and_its_job_through_a_hangup(alice_fast, fast_server):
+    """`nohup qsh host cmd`: a hangup that qsh was started to ignore stays ignored.
+
+    Without a terminal qsh ends on HUP like on the other signals above, but
+    only when HUP was not ignored when it started.
+    """
+    marker = "7474.25"
+    argv = alice_fast.argv("server2", "sleep", marker)
+    proc = alice_fast.node.popen(["nohup", *argv], user="alice")
+    try:
+        fast_server.node.wait_running(f"sleep {marker}", timeout=15)
+        assert alice_fast.node.kill_command("alice", argv, "HUP"), "no qsh to signal"
+        time.sleep(2)
+        assert proc.poll() is None, f"qsh ended with {proc.returncode} on a hangup it was told to ignore"
+        assert fast_server.node.pids(f"sleep {marker}"), "the remote job ended"
+    finally:
+        alice_fast.node.kill_command("alice", argv)
+        proc.wait(timeout=10)
+        fast_server.node.run(["pkill", "-u", "alice", "-f", f"^sleep {marker}$"])
 
 
 # ---------------------------------------------------------------- LIFE-11

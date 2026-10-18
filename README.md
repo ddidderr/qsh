@@ -245,12 +245,14 @@ against, the boundaries it promises, and the trade-offs already decided.
   `/tmp/tool` because it ends in `tool` would permit a replacement executable.
   A bare name is resolved through the server's own fixed
   `PATH`; to allow a program elsewhere, authorize its absolute path.
-* A session is torn down with its connection. If the client is killed, the
-  server notices when the QUIC idle timeout expires (60s by default, with
-  15-second keep-alives) and signals the session's process group `SIGHUP`, then
-  `SIGTERM`, then `SIGKILL`. That watch stays up for the whole session,
-  including while the last of the output is still draining, so a descendant
-  that outlives the command it was started from is cleaned up too.
+* A session is torn down with its connection. A client ended by a signal
+  closes the connection on its way out. If the client is killed outright
+  (`SIGKILL`), crashes, or loses the network, the server notices when the
+  QUIC idle timeout expires (60s by default, with 15-second keep-alives).
+  Either way it signals the session's process group `SIGHUP`, then `SIGTERM`,
+  then `SIGKILL`. That watch stays up for the whole session, including while
+  the last of the output is still draining, so a descendant that outlives the
+  command it was started from is cleaned up too.
 
   For an ordinary key, an intentional detached job may survive. PTY job
   control or `setsid` can move work to another process group, beyond those
@@ -490,6 +492,13 @@ signal `n`, and `255` for its own failures — the convention scripts and rsync
 expect from a remote shell. As from a shell, a remote program that does not
 exist gives `127`, and one that cannot be executed, or that the key may not
 run, gives `126`.
+
+When a signal ends qsh, qsh restores the terminal and closes the connection
+first, so the server ends the remote command at once, and it exits with
+`128+n`. Without a terminal, INT and TERM (Ctrl-C, or a supervisor stopping
+qsh) go to the remote command instead, and its status becomes qsh's. Without
+a terminal, a signal that was ignored when qsh started stays ignored: `nohup
+qsh host cmd` survives a hangup.
 
 ## Running under systemd
 
