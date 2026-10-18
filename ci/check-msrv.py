@@ -6,11 +6,9 @@ Run from anywhere:  python3 ci/check-msrv.py
 Only crates actually reachable from this package in Cargo.lock are considered,
 so a dependency that is present but never resolved cannot make the check lie.
 
-This lives in a file rather than inside the workflow on purpose: multi-line
-Python embedded in a YAML block scalar is how CI silently stopped parsing once
-already.
+`just msrv` runs it before testing with that version.
 
-Requires Python 3.11+ for tomllib (ubuntu-latest ships 3.12).
+Requires Python 3.11+ for tomllib.
 """
 
 from __future__ import annotations

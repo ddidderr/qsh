@@ -54,8 +54,8 @@ cargo install --path .          # installs qsh and qsh-server
 ```
 
 Requires a Unix-like system (Linux is what it is tested on) and Rust 1.88+,
-which is what the pinned dependency graph in `Cargo.lock` needs. CI builds
-both that version and current stable with `--locked`.
+which is what the pinned dependency graph in `Cargo.lock` needs. `just msrv`
+builds and tests with that version.
 
 ## Setup
 
@@ -560,23 +560,23 @@ a network simulator that loses, delays, reorders and re-addresses traffic,
 and real rsync, tar and terminal sessions. `just e2e` runs it;
 [`e2e/TEST_PLAN.md`](e2e/TEST_PLAN.md) lists what it checks and why.
 
-### Continuous integration
+### Checks before merging
 
-`.github/workflows/ci.yml` runs rustfmt, pedantic clippy as errors, the tests
-on both stable and the declared MSRV with `--locked`, an end-to-end run with
-rsync installed, a **root** end-to-end run (without it the privilege-drop path
-is never executed, since an unprivileged server never switches account), a
-check that the declared MSRV still matches the lockfile, and `cargo audit
---deny warnings` so an unmaintained dependency fails the build rather than
-waiting to be noticed.
+There is no hosted CI. `just verify` runs everything that must pass before a
+change reaches `main`, with `--locked` throughout:
 
-`actionlint` runs over the workflow itself, because a workflow that does not
-parse runs nothing and reports no failure — which is exactly how an earlier
-version of this file sat there doing nothing.
-
-`.github/workflows/e2e.yml` checks that the test plan and the scenarios
-agree, then runs the multi-host suite; pull requests skip the scenarios
-marked slow (a gigabyte each way, outages under the default timeouts).
+- `just check`: rustfmt, pedantic clippy with warnings as errors, and the
+  tests (the end-to-end tests need rsync installed).
+- `just msrv`: a check that the declared MSRV still matches the lockfile,
+  and the tests on that version.
+- `just test-root`: the tests that need root. Without root the privilege-drop
+  path is never executed, since an unprivileged server never switches
+  account, and the session cgroup needs a delegated systemd scope.
+- `just audit-deps`: `cargo audit --deny warnings`, so an advisory or an
+  unmaintained dependency stops the merge rather than waiting to be noticed.
+  An advisory is fixed by updating the dependency.
+- `just e2e-plan` and `just e2e`: the test plan agrees with the scenarios,
+  and the multi-host suite passes, slow scenarios included.
 
 ### Lints
 
