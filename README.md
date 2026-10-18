@@ -418,6 +418,12 @@ Environment overrides for both binaries: `QSH_HOME` (client directory) and
 `QSH_SERVER_HOME` (server directory); `qsh-server --dir` and `qsh -i` do the
 same per invocation.
 
+qsh-server reads `qsh-server.toml`, the host key and certificate, and its
+command line and environment only at startup; restart it to apply a change,
+which ends running sessions. `authorized/` is re-read every second, so
+`authorize`, `revoke` and edits there need no restart. Accounts and groups
+are looked up for every session.
+
 ## Client reference
 
 ```
@@ -522,6 +528,14 @@ WantedBy=multi-user.target
 
 Open the port with `ufw allow 2222/udp` (or the nftables equivalent) — UDP,
 not TCP. This is the single most common reason a first connection times out.
+
+qsh-server has nothing to reload, so the unit has no `ExecReload=` and
+`systemctl reload qsh-server` is refused; after changing `qsh-server.toml`,
+run `systemctl restart qsh-server`. SIGHUP is ignored: the server logs that
+there is nothing to reload and keeps serving. A stop or restart closes every
+connection first, so clients exit at once saying the server is shutting down.
+It takes a few seconds at most, even while journald is not reading or account
+lookups are stuck.
 
 ## Protocol
 

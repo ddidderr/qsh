@@ -193,6 +193,8 @@ fn serve(paths: &ServerPaths, args: Serve) -> Result<()> {
     served
 }
 
+/// SIGINT or SIGTERM. SIGHUP does not stop the server: `serve` logs it and
+/// carries on.
 async fn shutdown_signal() {
     let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
     else {

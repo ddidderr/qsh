@@ -108,7 +108,8 @@ const FIRST_FRAME_GRACE: Duration = Duration::from_secs(10);
 /// four MiB per session. Backpressure continues through the child's pipes.
 const OUTPUT_QUEUE_FRAMES: usize = 8;
 
-/// Run the server until `shutdown` completes.
+/// Run the server until `shutdown` completes. SIGHUP is logged and otherwise
+/// ignored.
 ///
 /// # Errors
 /// Fails if the host identity is missing, the authorisation store cannot be
@@ -173,6 +174,7 @@ pub async fn serve(
     let per_key = Arc::new(PerKeyConnections::default());
     let sessions = SessionBudget::new();
 
+    let shutdown = ignoring_hangups(shutdown, &diagnostics)?;
     tokio::pin!(shutdown);
     loop {
         let incoming = tokio::select! {
@@ -230,6 +232,30 @@ pub async fn serve(
     }
     refresher.abort();
     Ok(())
+}
+
+/// Wait for `shutdown`, logging every SIGHUP meanwhile. There is nothing to
+/// reload, and the signal's default action would end the server without a
+/// word to its clients.
+fn ignoring_hangups<'a>(
+    shutdown: impl Future<Output = ()> + 'a,
+    diagnostics: &'a Diagnostics,
+) -> Result<impl Future<Output = ()> + 'a> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut hangup = signal(SignalKind::hangup()).context("handling SIGHUP")?;
+    Ok(async move {
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                () = &mut shutdown => return,
+                Some(()) = hangup.recv() => diagnostics.record(|| {
+                    "qsh-server: ignoring SIGHUP: there is nothing to reload; authorized/ is \
+                     re-read every second, and other settings take effect on restart"
+                        .into()
+                }),
+            }
+        }
+    })
 }
 
 /// Close every connection, then log the shutdown. Without a `CONNECTION_CLOSE`

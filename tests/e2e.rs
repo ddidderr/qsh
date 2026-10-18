@@ -1058,6 +1058,28 @@ fn a_changed_host_key_is_refused() {
     );
 }
 
+#[test]
+fn sighup_is_logged_and_the_server_keeps_serving() {
+    let f = Fixture::start(&[]);
+    let log = f.tmp.path().join("server.log");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(f.server.id() as i32),
+        nix::sys::signal::Signal::SIGHUP,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = std::fs::read_to_string(&log).unwrap();
+        if text.contains("qsh-server: ignoring SIGHUP: there is nothing to reload") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no SIGHUP line:\n{text}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let (code, out, err) = f.exec(&["echo", "still serving"]);
+    assert_eq!((code, out.as_str()), (0, "still serving\n"), "{err}");
+}
+
 /// Whether the server's log writer is blocked writing to its stderr: in a
 /// system call on descriptor 2, not idle on its queue.
 #[cfg(target_os = "linux")]
