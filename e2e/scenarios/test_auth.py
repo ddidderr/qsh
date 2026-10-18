@@ -12,7 +12,6 @@ from contextlib import ExitStack, contextmanager
 
 import pytest
 
-from harness.env import Unmet
 from harness.qsh import RELOAD_SETTLE, QshServer, unique
 from harness.terminal import Terminal
 
@@ -827,12 +826,6 @@ def test_a_directory_outage_fails_sessions_and_gives_their_budget_back(make_clie
 
 
 @pytest.mark.plan("AUTH-20")
-@pytest.mark.xfail(
-    strict=True,
-    raises=Unmet,
-    reason="F31: qsh-server does not exit until every stuck account lookup has returned, "
-    "so stop and restart wait out the directory's timeouts",
-)
 def test_a_directory_outage_does_not_hold_up_stopping_the_server(make_client, server, env):
     """`systemctl stop` while sessions wait on a silent directory.
 
@@ -843,7 +836,9 @@ def test_a_directory_outage_does_not_hold_up_stopping_the_server(make_client, se
     needs the process to stay: it takes no lock and starts no child
     (src/server.rs, handle_session). Until the process is gone systemd
     cannot start a new one, and nothing listens on the port, not even for
-    keys whose accounts need no directory.
+    keys whose accounts need no directory. So the daemon waits for blocking
+    work only briefly at exit (BLOCKING_GRACE in src/bin/qsh-server.rs);
+    F31: it used to wait until the last lookup returned.
     """
     node = server.node
     with directory_accounts(server, env.node("server2")) as directory:
@@ -867,10 +862,10 @@ def test_a_directory_outage_does_not_hold_up_stopping_the_server(make_client, se
                     assert b"granted-auth20" not in out
                 stopper.wait(timeout=120)
                 took = time.monotonic() - begin
+            print(f"`systemctl stop` took {took:.2f}s")
             assert stopper.returncode == 0
             assert not server.is_active()
-            if took >= 10:
-                raise Unmet(f"stopping qsh-server took {took:.1f}s while account lookups were stuck")
+            assert took < 10, f"stopping qsh-server took {took:.1f}s while account lookups were stuck"
         finally:
             for proc in procs:
                 proc.kill()

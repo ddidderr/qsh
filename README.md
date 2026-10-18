@@ -344,6 +344,16 @@ against, the boundaries it promises, and the trade-offs already decided.
   A non-root daemon inherits its account's supplementary groups at startup and
   cannot reset them. Restart it after removing group membership, and do not
   grant service-specific supplementary groups that remote sessions should lack.
+* Accounts and groups come from NSS (`/etc/passwd`, LDAP, SSSD) and are looked
+  up afresh for every session. While a directory does not answer, a session
+  for one of its accounts waits out the NSS module's timeouts, holding its
+  place in the session budget, and then fails with status 126 and
+  ``looking up user `alice`: ENOENT: No such file or directory``: glibc reports
+  a source it cannot reach as `ENOENT`, so this reads like a missing account.
+  A local account's session can wait for its group lookup too, and then starts
+  without its directory groups. root needs no directory lookup and is not
+  affected. Give the NSS module finite timeouts; nslcd's `timelimit`, for one,
+  waits for ever by default. A stop or restart does not wait for stuck lookups.
 
 What 1.0 does **not** have, on purpose: port forwarding, agent forwarding, X11
 forwarding, `sftp`, jump hosts, certificate authorities, host key rotation

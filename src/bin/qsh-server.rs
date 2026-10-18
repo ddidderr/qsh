@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -166,6 +167,9 @@ fn run(paths: &ServerPaths, command: Command) -> Result<()> {
     }
 }
 
+/// How long exit waits for the runtime's threads once serving has stopped.
+const BLOCKING_GRACE: Duration = Duration::from_secs(1);
+
 fn serve(paths: &ServerPaths, args: Serve) -> Result<()> {
     let cfg = match args.config {
         Some(path) => ServerConfig::load_required(&path)?,
@@ -175,12 +179,18 @@ fn serve(paths: &ServerPaths, args: Serve) -> Result<()> {
         .enable_all()
         .build()
         .context("starting the async runtime")?;
-    runtime.block_on(qsh::server::serve(
+    let served = runtime.block_on(qsh::server::serve(
         paths,
         &cfg,
         args.listen,
         shutdown_signal(),
-    ))
+    ));
+    // Dropping the runtime would wait for every blocking task, and a session
+    // preparation stuck in an account lookup waits out the directory's
+    // timeouts. It holds no lock and has started no child. The bound still
+    // gives the workers time to drop every session, which kills its job.
+    runtime.shutdown_timeout(BLOCKING_GRACE);
+    served
 }
 
 async fn shutdown_signal() {
