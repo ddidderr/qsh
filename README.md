@@ -319,6 +319,14 @@ against, the boundaries it promises, and the trade-offs already decided.
   It bounds concurrency, not attempt rate, and it says nothing about a
   distributed flood from many addresses — for that, put the port behind
   whatever the host already uses for the rest of its services.
+
+  Clients behind one NAT address share that address's 4 handshake slots. An
+  attempt over the limit gets no answer, and the client sends it again on
+  QUIC's retransmission timer, about 1, 3 and 7 seconds after the first. So
+  when many clients behind one address connect at the same moment over a WAN
+  path, about four get in per retry: of 32 at once, about 16 log in, whatever
+  `--connect-timeout` says, and the rest fail, usually with `timed out`.
+  Stagger such bursts.
 * A key's policy is re-read for every session, not captured when the
   connection was made, so revoking a key also cuts off the connections it
   already has. A change that no longer allows a running session (shells or
