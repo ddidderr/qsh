@@ -3,6 +3,11 @@ Description=qsh server (SSH replacement over QUIC)
 Documentation=https://github.com/ddidderr/qsh
 After=network-online.target
 Wants=network-online.target
+# A server that cannot start, such as one whose listen address is not there
+# yet (a DHCP lease, a floating IP), is retried every RestartSec for as long
+# as it takes. systemd's default start limit counts every start, restarts by
+# hand too, and would leave the unit failed for good.
+StartLimitIntervalSec=0
 
 [Service]
 Type=exec

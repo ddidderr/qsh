@@ -159,6 +159,18 @@ rsync sends the paths inside its own protocol instead:
 rsync -e qsh -s -av ./data/ 'server:/backup/my data/'
 ```
 
+If a network outage cuts a transfer, the remote rsync cannot tell that its
+client is gone. It runs on until the server's idle timeout (60 seconds by
+default) and is then hung up. With `--partial`, and so with `-P`, it then
+moves the partial file it was writing to the destination name, over whatever
+a quick retry put there in the meantime, and nothing reports it. Keep partial
+files apart with `--partial-dir`, or wait out the idle timeout before you
+retry:
+
+```
+rsync -e qsh -P --partial-dir=.rsync-partial -av ./data/ server:/backup/data/
+```
+
 ## git
 
 git hands its ssh program the remote command as one string,
@@ -325,6 +337,14 @@ against, the boundaries it promises, and the trade-offs already decided.
   It bounds concurrency, not attempt rate, and it says nothing about a
   distributed flood from many addresses — for that, put the port behind
   whatever the host already uses for the rest of its services.
+
+  Clients behind one NAT address share that address's 4 handshake slots. An
+  attempt over the limit gets no answer, and the client sends it again on
+  QUIC's retransmission timer, about 1, 3 and 7 seconds after the first. So
+  when many clients behind one address connect at the same moment over a WAN
+  path, about four get in per retry: of 32 at once, about 16 log in, and a
+  longer `--connect-timeout` lets no more in. The rest fail, usually with
+  `timed out`. Stagger such bursts.
 * A key's policy is re-read for every session, not captured when the
   connection was made, so revoking a key also cuts off the connections it
   already has. A change that no longer allows a running session (shells or
@@ -542,10 +562,13 @@ survives a hangup.
 [Unit]
 Description=qsh server
 After=network.target
+# Keep retrying, for example until the listen address exists.
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/usr/local/bin/qsh-server serve
 Restart=on-failure
+RestartSec=2s
 # The server must start as root to switch to the target user.
 User=root
 Delegate=yes
@@ -554,6 +577,14 @@ KillMode=control-group
 [Install]
 WantedBy=multi-user.target
 ```
+
+A server that cannot start exits, and systemd tries again every two seconds
+for as long as it takes; each try logs why it failed. A `listen` address that
+arrives after boot (a DHCP lease, a floating IP) is served within a couple of
+seconds of appearing. Without `StartLimitIntervalSec=0`, systemd gives up after
+five starts within ten seconds, a `systemctl restart` included, and the unit
+stays failed. The repository ships this unit, with comments and a few more
+settings, as `contrib/qsh-server.service`.
 
 Open the port with `ufw allow 2222/udp` (or the nftables equivalent) — UDP,
 not TCP. This is the single most common reason a first connection times out.
