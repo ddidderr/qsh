@@ -478,7 +478,13 @@ An interactive session is different, because a terminal has no equivalent of
 open after the shell exits. So the session does not wait for the terminal:
 `exit` or Ctrl-D delivers what the shell printed and returns you to your prompt
 at once, with the shell's exit status. Only a job that writes to the terminal
-more than ten times a second can hold that up, for at most two seconds. The
+more than ten times a second, or a connection too slow to take the shell's last
+output, can hold that up, for at most two seconds however fast the job writes;
+output already on its way still arrives first. If a background job, or any
+other process, still has the terminal open at that point, the rest of the
+output is dropped, the shell's own last lines included, and you still get the
+shell's status. With nothing else on the terminal, output that could not be
+sent by then makes the status 255. The
 background job keeps running, as after `exit` in a local terminal, but its
 later output goes nowhere. A key with `kill_session_processes` ends it
 instead. A session that ends abnormally
