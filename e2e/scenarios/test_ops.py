@@ -464,11 +464,12 @@ def test_a_stalled_journald_does_not_stop_serving_or_revocation(alice_fast, fast
 
     THREAT_MODEL.md: "a blocked or failing stderr/journald must never block
     serving". README: a bounded queue and a dedicated writer, so "a full log
-    pipe cannot block session handling or authorization reload". The writer
-    is shown stuck in write(2) before and after the checks, so they ran while
-    the log was blocked; afterwards, every line the full queue dropped must
-    be counted ("lines that do not fit are counted and reported as
-    suppressed", src/server/diagnostics.rs).
+    pipe cannot block session handling, authorization reload, or a stop"
+    (the stop is the next scenario's). The writer is shown stuck in write(2)
+    before and after the checks, so they ran while the log was blocked;
+    afterwards, every line the full queue dropped must be counted ("lines
+    that do not fit are counted and reported as suppressed",
+    src/server/diagnostics.rs).
     """
     node = fast_server.node
     noisy = make_client("alice", authorize_as="alice", on=fast_server)
@@ -550,18 +551,18 @@ def test_a_stalled_journald_does_not_stop_serving_or_revocation(alice_fast, fast
 
 
 @pytest.mark.plan("OPS-13")
-@pytest.mark.xfail(strict=True, reason="F28: the shutdown line waits on the blocked log writer, so a restart hangs")
 def test_a_restart_during_a_journald_stall_is_not_held_up(alice_fast, fast_server, make_client):
     """A restart while journald is stalled must still restart.
 
     The writer thread holds Rust's stderr lock while it is blocked in
-    write(2). On SIGTERM the daemon prints "shutting down" with `eprintln!`
-    on the runtime's main thread (`serve` in src/bin/qsh-server.rs) before
-    it closes the endpoint, and waits for that lock: no close is sent, the
-    accept loop stops, and the unit sits in `deactivating (stop-sigterm)`
-    until journald recovers or systemd's 90 s stop timeout kills it. Serving
-    is blocked for that long. Proposed: log the line through the diagnostics
-    queue, or after the close.
+    write(2), so nothing on the shutdown path may write to stderr directly.
+    The daemon closes the endpoint first, then queues "shutting down" for
+    the writer like any other line, and gives the closes and the line the
+    same bounded wait (SHUTDOWN_GRACE in src/server.rs). With journald
+    stopped the line never gets out, and the old daemon exits once that
+    bound is up. F28: the line used to be printed with `eprintln!` before
+    the close, which waited for the lock until journald ran again or
+    systemd's 90 s stop timeout killed the daemon.
     """
     noisy = make_client("alice", authorize_as="alice", on=fast_server)
     try:
@@ -572,6 +573,7 @@ def test_a_restart_during_a_journald_stall_is_not_held_up(alice_fast, fast_serve
             begin = time.monotonic()
             r = fast_server.node.run(["systemctl", "restart", fast_server.unit], timeout=15)
             took = time.monotonic() - begin
+            print(f"`systemctl restart` took {took:.2f}s")
             assert r.rc == 0 and took < 10, f"`systemctl restart` exited {r.rc} after {took:.1f}s"
             fast_server.wait_listening()
             r = alice_fast.run("server2", "echo", "restarted", timeout=15)

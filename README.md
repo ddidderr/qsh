@@ -312,7 +312,7 @@ against, the boundaries it promises, and the trade-offs already decided.
   counted as suppressed. While stderr is blocked, the newest
   authorization-reload warnings wait in a small backlog. Logging is best
   effort: a failed write is not retried. A full log pipe cannot block session
-  handling or authorization reload.
+  handling, authorization reload, or a stop.
 
   This is a fairness reservation, not a rate limit: nothing is remembered
   after an attempt ends, so there is no per-address table to grow or expire.

@@ -1058,6 +1058,108 @@ fn a_changed_host_key_is_refused() {
     );
 }
 
+/// Whether the server's log writer is blocked writing to its stderr: in a
+/// system call on descriptor 2, not idle on its queue.
+#[cfg(target_os = "linux")]
+fn log_writer_blocked(pid: u32) -> bool {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    tasks.flatten().any(|task| {
+        let comm = std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+        let call = std::fs::read_to_string(task.path().join("syscall")).unwrap_or_default();
+        comm.trim() == "qsh-diagnostics" && call.split_whitespace().nth(1) == Some("0x2")
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_blocked_log_does_not_hold_up_a_stop() {
+    use std::io::BufRead;
+
+    let mut f = Fixture::start(&[]);
+    // Serve again, with stderr on a one-page pipe read only up to the
+    // listening line: a few dozen login lines fill it.
+    let _ = f.server.kill();
+    let _ = f.server.wait();
+    f.server = Command::new(SERVER_BIN)
+        .args([
+            "--dir",
+            f.server_dir.to_str().unwrap(),
+            "serve",
+            "--listen",
+            "127.0.0.1:0",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("starting qsh-server");
+    let stderr = f.server.stderr.take().unwrap();
+    nix::fcntl::fcntl(&stderr, nix::fcntl::FcntlArg::F_SETPIPE_SZ(4096)).unwrap();
+    let mut stderr = std::io::BufReader::new(stderr);
+    let mut line = String::new();
+    while !line.contains("listening on ") {
+        line.clear();
+        assert_ne!(stderr.read_line(&mut line).unwrap(), 0, "no listening line");
+    }
+    f.port = line
+        .split("listening on ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|addr| addr.rsplit(':').next())
+        .and_then(|port| port.parse().ok())
+        .unwrap();
+    let pid = f.server.id();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let begin = rt.block_on(async {
+        let endpoint = raw_endpoint(&f.client_dir, "0.0.0.0:0", Arc::new(AcceptAnyServer));
+        let server = std::net::SocketAddr::from(([127, 0, 0, 1], f.port));
+        let open = endpoint.connect(server, "qsh").unwrap().await.unwrap();
+        for _ in 0..300 {
+            if log_writer_blocked(pid) {
+                break;
+            }
+            let login = endpoint.connect(server, "qsh").unwrap().await.unwrap();
+            login.close(0u32.into(), b"");
+        }
+        assert!(log_writer_blocked(pid), "the log writer never blocked");
+
+        let begin = Instant::now();
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .unwrap();
+        // Clients are told first, whatever the log is doing.
+        let closed = tokio::time::timeout(Duration::from_secs(5), open.closed())
+            .await
+            .expect("the server did not close the connection");
+        assert!(
+            matches!(&closed, quinn::ConnectionError::ApplicationClosed(close)
+                if close.reason.as_ref() == b"server shutting down"),
+            "{closed}"
+        );
+        begin
+    });
+    let status = wait_with_deadline_status(&mut f.server, Duration::from_secs(10));
+    assert_eq!(
+        status,
+        Some(0),
+        "the server had not exited {:.1}s after SIGTERM",
+        begin.elapsed().as_secs_f64()
+    );
+    assert!(
+        begin.elapsed() < Duration::from_secs(5),
+        "exit took {:.1}s",
+        begin.elapsed().as_secs_f64()
+    );
+    drop(stderr);
+}
+
 #[test]
 fn a_restricted_key_cannot_run_a_lookalike_from_a_writable_path() {
     // The regression behind the review: matching an allow-list entry by

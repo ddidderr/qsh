@@ -175,10 +175,12 @@ fn serve(paths: &ServerPaths, args: Serve) -> Result<()> {
         .enable_all()
         .build()
         .context("starting the async runtime")?;
-    runtime.block_on(qsh::server::serve(paths, &cfg, args.listen, async {
-        shutdown_signal().await;
-        eprintln!("qsh-server: shutting down");
-    }))
+    runtime.block_on(qsh::server::serve(
+        paths,
+        &cfg,
+        args.listen,
+        shutdown_signal(),
+    ))
 }
 
 async fn shutdown_signal() {

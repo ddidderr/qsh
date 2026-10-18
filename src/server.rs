@@ -178,11 +178,7 @@ pub async fn serve(
         let incoming = tokio::select! {
             incoming = endpoint.accept() => incoming,
             () = &mut shutdown => {
-                // Tell every client now. Without a CONNECTION_CLOSE they wait
-                // on a dead session until their idle timeout, and the next
-                // process's stateless resets cannot reach them either.
-                endpoint.close(0u32.into(), b"server shutting down");
-                let _ = tokio::time::timeout(SHUTDOWN_GRACE, endpoint.wait_idle()).await;
+                shut_down(&endpoint, &diagnostics).await;
                 break;
             }
         };
@@ -234,6 +230,21 @@ pub async fn serve(
     }
     refresher.abort();
     Ok(())
+}
+
+/// Close every connection, then log the shutdown. Without a `CONNECTION_CLOSE`
+/// clients wait on a dead session until their idle timeout, and the next
+/// process's stateless resets cannot reach them either.
+///
+/// The line goes through the queue and gets the same bounded wait as the
+/// closes: a blocked log sink must hold up neither.
+async fn shut_down(endpoint: &quinn::Endpoint, diagnostics: &Diagnostics) {
+    endpoint.close(0u32.into(), b"server shutting down");
+    diagnostics.record(|| "qsh-server: shutting down".into());
+    let _ = tokio::time::timeout(SHUTDOWN_GRACE, async {
+        tokio::join!(endpoint.wait_idle(), diagnostics.flush())
+    })
+    .await;
 }
 
 fn server_config(
