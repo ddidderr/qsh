@@ -436,7 +436,35 @@ fn connect_error(e: &quinn::ConnectionError, opts: &Options, addr: SocketAddr) -
              reachable — QUIC needs UDP, not TCP.",
             opts.port
         ),
+        _ if closed_during_handshake(e) => anyhow!(
+            "{base}\n\nThe server ended the login before it completed: it allows {} seconds for \
+             the handshake, so the path may be too slow or too lossy (or the server was \
+             stopping or restarting).",
+            crate::server::HANDSHAKE_GRACE.as_secs()
+        ),
         _ => base,
+    }
+}
+
+/// Did the server close the connection before its side of the handshake was
+/// done? Whatever code and reason it gave, such a close arrives as a bare
+/// `APPLICATION_ERROR` (RFC 9000, section 10.2.3). From qsh-server that is its
+/// handshake deadline, or a shutdown at that moment: a refused key is a TLS
+/// error, and a close after the handshake keeps its reason.
+fn closed_during_handshake(e: &quinn::ConnectionError) -> bool {
+    matches!(e, quinn::ConnectionError::ConnectionClosed(close)
+        if close.error_code == quinn::TransportErrorCode::APPLICATION_ERROR)
+}
+
+/// The client finishes its side of the handshake one flight before the server
+/// does, so until the server's first frame its deadline can still end the
+/// login. Report that as [`connect_one`] would, not as a lost connection.
+fn before_start(conn: &quinn::Connection, opts: &Options, error: anyhow::Error) -> anyhow::Error {
+    match conn.close_reason() {
+        Some(reason) if closed_during_handshake(&reason) => {
+            connect_error(&reason, opts, conn.remote_address())
+        }
+        _ => error,
     }
 }
 
@@ -546,7 +574,12 @@ async fn session(conn: &quinn::Connection, opts: &Options) -> Result<i32> {
     }
 
     let sent_size = pty_req.as_ref().map(|p| p.size);
-    let (mut send, mut recv) = conn.open_bi().await.context("opening the session stream")?;
+    let unstarted = |error: anyhow::Error| before_start(conn, opts, error);
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .context("opening the session stream")
+        .map_err(unstarted)?;
 
     write_frame(
         &mut send,
@@ -559,10 +592,14 @@ async fn session(conn: &quinn::Connection, opts: &Options) -> Result<i32> {
         }),
     )
     .await
-    .context("sending the session request")?;
+    .context("sending the session request")
+    .map_err(unstarted)?;
 
     // Wait for the server's verdict before touching the local terminal.
-    match read_frame(&mut recv).await? {
+    let verdict = read_frame(&mut recv)
+        .await
+        .map_err(|e| unstarted(e.into()))?;
+    match verdict {
         Some(Frame::Started) => {}
         Some(Frame::Error(msg)) => {
             let _ = writeln!(std::io::stderr(), "qsh: {msg}");
@@ -1481,6 +1518,77 @@ mod tests {
         peer.close(0u32.into(), b"done");
         endpoint.close(0u32.into(), b"done");
         server.close(0u32.into(), b"done");
+    }
+
+    #[tokio::test]
+    async fn a_handshake_the_server_drops_is_reported_as_its_deadline() {
+        let server_dir = tempfile::tempdir().unwrap();
+        let server_id = test_identity(server_dir.path());
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![server_id.cert.clone()], server_id.key.clone_key())
+        .unwrap();
+        tls.alpn_protocols = vec![crate::proto::ALPN.to_vec()];
+        let config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap(),
+        ));
+        let server = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let opts = Options {
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+            user: None,
+            command: None,
+            pty: PtyPolicy::Never,
+            env: vec![],
+            host_key_policy: HostKeyPolicy::Refuse,
+            paths_dir: None,
+            quiet: true,
+            no_stdin: false,
+            family: AddressFamily::V4,
+            connect_timeout_secs: 5,
+        };
+        let pin = Fingerprint::of_cert(&server_id.cert).unwrap();
+        let config = client_config(PinnedServerVerifier::new(pin), None).unwrap();
+        let (client, ()) = tokio::join!(connect_one(addr, &config, &opts), async {
+            // What HANDSHAKE_GRACE does to a handshake that has not finished.
+            drop(server.accept().await.unwrap().accept().unwrap());
+        });
+        let error = format!("{:#}", client.unwrap_err());
+        assert!(
+            error.contains("The server ended the login before it completed: it allows 5 seconds"),
+            "{error}"
+        );
+        server.close(0u32.into(), b"done");
+    }
+
+    #[test]
+    fn only_a_close_during_the_handshake_is_taken_for_the_deadline() {
+        let transport = |error_code| {
+            quinn::ConnectionError::ConnectionClosed(quinn::ConnectionClose {
+                error_code,
+                frame_type: None,
+                reason: Vec::new().into(),
+            })
+        };
+        assert!(closed_during_handshake(&transport(
+            quinn::TransportErrorCode::APPLICATION_ERROR
+        )));
+        // An unauthorized key is refused by TLS, with an alert.
+        assert!(!closed_during_handshake(&transport(
+            quinn::TransportErrorCode::crypto(42)
+        )));
+        // Shutdowns and refusals after the handshake keep their reason.
+        let after = quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: 0u32.into(),
+            reason: b"server shutting down".to_vec().into(),
+        });
+        assert!(!closed_during_handshake(&after));
+        assert!(!closed_during_handshake(&quinn::ConnectionError::TimedOut));
     }
 
     #[test]

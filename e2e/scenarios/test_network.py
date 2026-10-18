@@ -260,8 +260,8 @@ DEADLINE_PATHS = {
 def deadline_logins(env, alice, server):
     """A login over each DEADLINE_PATHS path, made once for the tests that judge it.
 
-    Nothing random decides how one ends, and they take 5 and 17 s, so the
-    pinned test and the xfail test share them.
+    Nothing random decides how one ends, and they take 5 and 17 s, so both
+    tests share them.
     """
     links, done = [], {}
 
@@ -302,17 +302,15 @@ def test_a_handshake_past_the_server_deadline_fails(path, deadline_logins):
 
 @pytest.mark.plan("NET-13")
 @pytest.mark.parametrize("path", sorted(DEADLINE_PATHS))
-@pytest.mark.xfail(strict=True, reason="F33: the server's handshake deadline is reported as quinn's generic application close")
 def test_a_handshake_past_the_server_deadline_is_named(path, deadline_logins):
     """The user learns that the server ended a handshake that took too long.
 
-    Today the client prints quinn's text for a peer's application close during
-    the handshake ("the application or application protocol caused the
-    connection to be closed during the handshake"), prefixed with "connection
-    lost" when the client had finished its side: it reads like a refusal or a
-    dropped session, not like a path too slow for the 5 s deadline. quinn's
-    text may stay, as long as qsh says what ended the login; a session that
-    never started was not lost.
+    The server's close reaches the client as quinn's bare application close
+    during the handshake ("the application or application protocol caused the
+    connection to be closed during the handshake"), on "slow" after the client
+    has finished its side and sent its request. qsh adds that the server ended
+    the login and allows 5 seconds, both times: a session that never started
+    was not lost.
     """
     r, _, _ = deadline_logins(path)
     assert r.rc == 255, r.describe()
