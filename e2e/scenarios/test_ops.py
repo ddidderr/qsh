@@ -446,10 +446,11 @@ def login_burst(client: QshClient, host: str, rounds: int, parallel: int = 4) ->
     return codes["0"] + codes["126"], codes["126"]
 
 
-# Lines the daemon's queue may drop that OPS-13 does not tally one by one,
-# such as the once-a-second admission summary for the revoked key's refused
-# connection.
-UNTALLIED_LINES = 4
+# Lines the daemon's queue may drop that OPS-13 does not tally one by one:
+# the once-a-second admission summary for the revoked key's refused
+# connection, and room for two more. Every run counted exactly one line more
+# than it tallied as missing.
+UNTALLIED_LINES = 3
 
 
 @pytest.mark.plan("OPS-13")
