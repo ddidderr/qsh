@@ -312,10 +312,12 @@ def test_the_handshake_pool_filled_from_many_addresses(make_client, alice, serve
         )
         probe_out, probe_err = probe.communicate(timeout=30)
         probed = time.monotonic() - flooded
-        strangers = flood.wait(timeout=60)
+        # Just past the deadline, whether or not every stranger has heard of it.
+        time.sleep(max(0.0, flooded + HANDSHAKE_DEADLINE + 0.5 - time.monotonic()))
         begin = time.monotonic()
         after = alice.run("server", "echo", "AFTER")
         released = time.monotonic() - begin
+        strangers = flood.wait(timeout=60)
         session.wait(timeout=60)
         reader.join(timeout=10)
         time.sleep(1.5)  # the last admission counters reach the journal
@@ -328,18 +330,23 @@ def test_the_handshake_pool_filled_from_many_addresses(make_client, alice, serve
     print(
         f"probe ended {probed:.1f}s into the flood: {probe_err.decode().strip()}; strangers ended after"
         f" {min(x.took for x in strangers):.2f}-{max(x.took for x in strangers):.2f}s;"
-        f" a login after them took {released:.2f}s"
+        f" {sum(x.took > CONNECT_TIMEOUT - 2 for x in strangers)} on their own timer;"
+        f" a login just past the deadline took {released:.2f}s"
     )
     # The precondition: the pool is full, so no new login gets in.
     assert probe.returncode == 255 and b"timed out after 2s" in probe_err, f"the pool was not full: {probe_out + probe_err}"
     # Its last attempt came well before the strangers' deadline.
     assert probed < HANDSHAKE_DEADLINE - 0.5, f"the probe ended {probed:.1f}s into the flood"
-    # Each slot was held until the server's deadline ended its handshake, not
-    # until the stranger's own timer ran out.
+    # Each slot was held until the server's deadline ended its handshake. The
+    # stranger usually hears so in a 131-byte close. When a retransmission of
+    # the server's first flight falls due at that moment, quinn pads the close
+    # to 1,200 bytes like the flight, this path drops it, and the stranger
+    # waits out its own timer instead; the server freed the slot all the same.
     for x in strangers:
-        assert x.rc == 255 and f"timed out after {CONNECT_TIMEOUT}s" not in x.err, x
-        assert HANDSHAKE_DEADLINE - 1 < x.took < CONNECT_TIMEOUT - 2, x
-    # Every slot is free again at once.
+        assert x.rc == 255, x
+        if f"timed out after {CONNECT_TIMEOUT}s" not in x.err:
+            assert HANDSHAKE_DEADLINE - 1 < x.took < CONNECT_TIMEOUT - 2, x
+    # The slots are free again at the deadline.
     assert after.rc == 0 and after.stdout == "AFTER\n", after.describe()
     assert released < 2, f"a login after the flood took {released:.1f}s"
     # All 32 strangers had a slot, and none of them got further.
