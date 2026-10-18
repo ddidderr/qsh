@@ -18,8 +18,6 @@ from .env import CommandFailed, Node, Result
 
 PORT = 2222
 
-DEFAULT_STATE_DIR = "/etc/qsh"
-
 # `qsh-server authorize` and `revoke` take effect at the server's next
 # once-a-second reload; revocation also needs the next policy check. The
 # README promises "normally within two seconds". Scenarios wait this long
@@ -35,13 +33,9 @@ def unique(prefix: str) -> str:
 
 
 class QshServer:
-    """A qsh-server on a server node, run by systemd as root (or by hand).
+    """A qsh-server on a server node, run by systemd as root (or by hand)."""
 
-    A state directory other than /etc/qsh is passed to every management
-    command with `--dir`.
-    """
-
-    def __init__(self, node: Node, *, state_dir: str = DEFAULT_STATE_DIR, unit: str = "qsh-server") -> None:
+    def __init__(self, node: Node, *, state_dir: str = "/etc/qsh", unit: str = "qsh-server") -> None:
         self.node = node
         self.state_dir = state_dir
         self.unit = unit
@@ -51,11 +45,8 @@ class QshServer:
         return self.node.service
 
     def admin(self, *args: str, check: bool = True, user: str | None = None) -> Result:
-        """Run `qsh-server [--dir DIR] <args>`, as root unless `user` is given."""
-        argv = ["qsh-server"]
-        if self.state_dir != DEFAULT_STATE_DIR:
-            argv += ["--dir", self.state_dir]
-        return self.node.run([*argv, *args], user=user, check=check)
+        """Run `qsh-server <args>` as root (the default /etc/qsh)."""
+        return self.node.run(["qsh-server", *args], user=user, check=check)
 
     def keygen(self, *args: str) -> str:
         out = self.admin("keygen", *args).stdout

@@ -9,9 +9,7 @@ TIOCSWINSZ on the server's PTY.
 
 from __future__ import annotations
 
-import os
 import re
-import signal
 import time
 
 import pexpect
@@ -95,34 +93,6 @@ class Terminal:
 
     def resize(self, rows: int, cols: int) -> None:
         self.child.setwinsize(rows, cols)
-
-    def resize_and_wait(self, rows: int, cols: int, timeout: float = 10) -> None:
-        """Resize, and wait until qsh's own terminal in the container has the size.
-
-        Right after a session starts, `docker exec` sometimes drops a resize
-        on the way to the container (measured: about 1 in 100 at once after
-        the first output; the container's terminal kept the old size). Asking
-        `docker` to forward it again (SIGWINCH, which makes it read our size)
-        does not touch qsh: the container's terminal changes, and qsh hears
-        of it, only once. What qsh does from there is up to the scenario.
-        """
-        self.child.setwinsize(rows, cols)
-        deadline = time.monotonic() + timeout
-        while (size := self.client_size()) != f"{rows} {cols}":
-            if time.monotonic() > deadline:
-                raise AssertionError(f"the client's terminal is still {size!r} after {timeout}s, not {rows} {cols}")
-            os.kill(self.child.pid, signal.SIGWINCH)
-            time.sleep(0.25)
-
-    def client_size(self) -> str:
-        """`rows cols` of the terminal qsh runs on in the client's container.
-
-        On failure, what the lookup printed instead.
-        """
-        script = 'p=$(pgrep -n -u "$0" -f "$1") && t=$(ps -o tty= -p "$p" | tr -d " ") && stty -F "/dev/$t" size'
-        pattern = "^" + re.escape(" ".join(self.argv)) + "$"
-        r = self.node.run(["sh", "-c", script, self.user, pattern])
-        return r.stdout.strip() if r.rc == 0 else f"unknown (status {r.rc}: {r.stdout.strip()} {r.stderr.strip()})"
 
     # ------------------------------------------------------------ teardown
 
