@@ -265,6 +265,23 @@ def test_signals_to_qsh_are_relayed_without_a_terminal(alice, server, signal, co
     assert proc.returncode == code, err.decode()
 
 
+@pytest.mark.plan("EXEC-22")
+@pytest.mark.parametrize("signal", ["INT", "TERM"])
+def test_a_timeout_reaches_the_remote_command_once(alice, server, signal):
+    """`timeout -s INT|TERM qsh host cmd`: one signal, though qsh may catch it twice.
+
+    timeout signals qsh and then its own process group, qsh included. On one
+    CPU qsh catches both, the second just after it relayed the first, and
+    must not take it for a second Ctrl-C (LIFE-10): the remote trap runs to
+    the end, and its status becomes qsh's.
+    """
+    script = 'trap "sleep 0.5; echo cleaned; exit 7" INT TERM; echo ready; while :; do sleep 0.1; done'
+    argv = alice.argv("server", "sh", "-c", script)
+    r = alice.node.run(["taskset", "-c", "0", "timeout", "--preserve-status", "-s", signal, "3", *argv], user="alice", timeout=30)
+    assert r.stdout.split() == ["ready", "cleaned"], r.describe()
+    assert r.rc == 7, r.describe()
+
+
 @pytest.mark.plan("EXEC-23")
 def test_an_argument_that_is_not_utf8_is_refused_cleanly(alice):
     """qsh/1 carries text arguments; a Latin-1 file name is refused, not a crash."""
