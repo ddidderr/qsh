@@ -463,6 +463,12 @@ at most two attempts at once, and an interleaved IPv6/IPv4 order. Each address
 gets its own connect timeout, so a dual-stack name still works when only one
 family is reachable.
 
+The server gives each login 5 seconds to finish its QUIC handshake, and a
+longer `--connect-timeout` cannot extend that. In testing at 50 ms each way,
+logins were reliable up to 20% loss each way, about half failed at 50%, and
+most failed from 60%. A path with a round trip of 5 seconds or more cannot log
+in at all. When the server ends a login this way, qsh says so.
+
 Host pins normalize DNS case, IP address spelling, and numeric ports. Existing
 equivalent entries with conflicting keys fail closed. A DNS name ending in `.`
 remains distinct: its absolute lookup must not be confused with resolver search

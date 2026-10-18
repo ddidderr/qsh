@@ -101,7 +101,7 @@ const MAX_HANDSHAKES_PER_SOURCE: usize = 4;
 /// How long an accepted connection may take to finish its handshake. The idle
 /// timeout is far too generous for this — it would let half-open attempts hold
 /// admission slots for a minute each.
-const HANDSHAKE_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const HANDSHAKE_GRACE: Duration = Duration::from_secs(5);
 
 /// How long an opened session stream may take to say what it wants.
 const FIRST_FRAME_GRACE: Duration = Duration::from_secs(10);
