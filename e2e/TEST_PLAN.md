@@ -171,8 +171,8 @@ fails until the mark is removed, so a fix cannot go unnoticed.
 
 ### EXEC-22 — INT and TERM are relayed without a terminal
 - **Status:** automated · **Priority:** P1 · **Needs:** —
-- **Steps:** send INT or TERM to a local qsh running a remote shell that traps it.
-- **Expected:** the remote trap runs and its status (130, 143) becomes qsh's (`src/client.rs` `until_fatal`: without a terminal INT and TERM are relayed to the remote command). Only a second INT or TERM before the command has ended would end qsh itself (LIFE-10).
+- **Steps:** send INT or TERM to a local qsh running a remote shell that traps it. Then `timeout -s INT|TERM 3 qsh server …` on one CPU (`taskset -c 0`), with a trap that takes 0.5 s to clean up and exits 7.
+- **Expected:** the remote trap runs and its status (130, 143; 7 after its clean-up) becomes qsh's (`src/client.rs` `until_fatal`: without a terminal INT and TERM are relayed to the remote command). Only a second INT or TERM before the command has ended would end qsh itself (LIFE-10), and the same signal again within 200 ms (`REPEAT_GRACE`) is not a second one: `timeout` signals qsh and then its own process group, and on one CPU qsh catches both. Measured: 7 and the clean-up's output in each of five runs per signal. Before that rule the second copy ended qsh with 130 or 143 and cut the trap short, in every run on one CPU.
 
 ### EXEC-23 — An argument that is not UTF-8 is refused cleanly
 - **Status:** automated · **Priority:** P1 · **Needs:** —

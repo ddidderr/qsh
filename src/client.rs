@@ -991,6 +991,11 @@ impl FatalSignals {
     }
 }
 
+/// How soon after a relayed signal the same one again is still that signal:
+/// `timeout` sends its signal to qsh and then to qsh's process group, and qsh
+/// can catch both.
+const REPEAT_GRACE: Duration = Duration::from_millis(200);
+
 /// Wait for a signal that ends the session, and return 128+n for it.
 ///
 /// A relayed signal goes to the remote command, so that it can clean up and
@@ -1002,6 +1007,15 @@ async fn until_fatal(caught: &mut mpsc::Receiver<Caught>, tx: Outbound) -> Optio
     let Some(name) = relayed else {
         return Some(128 + sig);
     };
+    let relayed_at = std::time::Instant::now();
+    let mut next = std::pin::pin!(async {
+        loop {
+            let (number, _) = caught.recv().await?;
+            if number != sig || relayed_at.elapsed() >= REPEAT_GRACE {
+                return Some(128 + number);
+            }
+        }
+    });
     tokio::select! {
         sent = tx.send(Frame::Signal(name.into())) => {
             if sent.is_err() {
@@ -1010,9 +1024,9 @@ async fn until_fatal(caught: &mut mpsc::Receiver<Caught>, tx: Outbound) -> Optio
         }
         // The queue can be full when the path is dead; the second signal must
         // not wait for room.
-        next = caught.recv() => return Some(128 + next?.0),
+        status = &mut next => return status,
     }
-    Some(128 + caught.recv().await?.0)
+    next.await
 }
 
 /// The signals whose default action ends qsh and that a handler can catch.
@@ -1308,7 +1322,9 @@ mod tests {
         let session = tokio::spawn(async move { until_fatal(&mut caught, tx).await });
         signals.send((libc::SIGINT, Some("INT"))).await.unwrap();
         assert!(matches!(rx.recv().await, Some(Frame::Signal(name)) if name == "INT"));
-        tokio::task::yield_now().await;
+        // `timeout` signals qsh and then its process group: one INT, caught twice.
+        signals.send((libc::SIGINT, Some("INT"))).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             !session.is_finished(),
             "the first relayed signal ended the session"
@@ -1342,8 +1358,13 @@ mod tests {
         tx.send(Frame::Stdin(vec![1])).await.unwrap();
         let session = tokio::spawn(async move { until_fatal(&mut caught, tx).await });
         signals.send((libc::SIGINT, Some("INT"))).await.unwrap();
-        tokio::task::yield_now().await;
-        assert!(!session.is_finished());
+        signals.send((libc::SIGINT, Some("INT"))).await.unwrap();
+        tokio::time::sleep(REPEAT_GRACE).await;
+        assert!(
+            !session.is_finished(),
+            "the same INT at once ended the session"
+        );
+        // A user pressing Ctrl-C again.
         signals.send((libc::SIGINT, Some("INT"))).await.unwrap();
         let status = tokio::time::timeout(Duration::from_secs(1), session)
             .await
