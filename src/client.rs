@@ -912,17 +912,9 @@ impl EscapeState {
 ///
 /// `SIGINT` is among them: in raw mode Ctrl-C is a byte for the remote
 /// terminal, not a signal, so an INT can only come from outside (`kill -INT`,
-/// `timeout -s INT`, a supervisor), and its default action, like that of USR1,
-/// USR2 and ALRM, would leave the terminal raw.
-struct FatalSignals {
-    term: tokio::signal::unix::Signal,
-    hup: tokio::signal::unix::Signal,
-    quit: tokio::signal::unix::Signal,
-    int: tokio::signal::unix::Signal,
-    usr1: tokio::signal::unix::Signal,
-    usr2: tokio::signal::unix::Signal,
-    alrm: tokio::signal::unix::Signal,
-}
+/// `timeout -s INT`, a supervisor), and its default action, like that of any
+/// other signal listed in `terminating_signals`, would leave the terminal raw.
+struct FatalSignals(Vec<(libc::c_int, tokio::signal::unix::Signal)>);
 
 impl FatalSignals {
     /// Start listening. Registration happens here, synchronously, so that by
@@ -930,34 +922,66 @@ impl FatalSignals {
     /// for a spawned task to be polled would leave a window with the terminal
     /// already in raw mode and nothing watching.
     fn install() -> Result<Self> {
-        use tokio::signal::unix::{signal, SignalKind};
-        Ok(Self {
-            term: signal(SignalKind::terminate()).context("listening for SIGTERM")?,
-            hup: signal(SignalKind::hangup()).context("listening for SIGHUP")?,
-            quit: signal(SignalKind::quit()).context("listening for SIGQUIT")?,
-            int: signal(SignalKind::interrupt()).context("listening for SIGINT")?,
-            usr1: signal(SignalKind::user_defined1()).context("listening for SIGUSR1")?,
-            usr2: signal(SignalKind::user_defined2()).context("listening for SIGUSR2")?,
-            alrm: signal(SignalKind::alarm()).context("listening for SIGALRM")?,
+        let mut signals = Vec::new();
+        for number in terminating_signals() {
+            let kind = tokio::signal::unix::SignalKind::from_raw(number);
+            let signal = tokio::signal::unix::signal(kind)
+                .with_context(|| format!("listening for signal {number}"))?;
+            signals.push((number, signal));
+        }
+        Ok(Self(signals))
+    }
+
+    async fn recv(&mut self) -> libc::c_int {
+        std::future::poll_fn(|cx| {
+            for (number, signal) in &mut self.0 {
+                if let std::task::Poll::Ready(Some(())) = signal.poll_recv(cx) {
+                    return std::task::Poll::Ready(*number);
+                }
+            }
+            std::task::Poll::Pending
         })
+        .await
     }
 
     /// Put the terminal back and exit when one of them arrives.
     async fn restore_on_fire(mut self, fd: RawFd, saved: nix::sys::termios::Termios) {
-        let sig = tokio::select! {
-            _ = self.term.recv() => libc::SIGTERM,
-            _ = self.hup.recv() => libc::SIGHUP,
-            _ = self.quit.recv() => libc::SIGQUIT,
-            _ = self.int.recv() => libc::SIGINT,
-            _ = self.usr1.recv() => libc::SIGUSR1,
-            _ = self.usr2.recv() => libc::SIGUSR2,
-            _ = self.alrm.recv() => libc::SIGALRM,
-        };
+        let sig = self.recv().await;
         pty::restore_termios(fd, &saved);
         let mut stdout = tokio::io::stdout();
         let _ = stdout.flush().await;
         std::process::exit(128 + sig);
     }
+}
+
+/// The signals whose default action ends qsh and that a handler can catch.
+/// Not the faults (SEGV, BUS, FPE, ILL) or TRAP: those come from qsh's own
+/// instructions, and a handler that returns would only run into them again.
+fn terminating_signals() -> Vec<libc::c_int> {
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut signals = vec![
+        libc::SIGHUP,
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGABRT,
+        libc::SIGALRM,
+        libc::SIGTERM,
+        libc::SIGUSR1,
+        libc::SIGUSR2,
+        libc::SIGVTALRM,
+        libc::SIGPROF,
+        libc::SIGXCPU,
+        libc::SIGXFSZ,
+        libc::SIGSYS,
+    ];
+    // Elsewhere SIGIO is ignored by default, and there is no SIGPWR.
+    #[cfg(target_os = "linux")]
+    signals.extend(
+        [libc::SIGIO, libc::SIGPWR]
+            .into_iter()
+            .chain(libc::SIGRTMIN()..=libc::SIGRTMAX()),
+    );
+    signals
 }
 
 /// A forced PTY may receive piped input while output still goes to a terminal.
@@ -1219,6 +1243,77 @@ mod tests {
                 .unwrap(),
             255
         );
+    }
+
+    #[tokio::test]
+    async fn the_first_signal_to_arrive_is_reported() {
+        use nix::sys::signal::{raise, Signal};
+        // Both are ignored by default, so neither can end the test binary.
+        let listen = |number| {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(number)).unwrap()
+        };
+        let mut signals = FatalSignals(vec![
+            (libc::SIGURG, listen(libc::SIGURG)),
+            (libc::SIGWINCH, listen(libc::SIGWINCH)),
+        ]);
+        let next = Duration::from_secs(1);
+        raise(Signal::SIGWINCH).unwrap();
+        let caught = tokio::time::timeout(next, signals.recv()).await.unwrap();
+        assert_eq!(caught, libc::SIGWINCH);
+        raise(Signal::SIGURG).unwrap();
+        let caught = tokio::time::timeout(next, signals.recv()).await.unwrap();
+        assert_eq!(caught, libc::SIGURG);
+    }
+
+    #[test]
+    fn every_terminating_signal_is_caught_except_the_faults() {
+        let caught = terminating_signals();
+        for number in [
+            libc::SIGHUP,
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGABRT,
+            libc::SIGALRM,
+            libc::SIGTERM,
+            libc::SIGUSR1,
+            libc::SIGUSR2,
+            libc::SIGVTALRM,
+            libc::SIGPROF,
+            libc::SIGXCPU,
+            libc::SIGXFSZ,
+            libc::SIGSYS,
+        ] {
+            assert!(caught.contains(&number), "signal {number} is not caught");
+        }
+        #[cfg(target_os = "linux")]
+        for number in [
+            libc::SIGIO,
+            libc::SIGPWR,
+            libc::SIGRTMIN(),
+            libc::SIGRTMIN() + 1,
+            libc::SIGRTMAX(),
+        ] {
+            assert!(caught.contains(&number), "signal {number} is not caught");
+        }
+        // Faults keep their default action, KILL and STOP cannot be caught,
+        // and the rest do not end qsh (the Rust runtime ignores PIPE).
+        for number in [
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGFPE,
+            libc::SIGILL,
+            libc::SIGTRAP,
+            libc::SIGKILL,
+            libc::SIGSTOP,
+            libc::SIGPIPE,
+            libc::SIGCHLD,
+            libc::SIGWINCH,
+            libc::SIGCONT,
+            libc::SIGTSTP,
+            libc::SIGURG,
+        ] {
+            assert!(!caught.contains(&number), "signal {number} is caught");
+        }
     }
 
     fn verify(pem: &str) -> std::result::Result<ServerCertVerified, TlsError> {

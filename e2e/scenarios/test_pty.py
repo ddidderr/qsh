@@ -206,21 +206,14 @@ def test_a_resize_during_session_setup_is_not_lost(alice, server, make_link, ter
 
 
 @pytest.mark.plan("PTY-15")
-@pytest.mark.parametrize(
-    "signal",
-    [
-        "INT",
-        "USR1",
-        "HUP",
-        "TERM",
-        *(
-            pytest.param(name, marks=pytest.mark.xfail(strict=True, reason="F27: qsh catches only seven terminating signals"))
-            for name in ("VTALRM", "PROF")
-        ),
-    ],
-)
+@pytest.mark.parametrize("signal", ["INT", "USR1", "HUP", "TERM", "VTALRM", "PROF", "XCPU", "RTMIN"])
 def test_a_signal_from_outside_still_restores_the_terminal(alice, signal):
-    """`kill -INT` or `timeout -s INT` on an interactive qsh: the terminal comes back."""
+    """`kill -INT` or `timeout -s INT` on an interactive qsh: the terminal comes back.
+
+    Every signal whose default action would end qsh, XCPU under `ulimit -t`
+    or a real-time one included; only the faults (SEGV, BUS, FPE, ILL) and
+    TRAP are left to their default action.
+    """
     local = local_sh(alice.node, "stty -g > /tmp/stty.b; qsh server; stty -g > /tmp/stty.a; cmp -s /tmp/stty.b /tmp/stty.a; echo CMP-$?")
     try:
         local.expect(r"\$ ")  # the remote login prompt

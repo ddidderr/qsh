@@ -242,8 +242,8 @@ fails until the mark is removed, so a fix cannot go unnoticed.
 
 ### PTY-15 — A signal from outside still restores the terminal
 - **Status:** automated · **Priority:** P1 · **Needs:** pty
-- **Steps:** `pkill -INT|-USR1|-HUP|-TERM|-VTALRM|-PROF qsh` during an interactive session started from a plain local `sh`.
-- **Expected:** the local terminal's settings are as before. Found F14 (fixed). VTALRM and PROF, as strict xfails, still leave it raw: qsh catches only TERM, HUP, QUIT, INT, USR1, USR2 and ALRM (`FatalSignals::install`, `src/client.rs`), and any other terminating signal (XCPU under `ulimit -t`, say) kills it before the terminal is restored. Found F27.
+- **Steps:** `pkill -INT|-USR1|-HUP|-TERM|-VTALRM|-PROF|-XCPU|-RTMIN qsh` during an interactive session started from a plain local `sh`.
+- **Expected:** the local terminal's settings are as before. qsh catches every signal whose default action would end it, XCPU under `ulimit -t` and the real-time signals included; only the faults (SEGV, BUS, FPE, ILL) and TRAP keep their default action (`terminating_signals`, `src/client.rs`). It used to catch only TERM, HUP, QUIT, INT, USR1, USR2 and ALRM, and VTALRM, PROF, XCPU and RTMIN left the terminal raw. Found F14 and F27.
 
 ### PTY-16 — `~.` returns promptly over a long round trip
 - **Status:** automated · **Priority:** P2 · **Needs:** pty, netsim
