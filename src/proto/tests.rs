@@ -77,7 +77,7 @@ async fn raw_payloads_keep_the_wire_format_and_size_limit() {
     ] {
         let mut encoded = Vec::new();
         assert!(write_frame(&mut encoded, &frame).await.is_err());
-        assert!(encoded.is_empty());
+        assert_eq!(encoded, b"");
     }
 }
 
@@ -152,7 +152,7 @@ async fn dense_argument_and_environment_lists_are_rejected() {
         assert!(write_frame(&mut outgoing, &Frame::Request(req))
             .await
             .is_err());
-        assert!(outgoing.is_empty());
+        assert_eq!(outgoing, b"");
     }
 }
 
@@ -204,7 +204,7 @@ async fn every_request_string_is_bounded_on_read_and_write() {
         assert!(write_frame(&mut outgoing, &Frame::Request(req))
             .await
             .is_err());
-        assert!(outgoing.is_empty());
+        assert_eq!(outgoing, b"");
     }
 }
 
@@ -224,7 +224,7 @@ async fn aggregate_request_budget_is_enforced_on_read_and_write() {
     assert!(write_frame(&mut outgoing, &Frame::Request(req))
         .await
         .is_err());
-    assert!(outgoing.is_empty());
+    assert_eq!(outgoing, b"");
 }
 
 #[tokio::test]
