@@ -336,9 +336,9 @@ against, the boundaries it promises, and the trade-offs already decided.
   attempt over the limit gets no answer, and the client sends it again on
   QUIC's retransmission timer, about 1, 3 and 7 seconds after the first. So
   when many clients behind one address connect at the same moment over a WAN
-  path, about four get in per retry: of 32 at once, about 16 log in, whatever
-  `--connect-timeout` says, and the rest fail, usually with `timed out`.
-  Stagger such bursts.
+  path, about four get in per retry: of 32 at once, about 16 log in, and a
+  longer `--connect-timeout` lets no more in. The rest fail, usually with
+  `timed out`. Stagger such bursts.
 * A key's policy is re-read for every session, not captured when the
   connection was made, so revoking a key also cuts off the connections it
   already has. A change that no longer allows a running session (shells or
