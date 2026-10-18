@@ -43,7 +43,7 @@ Each scenario has an ID (`AREA-NN`), never reused once published, and:
   next to the current one, which the image lacks while OPS-14 and OPS-16 are
   deferred).
 
-`e2e/run plan` (CI runs it) fails when a status is not one of these, when a
+`e2e/run plan` (part of `just verify`) fails when a status is not one of these, when a
 test names an ID this file does not have, when an `automated` scenario has
 no test, or when a test implements a scenario not marked `automated`.
 
@@ -627,7 +627,7 @@ fails until the mark is removed, so a fix cannot go unnoticed.
 
 ### OPS-14 — The upgrade path: replace the binary and restart
 - **Status:** deferred · **Priority:** P1 · **Needs:** server2, two-builds
-- **Deferred:** Paul, 2026-10-18: compatibility with qsh 1.0 is ignored for now, since nobody uses qsh yet, so F36 is not fixed. Revisit when a release people run has to be upgraded from, against that release rather than 1.0. Commit 34c6862 still has the tests (`e2e/scenarios/test_ops.py`), the image's 1.0 build and unit (`e2e/docker/Dockerfile`, `e2e/run`) and the harness's support for them (`e2e/harness/qsh.py`, `e2e/conftest.py`). The rest of this entry is what they checked and found against 1.0.
+- **Deferred:** decided 2026-10-18: compatibility with qsh 1.0 is ignored for now, since nobody uses qsh yet, so F36 is not fixed. Revisit when a release people run has to be upgraded from, against that release rather than 1.0. Commit 34c6862 still has the tests (`e2e/scenarios/test_ops.py`), the image's 1.0 build and unit (`e2e/docker/Dockerfile`, `e2e/run`) and the harness's support for them (`e2e/harness/qsh.py`, `e2e/conftest.py`). The rest of this entry is what they checked and found against 1.0.
 - **Why:** an upgrade replaces the binary under the unit and restarts it. Neither 1.0's README nor the current one has upgrade notes; the current one says only that policies written "before `key_fingerprint` existed remain accepted with a warning for upgrade compatibility" (THREAT_MODEL lists the same trade-off). 1.0 shipped contrib/qsh-server.service with `ProtectSystem=full`; the unit 1.0's README printed never set it, and the current contrib unit dropped it on purpose ("ProtectSystem=full would make /usr and /etc read-only *inside user sessions*"). An upgrade that replaces only the binary keeps whichever unit the host had.
 - **Steps:** server2 set up from scratch by qsh-server 1.0 (`keygen`, `authorize`) with three keys: one made by the current client; one made and pinned by qsh 1.0 itself, held to `--no-shell --command id`; one that 1.0's `authorize --force` left under two names. Replace `/usr/local/bin/qsh-server` as a package manager does (a new file renamed over the old one), check that the running 1.0 daemon still serves, `systemctl restart`. Rebind a 1.0 policy with `authorize`. Then the same upgrade on a host that kept 1.0's contrib unit file.
 - **Expected:** the host fingerprint is unchanged and no client re-pins: the current client, qsh 1.0, and the current client on the identity 1.0 wrote (`id.crt`, `id.key`, `known_hosts`) all log in. The 1.0 policy still refuses `sh`, and now also `/usr/bin/id`, because `argv[0]` is matched whole (1.0 matched the basename; THREAT_MODEL: "exact match, never basename"). The key under two names gets neither policy: refused, both names listed as `CONFLICT`, the journal names both. Each 1.0 policy is accepted with the warning "does not record which key it is for; re-run `qsh-server authorize`", at startup and from `list`. A plain re-run of `authorize` is refused ("pass --force"); with `--force` and the same options it writes `key_fingerprint`, the warning stops and the policy still restricts. Measured: about 9 s.
@@ -641,7 +641,7 @@ fails until the mark is removed, so a fix cannot go unnoticed.
 
 ### OPS-16 — Version skew and rollback
 - **Status:** deferred · **Priority:** P1 · **Needs:** server2, two-builds
-- **Deferred:** Paul, 2026-10-18: compatibility with qsh 1.0 is ignored for now, since nobody uses qsh yet, so F32 and F37 are not fixed. Revisit when a release people run has to work with a newer one, or be rolled back to, against that release rather than 1.0. Commit 34c6862 still has the tests (`e2e/scenarios/test_ops.py`), the image's 1.0 build (`e2e/docker/Dockerfile`, `e2e/run`) and the harness's support for it (`e2e/harness/qsh.py`, `e2e/harness/terminal.py`, `e2e/conftest.py`). The rest of this entry is what they checked and found against 1.0.
+- **Deferred:** decided 2026-10-18: compatibility with qsh 1.0 is ignored for now, since nobody uses qsh yet, so F32 and F37 are not fixed. Revisit when a release people run has to work with a newer one, or be rolled back to, against that release rather than 1.0. Commit 34c6862 still has the tests (`e2e/scenarios/test_ops.py`), the image's 1.0 build (`e2e/docker/Dockerfile`, `e2e/run`) and the harness's support for it (`e2e/harness/qsh.py`, `e2e/harness/terminal.py`, `e2e/conftest.py`). The rest of this entry is what they checked and found against 1.0.
 - **Why:** clients and servers are upgraded separately, and a bad upgrade is rolled back. Both builds speak qsh/1, protocol version 1 (README "Protocol"), so a mixed pair must behave as a matched one. A rollback must not undo what the newer build refused (THREAT_MODEL actor 3: revocation and expiry hold for every session).
 - **Steps:** servers run by hand on server2, each with its own state directory and port. (1) qsh 1.0's client against the current server, and the current client against qsh-server 1.0: 1 MiB of every byte value through a remote `cat` on stdin without a terminal, with a line on stderr and `exit 7`; a shell killing itself with TERM; argv and `-E` passed verbatim; a forced terminal (`-t`) opened at 33x91, resized to 40x100, whose shell exits 3 from its WINCH trap; a local TERM to a client without a terminal, which the remote shell traps and answers with `exit 44`; a request as `bob`; a key the server does not know; the current server stopped under a 1.0 client. A key held to 200 programs (`--command` 200 times) asks for `sh`: from the current server to a 1.0 client in the same test, from a 1.0 server to the current client in its own. (2) A store 1.0 set up, then changed by the current build (a new key, the revocation of a 1.0 key, a passed `--expires-in-days 0` deadline, a 1.0 policy narrowed to `--no-exec`), served by the current build, by 1.0, and by the current build again after 1.0 authorized the revoked key anew. (3) The current build's `revoke` of a 1.0 key killed as it deletes the certificate (strace fault injection), then served by the current build and by 1.0.
 - **Expected:** (1) the same results as a matched pair: the stream byte for byte, status 7, stderr apart, 143, `[a b][*][$HOME][][v 16]`; `tty-33 91`, then `WINCH-40 100` and status 3 (the request carries the size, a Resize frame the change); the trap's `got-TERM`, status 44 and the remote job gone (a Signal frame); 126 with "not `bob`"; 255 with a message for the unknown key; 255 with "server shutting down" within 10 s. The key held to 200 programs gets 126 and "may not execute `sh`" both ways. From the current server it does (refusals are bounded to 512 characters). From a 1.0 server, whose refusal lists every permitted program (5,041 bytes here; 1.0's own client shows it and exits 126), the current client exits 255 with "frame payload of 5041 exceeds limit 4096": it caps Error frames at 4096 bytes, where 1.0 allowed 1 MiB for every frame. A program name of 5,000 bytes does the same (by hand: 1.0 refuses it in 5,051 bytes; the current server says "program name is too long"). Found F32. Not checked: 1.0's server sends no close when it stops (F8), so a current client waits out its idle timeout there. Measured: about 9 s and 3 s.
@@ -827,21 +827,21 @@ that fixed each one carries its ID.
 | F22 | P2 | A narrowed policy ended sessions with `stream reset by peer: error 2` and no journal line | AUTH-18 | fixed |
 | F23 | P2 | `-o` accepted any ssh option and silently ignored all but `StrictHostKeyChecking=…`, including `UserKnownHostsFile`; `-v`, `-C`, `-a`, `-x` were no-ops | CLI-07 | fixed (all removed) |
 | F24 | P2 | An interactive `exit` waited two seconds for any background job on the terminal, and a chatty one could make it end with 255 | LIFE-09 | fixed |
-| F25 | P2 | A job that writes faster than the client reads still turns an interactive `exit` into status 255 after about 6 s | LIFE-09 | open |
-| F26 | P2 | A signal that ends qsh (a closed terminal window, `kill`) sends no close, so the remote job runs on until the idle timeout | LIFE-10 | open |
-| F27 | P2 | Terminating signals qsh does not catch (VTALRM, PROF, XCPU, …) still leave the local terminal raw | PTY-15 | open |
-| F28 | P2 | A stop or restart while the log sink is blocked hangs: the shutdown line waits on the blocked log writer before the endpoint is closed | OPS-13 | open |
-| F29 | P2 | Restarting the shipped unit while it waits for a late listen address trips systemd's start limit for good; the README's unit gives up within a second | OPS-15 | open |
-| F30 | P2 | A revoked session sometimes ends with only `stream reset by peer: error 2`, and its withdrawal line can be missing | AUTH-03, OPS-13 | open |
-| F31 | P2 | Stopping or restarting the server during a directory outage waits for every stuck account lookup; the README does not say what a slow directory does | AUTH-20 | open |
-| F32 | P2 | The client rejects a 1.0 server's refusal over 4096 bytes (`frame payload of N exceeds limit 4096`, 255) instead of showing it (126) | OPS-16 | open |
-| F33 | P2 | A login ended by the server's 5 s handshake deadline is reported with quinn's generic text, sometimes as "connection lost"; the README does not say which paths the deadline excludes | NET-13 | open (decision) |
-| F34 | P2 | On a dead path, Ctrl-C without a terminal, or a supervisor's TERM, does nothing until the idle timeout | LIFE-10 | open (decision) |
-| F35 | P2 | SIGHUP kills qsh-server without a word and the service stays down; the README does not say there is no reload | OPS-12 | open (decision) |
-| F36 | P2 | Under 1.0's contrib unit (`ProtectSystem=full`) an upgraded server never starts; there are no upgrade notes, and the legacy-policy advice fails as given | OPS-14 | open (decision) |
-| F37 | P2 | Rolling back to 1.0 re-enables a legacy key whose revoke was interrupted, or whose files were restored from a backup | OPS-16 | open (decision) |
-| F38 | P2 | Undocumented: of a burst from one NAT address over a WAN path, about 16 get in, whatever `--connect-timeout` says | LOAD-06 | open (docs) |
-| F39 | P2 | Undocumented rsync hazard: after an outage the old receiver's `--partial` cleanup replaces a quick retry's file | LIFE-11 | open (docs) |
+| F25 | P2 | A job that writes faster than the client reads still turns an interactive `exit` into status 255 after about 6 s | LIFE-09 | fixed |
+| F26 | P2 | A signal that ends qsh (a closed terminal window, `kill`) sends no close, so the remote job runs on until the idle timeout | LIFE-10 | fixed |
+| F27 | P2 | Terminating signals qsh does not catch (VTALRM, PROF, XCPU, …) still leave the local terminal raw | PTY-15 | fixed |
+| F28 | P2 | A stop or restart while the log sink is blocked hangs: the shutdown line waits on the blocked log writer before the endpoint is closed | OPS-13 | fixed |
+| F29 | P2 | Restarting the shipped unit while it waits for a late listen address trips systemd's start limit for good; the README's unit gives up within a second | OPS-15 | fixed |
+| F30 | P2 | A revoked session sometimes ends with only `stream reset by peer: error 2`, and its withdrawal line can be missing | AUTH-03, OPS-13 | fixed |
+| F31 | P2 | Stopping or restarting the server during a directory outage waits for every stuck account lookup; the README does not say what a slow directory does | AUTH-20 | fixed |
+| F32 | P2 | The client rejects a 1.0 server's refusal over 4096 bytes (`frame payload of N exceeds limit 4096`, 255) instead of showing it (126) | OPS-16 | deferred (1.0 compatibility) |
+| F33 | P2 | A login ended by the server's 5 s handshake deadline is reported with quinn's generic text, sometimes as "connection lost"; the README does not say which paths the deadline excludes | NET-13 | fixed |
+| F34 | P2 | On a dead path, Ctrl-C without a terminal, or a supervisor's TERM, does nothing until the idle timeout | LIFE-10 | fixed |
+| F35 | P2 | SIGHUP kills qsh-server without a word and the service stays down; the README does not say there is no reload | OPS-12 | fixed (HUP is ignored) |
+| F36 | P2 | Under 1.0's contrib unit (`ProtectSystem=full`) an upgraded server never starts; there are no upgrade notes, and the legacy-policy advice fails as given | OPS-14 | deferred (1.0 compatibility) |
+| F37 | P2 | Rolling back to 1.0 re-enables a legacy key whose revoke was interrupted, or whose files were restored from a backup | OPS-16 | deferred (1.0 compatibility) |
+| F38 | P2 | Undocumented: of a burst from one NAT address over a WAN path, about 16 get in, whatever `--connect-timeout` says | LOAD-06 | fixed (docs) |
+| F39 | P2 | Undocumented rsync hazard: after an outage the old receiver's `--partial` cleanup replaces a quick retry's file | LIFE-11 | fixed (docs) |
 
 ### Open items
 
@@ -874,9 +874,6 @@ are not security findings under THREAT_MODEL.md.
 - **`keygen` under umask 000** creates group- and world-writable state
   directories. THREAT_MODEL.md treats that as an administrator mistake;
   refusing such a store would be a cheap fail-closed hardening.
-- **Both builds call themselves 1.0.0**, so neither an administrator nor
-  the upgrade scenarios' pin can tell the previous release from this one
-  by `--version`.
 - **`--no-shell` refuses login-shell requests**, not interactive programs:
   `qsh -t server bash` still works. The flag's help says "interactive
   shells".

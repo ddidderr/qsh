@@ -9,7 +9,7 @@
 # certificate when the build host needs them (see e2e/README.md).
 
 # Pinned so a rebuild months from now produces the same environment. Update
-# them deliberately, as with the CI action pins.
+# them deliberately.
 ARG RUST_IMAGE=rust:1.97-slim-trixie@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c
 ARG BASE_IMAGE=debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
 

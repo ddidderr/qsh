@@ -55,7 +55,7 @@ internet.
 A proxy that refuses Debian's mirrors can still build the suite on another
 apt-based release: `QSH_E2E_BASE_IMAGE=ubuntu:26.04 e2e/run build`. The
 binaries are still compiled on Debian, so the base needs the same or a newer
-glibc. CI and the scenarios' expectations assume the pinned Debian.
+glibc. The scenarios' expectations assume the pinned Debian.
 
 ## The environment
 
@@ -109,7 +109,7 @@ coexist on one Docker host.
    model, or the code.
 2. Implement it in the matching `scenarios/test_*.py` and tag it with
    `@pytest.mark.plan("ID")`. Set its status in the plan to `automated`.
-3. `e2e/run plan` checks the two agree; CI runs it.
+3. `e2e/run plan` checks the two agree; `just verify` runs it.
 
 The fixtures in [conftest.py](conftest.py) provide the shared machines:
 `server` and `fast_server` (`server2`), `alice` and `bob` (authorized,

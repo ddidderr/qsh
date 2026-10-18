@@ -12,8 +12,7 @@ Every scenario in the plan is a `### ID — title` heading followed by a
   one keeps its plan entry, not its tests).
 
 It reads the files as text and needs nothing beyond the standard library,
-so it runs without the test environment (and as the first job of
-.github/workflows/e2e.yml).
+so it runs without the test environment (`e2e/run plan`).
 """
 
 from __future__ import annotations
