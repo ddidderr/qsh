@@ -167,7 +167,9 @@ fn run(paths: &ServerPaths, command: Command) -> Result<()> {
     }
 }
 
-/// How long exit waits for the runtime's threads once serving has stopped.
+/// How long exit waits for the runtime's threads once serving has stopped. It
+/// follows the up to 2 s (`SHUTDOWN_GRACE`) that `serve` gives the closes and
+/// the last log line, so a stop takes about 3 s at most.
 const BLOCKING_GRACE: Duration = Duration::from_secs(1);
 
 fn serve(paths: &ServerPaths, args: Serve) -> Result<()> {

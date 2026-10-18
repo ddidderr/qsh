@@ -75,6 +75,9 @@ prints the host key fingerprint.
 Without root, everything moves to `~/.config/qsh-server` and the server can
 only run sessions as the account it runs under.
 
+`serve` runs in the foreground; stop it with Ctrl-C. It ignores SIGHUP, so
+closing the terminal leaves it running, holding the port, with nowhere to log.
+
 ### On the client
 
 ```
