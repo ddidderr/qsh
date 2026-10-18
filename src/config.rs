@@ -1068,7 +1068,7 @@ mod tests {
         assert!(kh.set_if_new("example.com:2222", fp("b")).is_err());
         assert_eq!(kh.remove("EXAMPLE.COM:2222").unwrap(), 1);
         assert_eq!(kh.remove("[2001:DB8::1]:2222").unwrap(), 1);
-        assert!(KnownHosts::load(&path).unwrap().entries().is_empty());
+        assert_eq!(KnownHosts::load(&path).unwrap().entries(), []);
     }
 
     #[test]

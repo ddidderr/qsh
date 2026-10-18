@@ -1969,9 +1969,15 @@ mod tests {
         let first = diagnostics.reload(&store, &authorized);
         assert_eq!(first.len(), 1);
         assert!(first[0].contains("ignoring authorization"));
-        assert!(diagnostics.reload(&store, &authorized).is_empty());
+        assert_eq!(
+            diagnostics.reload(&store, &authorized),
+            Vec::<String>::new()
+        );
         std::fs::remove_file(&cert).unwrap();
-        assert!(diagnostics.reload(&store, &authorized).is_empty());
+        assert_eq!(
+            diagnostics.reload(&store, &authorized),
+            Vec::<String>::new()
+        );
         std::fs::write(&cert, "broken certificate").unwrap();
         assert_eq!(diagnostics.reload(&store, &authorized), first);
 
@@ -1982,14 +1988,20 @@ mod tests {
         let failure = diagnostics.reload(&store, &authorized);
         assert_eq!(failure.len(), 1);
         assert!(failure[0].contains("keeping previous authorizations"));
-        assert!(diagnostics.reload(&store, &authorized).is_empty());
+        assert_eq!(
+            diagnostics.reload(&store, &authorized),
+            Vec::<String>::new()
+        );
         std::fs::remove_file(&authorized).unwrap();
         std::fs::rename(saved, &authorized).unwrap();
         assert_eq!(
             diagnostics.reload(&store, &authorized),
             ["qsh-server: authorization reload recovered"]
         );
-        assert!(diagnostics.reload(&store, &authorized).is_empty());
+        assert_eq!(
+            diagnostics.reload(&store, &authorized),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -2014,11 +2026,17 @@ mod tests {
         // A management command holds the lock while it revokes the key.
         let writer = AuthStore::lock_directory(&authorized).unwrap();
         std::fs::remove_file(authorized.join("client.crt")).unwrap();
-        assert!(diagnostics.reload(&store, &authorized).is_empty());
+        assert_eq!(
+            diagnostics.reload(&store, &authorized),
+            Vec::<String>::new()
+        );
         assert!(crate::sync::read(&store).lookup(&fingerprint).is_some());
 
         drop(writer);
-        assert!(diagnostics.reload(&store, &authorized).is_empty());
+        assert_eq!(
+            diagnostics.reload(&store, &authorized),
+            Vec::<String>::new()
+        );
         assert!(crate::sync::read(&store).lookup(&fingerprint).is_none());
     }
 
