@@ -724,12 +724,10 @@ def test_the_shipped_unit_waits_for_a_late_listen_address(make_client, fast_serv
 
     Binding an address the host does not have fails (EADDRNOTAVAIL) and
     qsh-server exits 1. The shipped unit's `Restart=on-failure` and
-    `RestartSec=2` try again every two seconds, and systemd's default start
-    limit (5 starts within 10 s, then the unit fails for good) never trips
-    on that loop alone: each of the five gaps is RestartSec plus the try plus
-    timer slack, more than 2 s, so the sixth start always falls past the
-    window, which then starts over. When the address appears, the next try
-    binds it and serves.
+    `RestartSec=2` try again every two seconds, and its
+    `StartLimitIntervalSec=0` turns off systemd's start limit (by default 5
+    starts within 10 s, then the unit fails for good), so it never gives up.
+    When the address appears, the next try binds it and serves.
     """
     node = fast_server.node
     address, prefix = env.spare_ip(40), env.subnet().prefixlen
@@ -746,7 +744,7 @@ def test_the_shipped_unit_waits_for_a_late_listen_address(make_client, fast_serv
             f"serving after {seen['serving']}s"
         )
         assert waiting["ActiveState"] != "failed", f"the unit gave up: {waiting}, tries at {seen['tries']}"
-        # More tries than the start limit's burst: the limit was really in play.
+        # More tries than the start limit's burst: the unit kept going past it.
         assert int(waiting["NRestarts"]) > int(waiting["StartLimitBurst"]), waiting
         assert seen["serving"] is not None, f"not serving {LATE_ADDRESS_BOUND}s after the address appeared"
         r = client.run(address, "hostname", timeout=30)
@@ -756,22 +754,23 @@ def test_the_shipped_unit_waits_for_a_late_listen_address(make_client, fast_serv
 
 
 @pytest.mark.plan("OPS-15")
-@pytest.mark.xfail(strict=True, reason="F29: restarting the unit while it waits for its address trips the start limit for good")
 def test_restarting_while_waiting_for_the_address_does_not_give_up(make_client, fast_server, env):
     """An administrator restarts the waiting unit; it must still come up with the address.
 
-    Alone, the retry loop never reaches the start limit (see above). Every
-    start counts towards it, though, the administrator's too: a `systemctl
+    Under systemd's default start limit the retry loop alone never trips it:
+    each of the five gaps is RestartSec plus the try plus timer slack, more
+    than 2 s, so the sixth start falls past the 10 s window. Every start
+    counts towards it, though, the administrator's too: a `systemctl
     restart` m seconds after a try, to see whether it helps, moves the sixth
     start to 4 gaps + m after the window opened, inside the 10 s if m is
-    under 1.0-1.8 s (gaps of 2.25-2.05 s). systemd refuses that
-    start ("Start request repeated too quickly") and the unit stays failed,
-    also once the address is there. Here the administrator restarts twice,
+    under 1.0-1.8 s (gaps of 2.25-2.05 s). systemd then refused that start
+    ("Start request repeated too quickly") and the unit stayed failed, also
+    once the address was there (F29). Here the administrator restarts twice,
     each right after a failed try: the sixth start then comes about 7 s
     after the first, so the outcome does not hang on how fast this host
     runs the loop (one restart leaves about 1 s to spare over four gaps,
-    two leave 3 s over three). Proposed: `StartLimitIntervalSec=0` in the
-    unit's [Unit] section, so that it keeps trying.
+    two leave 3 s over three). The shipped unit's `StartLimitIntervalSec=0`
+    turns the limit off.
     """
     address, prefix = env.spare_ip(40), env.subnet().prefixlen
     client = make_client("alice", authorize_as="alice", on=fast_server)
@@ -779,7 +778,10 @@ def test_restarting_while_waiting_for_the_address_does_not_give_up(make_client, 
     original = listen_on(fast_server, address)
     try:
         seen = serve_on_a_late_address(fast_server, address, prefix, restarts=2)
-        print(f"after {LATE_ADDRESS_DELAY}s without the address: {seen['waiting']}; tries at {seen['tries']}")
+        print(
+            f"after {LATE_ADDRESS_DELAY}s without the address: {seen['waiting']}; tries at {seen['tries']}; "
+            f"serving after {seen['serving']}s"
+        )
         assert seen["serving"] is not None, f"the unit gave up: {seen['waiting']}, tries at {seen['tries']}"
         r = client.run(address, "hostname", timeout=30)
         assert r.rc == 0 and r.stdout.strip() == "server2", r.describe()
@@ -797,17 +799,16 @@ def readme_unit() -> str:
 
 
 @pytest.mark.plan("OPS-15")
-@pytest.mark.xfail(strict=True, reason="F29: the README's unit restarts every 100 ms, so a late address trips the start limit at once")
 def test_the_readme_unit_waits_for_a_late_listen_address(make_client, fast_server, env):
     """The same late address, under the unit the README shows instead of the shipped one.
 
-    The README's unit has `Restart=on-failure` but no `RestartSec=`, so
-    systemd retries after its default 100 ms: five tries take about a
-    second, the start limit trips, and the unit stays failed for good, also
-    once the address is there. It is also ordered only after
-    `network.target`, which waits for no address at all. Proposed: show the
-    shipped unit (`RestartSec=2`, `After=network-online.target`) in the
-    README, with `StartLimitIntervalSec=0` as for F29.
+    Without `RestartSec=`, systemd retries after its default 100 ms: five
+    tries took about a second, the start limit tripped, and the unit stayed
+    failed for good, also once the address was there (F29). The README's
+    unit sets `RestartSec=2s` and `StartLimitIntervalSec=0`, as the shipped
+    one does. It is still ordered only after `network.target`, which waits
+    for no address at all: the retries cover a late address whatever brings
+    it.
     """
     node = fast_server.node
     address, prefix = env.spare_ip(41), env.subnet().prefixlen
@@ -822,7 +823,10 @@ def test_the_readme_unit_waits_for_a_late_listen_address(make_client, fast_serve
         # The shipped unit holds 0.0.0.0:2222, which the new address's port would collide with.
         fast_server.stop()
         seen = serve_on_a_late_address(readme, address, prefix)
-        print(f"after {LATE_ADDRESS_DELAY}s without the address: {seen['waiting']}; tries at {seen['tries']}")
+        print(
+            f"after {LATE_ADDRESS_DELAY}s without the address: {seen['waiting']}; tries at {seen['tries']}; "
+            f"serving after {seen['serving']}s"
+        )
         assert seen["serving"] is not None, f"the unit gave up: {seen['waiting']}, tries at {seen['tries']}"
         r = client.run(address, "hostname", timeout=30)
         assert r.rc == 0 and r.stdout.strip() == "server2", r.describe()

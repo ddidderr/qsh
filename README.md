@@ -497,10 +497,13 @@ run, gives `126`.
 [Unit]
 Description=qsh server
 After=network.target
+# Keep retrying, for example until the listen address exists.
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/usr/local/bin/qsh-server serve
 Restart=on-failure
+RestartSec=2s
 # The server must start as root to switch to the target user.
 User=root
 Delegate=yes
@@ -509,6 +512,14 @@ KillMode=control-group
 [Install]
 WantedBy=multi-user.target
 ```
+
+A server that cannot start exits, and systemd tries again every two seconds
+for as long as it takes; each try logs why it failed. A `listen` address that
+arrives after boot (a DHCP lease, a floating IP) is served within a couple of
+seconds of appearing. Without `StartLimitIntervalSec=0`, systemd gives up after
+five starts within ten seconds, a `systemctl restart` included, and the unit
+stays failed. The repository ships this unit, with comments and a few more
+settings, as `contrib/qsh-server.service`.
 
 Open the port with `ufw allow 2222/udp` (or the nftables equivalent) — UDP,
 not TCP. This is the single most common reason a first connection times out.
