@@ -68,22 +68,12 @@ glibc. CI and the scenarios' expectations assume the pinned Debian.
 All five containers run one image, built by
 [docker/Dockerfile](docker/Dockerfile): qsh compiled from this checkout inside
 the image's Debian release, the shipped
-[systemd unit](../contrib/qsh-server.service), rsync, git, python3, strace, and
-the accounts `alice` (with supplementary group `project`), `bob`, `carol` and
+[systemd unit](../contrib/qsh-server.service), rsync, git, python3, and the
+accounts `alice` (with supplementary group `project`), `bob`, `carol` and
 `dave`. slapd, nslcd and the LDAP NSS module are there for AUTH-20's
 directory accounts, but off: nothing starts them at boot and nsswitch.conf
 does not name `ldap`. That scenario sets up a directory of its own on
 server2, points `server` at it, and takes both down again.
-
-The image also carries the previous release, for the upgrade and
-version-skew scenarios (OPS-14, OPS-16): `qsh-1.0` and `qsh-server-1.0` next
-to the current binaries, and the unit 1.0 shipped in
-`/usr/local/share/qsh-e2e/`. There are no release tags, so
-[run](run) pins its commit (`PREVIOUS_COMMIT`): `e2e/run build` exports that
-commit's tree with `git archive`, fetching just that commit first when the
-checkout is shallow (as CI's is), and hands it to the build as the `previous`
-context. A separate build stage compiles it with its own `Cargo.lock` and
-caches.
 
 - **server** boots systemd as PID 1 and runs `qsh-server` exactly as the
   README's setup describes: `keygen` as root into `/etc/qsh`, the unit
@@ -129,11 +119,6 @@ pinned identities), `alice_fast` (alice's key on server2), `make_client`
 run commands on nodes (`Node.run`, `Node.sh`, `Node.wait_for`) and reboot
 them (`Node.reboot`), drive qsh (`QshServer`, `QshClient`, `NetLink`), and
 drive terminals (`Terminal`).
-The previous release is one argument away: `make_client(previous=True)`
-makes an identity with `qsh-1.0` and drives it with it (`PreviousQshClient`),
-and `QshServer(node, program="qsh-server-1.0", state_dir=...)` manages a
-store with 1.0's `qsh-server`, passing `--dir` for any directory but
-/etc/qsh.
 
 Scenarios share the environment, as tests on real machines would. Leave
 shared state as you found it: use your own identity from `make_client`, a
@@ -182,9 +167,6 @@ Some lessons the first scenarios taught:
 - A strict xfail turns every failure inside it into the expected one. Raise
   a dedicated exception for the unmet expectation and name it in the mark's
   `raises`, so a broken precondition still fails (`harness.env.Unmet`).
-- To leave the state an interrupted management command leaves, interrupt a
-  real one: `strace -P FILE -e inject=unlink,unlinkat:error=EIO:signal=KILL`
-  kills it just as it would delete FILE.
 - A peer that does not answer is not one that refuses. A blackhole route
   makes the node that has it fail its own sends at once (EINVAL); to make a
   TCP service go silent, as behind a failed link, put the route on the
@@ -193,10 +175,6 @@ Some lessons the first scenarios taught:
   up an account missing from /etc/passwd waits out NSS's timeouts.
   `journalctl -u` is one: it resolves `systemd-coredump`. Read a unit's
   lines with `journalctl _SYSTEMD_UNIT=…` meanwhile.
-- `docker exec` sometimes drops a resize made right after a session starts:
-  the client container's terminal keeps the old size and qsh never hears of
-  it. `Terminal.resize_and_wait` forwards it again until that terminal has
-  the new size, so whatever happens next is qsh's doing.
 - `Terminal.expect` and `Terminal.command` wait for ever unless given a
   timeout. Give one where a broken qsh would print nothing, or the failure
   shows only when pytest-timeout ends the run 10 minutes later.
