@@ -984,9 +984,14 @@ impl FatalSignals {
                 _ => None,
             };
             let kind = tokio::signal::unix::SignalKind::from_raw(number);
-            let signal = tokio::signal::unix::signal(kind)
-                .with_context(|| format!("listening for signal {number}"))?;
-            signals.push(((number, relayed), signal));
+            match tokio::signal::unix::signal(kind) {
+                Ok(signal) => signals.push(((number, relayed), signal)),
+                // Emulators such as qemu-user reserve some real-time signals.
+                // One that cannot be caught keeps its default action, as
+                // before qsh caught any.
+                Err(_) if relayed.is_none() => {}
+                Err(e) => return Err(e).with_context(|| format!("listening for signal {number}")),
+            }
         }
         Ok(Self(signals))
     }
