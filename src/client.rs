@@ -1399,7 +1399,7 @@ mod tests {
 
         // A dual-stack name must offer every address, not just the first.
         if let Ok(all) = resolve("localhost", 2222, AddressFamily::Any) {
-            assert!(!all.is_empty());
+            assert_ne!(all, []);
             for addr in &all {
                 assert_eq!(addr.port(), 2222);
             }

@@ -2801,7 +2801,7 @@ fn no_stdin_leaves_the_local_input_unread() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(out.stdout.is_empty());
+    assert_eq!(out.stdout, b"");
     let mut unread = String::new();
     file.read_to_string(&mut unread).unwrap();
     assert_eq!(unread, "host-one\nhost-two\n");
