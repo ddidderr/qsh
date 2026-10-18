@@ -75,6 +75,9 @@ prints the host key fingerprint.
 Without root, everything moves to `~/.config/qsh-server` and the server can
 only run sessions as the account it runs under.
 
+`serve` runs in the foreground; stop it with Ctrl-C. It ignores SIGHUP, so
+closing the terminal leaves it running, holding the port, with nowhere to log.
+
 ### On the client
 
 ```
@@ -314,7 +317,7 @@ against, the boundaries it promises, and the trade-offs already decided.
   counted as suppressed. While stderr is blocked, the newest
   authorization-reload warnings wait in a small backlog. Logging is best
   effort: a failed write is not retried. A full log pipe cannot block session
-  handling or authorization reload.
+  handling, authorization reload, or a stop.
 
   This is a fairness reservation, not a rate limit: nothing is remembered
   after an attempt ends, so there is no per-address table to grow or expire.
@@ -346,6 +349,16 @@ against, the boundaries it promises, and the trade-offs already decided.
   A non-root daemon inherits its account's supplementary groups at startup and
   cannot reset them. Restart it after removing group membership, and do not
   grant service-specific supplementary groups that remote sessions should lack.
+* Accounts and groups come from NSS (`/etc/passwd`, LDAP, SSSD) and are looked
+  up afresh for every session. While a directory does not answer, a session
+  for one of its accounts waits out the NSS module's timeouts, holding its
+  place in the session budget, and then fails with status 126 and
+  ``looking up user `alice`: ENOENT: No such file or directory``: glibc reports
+  a source it cannot reach as `ENOENT`, so this reads like a missing account.
+  A local account's session can wait for its group lookup too, and then starts
+  without its directory groups. root needs no directory lookup and is not
+  affected. Give the NSS module finite timeouts; nslcd's `timelimit`, for one,
+  waits for ever by default. A stop or restart does not wait for stuck lookups.
 
 What 1.0 does **not** have, on purpose: port forwarding, agent forwarding, X11
 forwarding, `sftp`, jump hosts, certificate authorities, host key rotation
@@ -409,6 +422,12 @@ reload is skipped and retried.
 Environment overrides for both binaries: `QSH_HOME` (client directory) and
 `QSH_SERVER_HOME` (server directory); `qsh-server --dir` and `qsh -i` do the
 same per invocation.
+
+qsh-server reads `qsh-server.toml`, the host key and certificate, and its
+command line and environment only at startup; restart it to apply a change,
+which ends running sessions. `authorized/` is re-read every second, so
+`authorize`, `revoke` and edits there need no restart. Accounts and groups
+are looked up for every session.
 
 ## Client reference
 
@@ -531,6 +550,14 @@ WantedBy=multi-user.target
 
 Open the port with `ufw allow 2222/udp` (or the nftables equivalent) — UDP,
 not TCP. This is the single most common reason a first connection times out.
+
+qsh-server has nothing to reload, so the unit has no `ExecReload=` and
+`systemctl reload qsh-server` is refused; after changing `qsh-server.toml`,
+run `systemctl restart qsh-server`. SIGHUP is ignored: the server logs that
+there is nothing to reload and keeps serving. A stop or restart closes every
+connection first, so clients exit at once saying the server is shutting down.
+It takes a few seconds at most, even while journald is not reading or account
+lookups are stuck.
 
 ## Protocol
 

@@ -8,9 +8,9 @@
 //! * [`Diagnostics::emit`] — peer-triggered detail (session errors, refused
 //!   streams). A global per-second budget stops a peer from flooding the log.
 //! * [`Diagnostics::record`] — audit and security-relevant server events
-//!   (logins, withdrawn authorizations, failed cgroup kills). They do not draw
-//!   on that budget, so failing sessions cannot silence them, but they share
-//!   the queue and are dropped (and counted) if it is full.
+//!   (logins, withdrawn authorizations, failed cgroup kills, shutdown). They do
+//!   not draw on that budget, so failing sessions cannot silence them, but they
+//!   share the queue and are dropped (and counted) if it is full.
 //! * [`Diagnostics::emit_administrative`] — authorization-reload state, which
 //!   is reported once per change, so the newest few are held in a backlog
 //!   while stderr is blocked.
@@ -28,11 +28,14 @@ const QUEUE_CAPACITY: usize = 256;
 const ADMIN_CAPACITY: usize = 32;
 const MESSAGES_PER_SECOND: usize = 16;
 const MAX_MESSAGE_CHARS: usize = 512;
+const FLUSH_RETRY: Duration = Duration::from_millis(10);
 
 #[derive(Debug)]
 enum Event {
     Line(String),
     Administrative,
+    /// Answered once every line queued before it has been written.
+    Flush(tokio::sync::oneshot::Sender<()>),
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +68,10 @@ impl Diagnostics {
                         let _ = writeln!(writer, "{message}");
                     }
                     Ok(Event::Administrative) => {}
+                    Ok(Event::Flush(written)) => {
+                        let _ = writer.flush();
+                        let _ = written.send(());
+                    }
                     Err(_) => break,
                 }
             })?;
@@ -121,6 +128,20 @@ impl Diagnostics {
         pending.push_back(message);
         drop(pending);
         let _ = self.sender.try_send(Event::Administrative);
+    }
+
+    /// Wait until the writer has written every line queued so far. A blocked
+    /// sink never gets there, so the caller bounds the wait.
+    pub(super) async fn flush(&self) {
+        let (done, written) = tokio::sync::oneshot::channel();
+        let mut marker = Event::Flush(done);
+        // A full queue is a writer still working through a burst, or a
+        // blocked one; either way the marker has to wait for room.
+        while let Err(mpsc::TrySendError::Full(event)) = self.sender.try_send(marker) {
+            marker = event;
+            tokio::time::sleep(FLUSH_RETRY).await;
+        }
+        let _ = written.await;
     }
 
     /// Called once per reload interval, including after malicious traffic
@@ -364,6 +385,70 @@ mod tests {
         );
         assert!(
             written.contains("second authorization reload failure"),
+            "{written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_waits_for_room_and_returns_once_the_lines_are_written() {
+        struct GatedWriter {
+            started: Option<mpsc::Sender<()>>,
+            release: mpsc::Receiver<()>,
+            output: Arc<Mutex<Vec<u8>>>,
+        }
+
+        impl Write for GatedWriter {
+            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+                if let Some(started) = self.started.take() {
+                    started.send(()).unwrap();
+                    self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                crate::sync::mutex(&self.output).extend_from_slice(buffer);
+                Ok(buffer.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (started, running) = mpsc::channel();
+        let (finish, release) = mpsc::channel();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let diagnostics = Diagnostics::with_writer(GatedWriter {
+            started: Some(started),
+            release,
+            output: Arc::clone(&output),
+        })
+        .unwrap();
+        diagnostics.record(|| "line 0".into());
+        running.recv_timeout(Duration::from_secs(5)).unwrap();
+        for i in 1..=QUEUE_CAPACITY {
+            diagnostics.record(|| format!("line {i}"));
+        }
+        assert_eq!(diagnostics.suppressed.load(Ordering::Relaxed), 0);
+
+        // The sink is blocked and the queue full: only the caller's bound ends
+        // the wait.
+        let blocked = tokio::time::timeout(Duration::from_millis(100), diagnostics.flush()).await;
+        assert!(
+            blocked.is_err(),
+            "a flush returned while the sink was blocked"
+        );
+
+        let flushing = tokio::spawn({
+            let diagnostics = diagnostics.clone();
+            async move { diagnostics.flush().await }
+        });
+        finish.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), flushing)
+            .await
+            .expect("the flush did not return once the sink recovered")
+            .unwrap();
+        let written = String::from_utf8(crate::sync::mutex(&output).clone()).unwrap();
+        assert_eq!(written.lines().count(), QUEUE_CAPACITY + 1, "{written}");
+        assert!(
+            written.ends_with(&format!("line {QUEUE_CAPACITY}\n")),
             "{written}"
         );
     }

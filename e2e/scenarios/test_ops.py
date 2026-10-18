@@ -232,19 +232,22 @@ def unit_verdicts(server: QshServer, since: str) -> Counter:
     return Counter("success" if message == UNIT_SUCCESS else "failed" for message in found)
 
 
-@pytest.mark.plan("OPS-12")
-def test_sighup_stops_the_daemon_and_systemd_leaves_it_stopped(alice_fast, fast_server):
-    """SIGHUP is not a reload: qsh-server exits, and stays down.
+SIGHUP_LINE = (
+    "qsh-server: ignoring SIGHUP: there is nothing to reload; authorized/ is re-read every second, "
+    "and other settings take effect on restart"
+)
 
-    qsh-server has nothing to reload on a signal: authorizations are re-read
-    every second, the configuration only at startup. It handles INT and TERM
-    (`shutdown_signal` in src/bin/qsh-server.rs) and nothing else, so SIGHUP
-    takes its default action and ends the process. systemd counts death by
-    SIGHUP as a clean exit, like INT, TERM and PIPE, so the shipped
-    `Restart=on-failure` does not start it again, and the unit has no
-    `ExecReload=`, so `systemctl reload` is refused rather than turned into a
-    signal. An administrator's habitual `kill -HUP` takes the service down
-    until someone starts it.
+
+@pytest.mark.plan("OPS-12")
+def test_sighup_is_logged_and_the_daemon_keeps_serving(alice_fast, fast_server):
+    """SIGHUP is not a reload: qsh-server says so and carries on.
+
+    qsh-server has nothing to reload on a signal: authorized/ is re-read
+    every second, and qsh-server.toml, the host key and the command line
+    only at startup. Decided 2026-10-18: SIGHUP is ignored, with one journal
+    line that says so. An administrator's habitual `kill -HUP` must neither
+    take the service down nor end a session. The unit has no `ExecReload=`,
+    so `systemctl reload` is refused rather than turned into a signal.
     """
     node, unit = fast_server.node, fast_server.unit
     pid = fast_server.main_pid()
@@ -253,66 +256,31 @@ def test_sighup_stops_the_daemon_and_systemd_leaves_it_stopped(alice_fast, fast_
     assert unit_state(fast_server, "CanReload") == {"CanReload": "no"}
     assert fast_server.main_pid() == pid, "a refused reload must leave the daemon alone"
 
-    marker = "7373.25"
-    argv = alice_fast.argv("server2", "sleep", marker)
+    # Longer than server2's idle timeout: a client left on a dead connection
+    # would have given up by then.
+    marker = f"{FAST_IDLE_TIMEOUT + 1}.7373"
+    argv = alice_fast.argv("server2", "sh", "-c", f"sleep {marker}; echo still-served")
     proc = alice_fast.node.popen(argv, user="alice")
+    since = fast_server.cursor()
     try:
         node.wait_running(f"sleep {marker}", timeout=10)
-        since = fast_server.cursor()
         node.run(["kill", "-HUP", str(pid)], check=True)
-        node.wait_for(f"! systemctl is-active --quiet {unit}", timeout=20)
-        # A restart would be scheduled RestartSec=2 after the exit. Proving
-        # that none comes takes waiting past that point.
-        time.sleep(5)
-        # systemd's verdict is in its journal. A unit that exited cleanly, is
-        # not enabled and that nothing refers to is unloaded right after, so
-        # the properties below are an unloaded unit's defaults: they show
-        # that it is neither failed (a failed unit stays loaded) nor running
-        # again, not what systemd thought of the exit.
-        assert unit_verdicts(fast_server, since) == Counter(success=1), unit_verdicts(fast_server, since)
-        state = unit_state(fast_server, "ActiveState", "SubState", "Result", "MainPID")
-        assert state == {"ActiveState": "inactive", "SubState": "dead", "Result": "success", "MainPID": "0"}, state
-        assert node.run(["sh", "-c", f"ss -Hlun 'sport = :{PORT}' | grep -q ."]).rc != 0, "something still listens"
-        # KillMode=control-group took the session's job with the daemon.
-        node.wait_gone(f"sleep {marker}", timeout=10)
+        fast_server.wait_journal(re.escape(SIGHUP_LINE), since, timeout=10)
+        out, err = proc.communicate(timeout=30)
+        assert proc.returncode == 0 and out.decode().strip() == "still-served", err.decode()
     finally:
         proc.kill()
         alice_fast.node.kill_command("alice", argv)
-        bring_back(fast_server)
+        if fast_server.main_pid() != pid:
+            bring_back(fast_server)
+    assert fast_server.main_pid() == pid, "SIGHUP replaced the daemon"
+    assert unit_state(fast_server, "ActiveState", "SubState") == {"ActiveState": "active", "SubState": "running"}
+    # systemd saw no exit at all, clean or not.
+    assert unit_verdicts(fast_server, since) == Counter(), unit_verdicts(fast_server, since)
     assert alice_fast.run("server2", "true").rc == 0
-
-
-@pytest.mark.plan("OPS-12")
-@pytest.mark.xfail(strict=True, reason="F35: SIGHUP kills qsh-server silently; clients wait out the idle timeout")
-def test_sighup_tells_clients_and_the_journal_like_a_stop(alice_fast, fast_server):
-    """Whatever SIGHUP does, the daemon must not vanish without a word.
-
-    Since F8 a stop closes every connection: clients are told at once and the
-    journal says the server shut down (OPS-04). Killed by SIGHUP, the daemon
-    sends no close, so a client sits on the dead session until its idle
-    timeout (8 s on server2, 60 s by default) and then reports a timeout, and
-    nothing from qsh-server in the journal says what happened. Proposed:
-    `shutdown_signal` handles SIGHUP like SIGTERM.
-    """
-    node = fast_server.node
-    marker = "7374.25"
-    argv = alice_fast.argv("server2", "sleep", marker)
-    proc = alice_fast.node.popen(argv, user="alice")
-    try:
-        node.wait_running(f"sleep {marker}", timeout=10)
-        since = fast_server.cursor()
-        begin = time.monotonic()
-        node.run(["kill", "-HUP", str(fast_server.main_pid())], check=True)
-        _, err = proc.communicate(timeout=30)
-        took = time.monotonic() - begin
-        assert proc.returncode == 255, err.decode()
-        assert "shutting down" in err.decode(), f"after {took:.1f}s: {err.decode()}"
-        assert took < FAST_IDLE_TIMEOUT / 2, f"the client noticed after {took:.1f}s"
-        fast_server.wait_journal(r"qsh-server: shutting down", since, timeout=10)
-    finally:
-        proc.kill()
-        alice_fast.node.kill_command("alice", argv)
-        bring_back(fast_server)
+    journal = fast_server.journal(since)
+    assert journal.count(SIGHUP_LINE) == 1, journal
+    assert "shutting down" not in journal, journal
 
 
 # How a revoked key's running session ends on the client. The connection's
@@ -459,11 +427,12 @@ def test_a_stalled_journald_does_not_stop_serving_or_revocation(alice_fast, fast
 
     THREAT_MODEL.md: "a blocked or failing stderr/journald must never block
     serving". README: a bounded queue and a dedicated writer, so "a full log
-    pipe cannot block session handling or authorization reload". The writer
-    is shown stuck in write(2) before and after the checks, so they ran while
-    the log was blocked; afterwards, every line the full queue dropped must
-    be counted ("lines that do not fit are counted and reported as
-    suppressed", src/server/diagnostics.rs).
+    pipe cannot block session handling, authorization reload, or a stop"
+    (the stop is the next scenario's). The writer is shown stuck in write(2)
+    before and after the checks, so they ran while the log was blocked;
+    afterwards, every line the full queue dropped must be counted ("lines
+    that do not fit are counted and reported as suppressed",
+    src/server/diagnostics.rs).
     """
     node = fast_server.node
     noisy = make_client("alice", authorize_as="alice", on=fast_server)
@@ -545,18 +514,18 @@ def test_a_stalled_journald_does_not_stop_serving_or_revocation(alice_fast, fast
 
 
 @pytest.mark.plan("OPS-13")
-@pytest.mark.xfail(strict=True, reason="F28: the shutdown line waits on the blocked log writer, so a restart hangs")
 def test_a_restart_during_a_journald_stall_is_not_held_up(alice_fast, fast_server, make_client):
     """A restart while journald is stalled must still restart.
 
     The writer thread holds Rust's stderr lock while it is blocked in
-    write(2). On SIGTERM the daemon prints "shutting down" with `eprintln!`
-    on the runtime's main thread (`serve` in src/bin/qsh-server.rs) before
-    it closes the endpoint, and waits for that lock: no close is sent, the
-    accept loop stops, and the unit sits in `deactivating (stop-sigterm)`
-    until journald recovers or systemd's 90 s stop timeout kills it. Serving
-    is blocked for that long. Proposed: log the line through the diagnostics
-    queue, or after the close.
+    write(2), so nothing on the shutdown path may write to stderr directly.
+    The daemon closes the endpoint first, then queues "shutting down" for
+    the writer like any other line, and gives the closes and the line the
+    same bounded wait (SHUTDOWN_GRACE in src/server.rs). With journald
+    stopped the line never gets out, and the old daemon exits once that
+    bound is up. F28: the line used to be printed with `eprintln!` before
+    the close, which waited for the lock until journald ran again or
+    systemd's 90 s stop timeout killed the daemon.
     """
     noisy = make_client("alice", authorize_as="alice", on=fast_server)
     try:
@@ -567,6 +536,7 @@ def test_a_restart_during_a_journald_stall_is_not_held_up(alice_fast, fast_serve
             begin = time.monotonic()
             r = fast_server.node.run(["systemctl", "restart", fast_server.unit], timeout=15)
             took = time.monotonic() - begin
+            print(f"`systemctl restart` took {took:.2f}s")
             assert r.rc == 0 and took < 10, f"`systemctl restart` exited {r.rc} after {took:.1f}s"
             fast_server.wait_listening()
             r = alice_fast.run("server2", "echo", "restarted", timeout=15)

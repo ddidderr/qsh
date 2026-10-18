@@ -110,17 +110,22 @@ const FIRST_FRAME_GRACE: Duration = Duration::from_secs(10);
 /// four MiB per session. Backpressure continues through the child's pipes.
 const OUTPUT_QUEUE_FRAMES: usize = 8;
 
-/// Run the server until `shutdown` completes.
+/// Run the server until `shutdown` completes. SIGHUP is logged and otherwise
+/// ignored.
 ///
 /// # Errors
-/// Fails if the host identity is missing, the authorisation store cannot be
-/// read, the TLS configuration is invalid, or the socket cannot be bound.
+/// Fails if SIGHUP cannot be handled, the host identity is missing, the
+/// authorisation store cannot be read, the TLS configuration is invalid, or the
+/// socket cannot be bound.
 pub async fn serve(
     paths: &ServerPaths,
     cfg: &ServerConfig,
     listen_override: Option<SocketAddr>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
+    // First: until it is handled, SIGHUP's default action ends the server.
+    let hangups = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .context("handling SIGHUP")?;
     let identity = crypto::load_identity(&paths.cert(), &paths.key()).with_context(|| {
         format!(
             "loading the server identity from {} (run `qsh-server keygen` first)",
@@ -175,16 +180,13 @@ pub async fn serve(
     let per_key = Arc::new(PerKeyConnections::default());
     let sessions = SessionBudget::new();
 
+    let shutdown = ignoring_hangups(shutdown, hangups, &diagnostics);
     tokio::pin!(shutdown);
     loop {
         let incoming = tokio::select! {
             incoming = endpoint.accept() => incoming,
             () = &mut shutdown => {
-                // Tell every client now. Without a CONNECTION_CLOSE they wait
-                // on a dead session until their idle timeout, and the next
-                // process's stateless resets cannot reach them either.
-                endpoint.close(0u32.into(), b"server shutting down");
-                let _ = tokio::time::timeout(SHUTDOWN_GRACE, endpoint.wait_idle()).await;
+                shut_down(&endpoint, &diagnostics).await;
                 break;
             }
         };
@@ -236,6 +238,42 @@ pub async fn serve(
     }
     refresher.abort();
     Ok(())
+}
+
+/// Wait for `shutdown`, logging every SIGHUP meanwhile, including one that
+/// arrived during startup. There is nothing to reload, and the signal's default
+/// action would end the server without a word to its clients.
+async fn ignoring_hangups(
+    shutdown: impl Future<Output = ()>,
+    mut hangups: tokio::signal::unix::Signal,
+    diagnostics: &Diagnostics,
+) {
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            () = &mut shutdown => return,
+            Some(()) = hangups.recv() => diagnostics.record(|| {
+                "qsh-server: ignoring SIGHUP: there is nothing to reload; authorized/ is \
+                 re-read every second, and other settings take effect on restart"
+                    .into()
+            }),
+        }
+    }
+}
+
+/// Close every connection, then log the shutdown. Without a `CONNECTION_CLOSE`
+/// clients wait on a dead session until their idle timeout, and the next
+/// process's stateless resets cannot reach them either.
+///
+/// The line goes through the queue and gets the same bounded wait as the
+/// closes: a blocked log sink must hold up neither.
+async fn shut_down(endpoint: &quinn::Endpoint, diagnostics: &Diagnostics) {
+    endpoint.close(0u32.into(), b"server shutting down");
+    diagnostics.record(|| "qsh-server: shutting down".into());
+    let _ = tokio::time::timeout(SHUTDOWN_GRACE, async {
+        tokio::join!(endpoint.wait_idle(), diagnostics.flush())
+    })
+    .await;
 }
 
 fn server_config(
