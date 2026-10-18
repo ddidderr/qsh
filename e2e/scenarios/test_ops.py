@@ -800,15 +800,18 @@ def readme_unit() -> str:
 
 @pytest.mark.plan("OPS-15")
 def test_the_readme_unit_waits_for_a_late_listen_address(make_client, fast_server, env):
-    """The same late address, under the unit the README shows instead of the shipped one.
+    """The same late address and restarts, under the unit the README shows instead of the shipped one.
 
-    Without `RestartSec=`, systemd retries after its default 100 ms: five
+    Without `RestartSec=`, systemd retried after its default 100 ms: five
     tries took about a second, the start limit tripped, and the unit stayed
     failed for good, also once the address was there (F29). The README's
     unit sets `RestartSec=2s` and `StartLimitIntervalSec=0`, as the shipped
-    one does. It is still ordered only after `network.target`, which waits
-    for no address at all: the retries cover a late address whatever brings
-    it.
+    one does, and the test checks both, since this is the unit
+    administrators copy: it restarts the unit twice as above, which trips
+    the default start limit, and the automatic tries must come about two
+    seconds apart. It is still ordered only after `network.target`, which
+    waits for no address at all: the retries cover a late address whatever
+    brings it.
     """
     node = fast_server.node
     address, prefix = env.spare_ip(41), env.subnet().prefixlen
@@ -822,12 +825,17 @@ def test_the_readme_unit_waits_for_a_late_listen_address(make_client, fast_serve
         node.run(["systemctl", "daemon-reload"], check=True)
         # The shipped unit holds 0.0.0.0:2222, which the new address's port would collide with.
         fast_server.stop()
-        seen = serve_on_a_late_address(readme, address, prefix)
+        seen = serve_on_a_late_address(readme, address, prefix, restarts=2)
         print(
             f"after {LATE_ADDRESS_DELAY}s without the address: {seen['waiting']}; tries at {seen['tries']}; "
             f"serving after {seen['serving']}s"
         )
         assert seen["serving"] is not None, f"the unit gave up: {seen['waiting']}, tries at {seen['tries']}"
+        # The tries after the two restarts are systemd's own: RestartSec=2s,
+        # not its default 100 ms. The journal stamps a line when it reads it,
+        # which a busy host delays, hence the margin.
+        tries = seen["tries"][2:]
+        assert min(b - a for a, b in zip(tries, tries[1:])) > 1.5, f"tries at {seen['tries']}"
         r = client.run(address, "hostname", timeout=30)
         assert r.rc == 0 and r.stdout.strip() == "server2", r.describe()
     finally:
