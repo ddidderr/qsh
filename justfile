@@ -63,8 +63,10 @@ msrv:
     cargo +"$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" test --all-features --locked
 
 # The tests that need root: the privilege drop, and the session cgroup in a
-# delegated systemd scope.
+# delegated systemd scope. Built as you first, so that root only runs them and
+# target/ stays yours.
 test-root:
+    cargo test --locked --no-run --lib --test e2e
     sudo -E env "PATH=$PATH" cargo test --locked --test e2e
     sudo -E env "PATH=$PATH" cargo test --locked --lib child::tests::mixed_credentials_cannot_reach_remote_exec
     sudo -E env "PATH=$PATH" cargo test --locked --lib child::tests::sessions_do_not_inherit_service_capabilities

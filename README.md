@@ -50,7 +50,7 @@ indirection rather than rustls directly.
 ## Install
 
 ```
-cargo install --path .          # installs qsh and qsh-server
+cargo install --path . --locked # installs qsh and qsh-server
 ```
 
 Requires a Unix-like system (Linux is what it is tested on) and Rust 1.88+,
@@ -235,8 +235,10 @@ against, the boundaries it promises, and the trade-offs already decided.
 * Deleting `authorized/<name>.crt` (or `qsh-server revoke <name>`) takes
   effect after the next reload and policy check, normally within two seconds,
   without a restart. The key's connections close and the server logs each
-  one; the client prints `authorization withdrawn or expired`. The server
-  signals each session's initial process group. A PTY shell can put a
+  one; the client prints `authorization withdrawn or expired`. A session the
+  server is still checking at that moment may be refused instead, with status
+  126 and `client authorization was withdrawn`. The server signals each
+  session's initial process group. A PTY shell can put a
   foreground job in a different group; that job may survive if it ignores
   the terminal hangup.
 * `--command` filters the executable name, not its arguments, subprocesses,
@@ -262,9 +264,9 @@ against, the boundaries it promises, and the trade-offs already decided.
   A bare name is resolved through the server's own fixed
   `PATH`; to allow a program elsewhere, authorize its absolute path.
 * A session is torn down with its connection. A client ended by a signal
-  closes the connection on its way out. If the client is killed outright
-  (`SIGKILL`), crashes, or loses the network, the server notices when the
-  QUIC idle timeout expires (60s by default, with 15-second keep-alives).
+  once the session has started closes the connection on its way out. If the
+  client is killed outright (`SIGKILL`), crashes, or loses the network, the
+  server notices when the QUIC idle timeout expires (60s by default, with 15-second keep-alives).
   Either way it signals the session's process group `SIGHUP`, then `SIGTERM`,
   then `SIGKILL`. That watch stays up for the whole session, including while
   the last of the output is still draining, so a descendant that outlives the
@@ -594,8 +596,9 @@ qsh-server has nothing to reload, so the unit has no `ExecReload=` and
 run `systemctl restart qsh-server`. SIGHUP is ignored: the server logs that
 there is nothing to reload and keeps serving. A stop or restart closes every
 connection first, so clients exit at once saying the server is shutting down.
-It takes a few seconds at most, even while journald is not reading or account
-lookups are stuck.
+qsh-server is gone within a few seconds, even while journald is not reading or
+account lookups are stuck. A detached job of a session that ignores SIGTERM
+still holds the stop until systemd's `TimeoutStopSec=` kills it.
 
 ## Protocol
 

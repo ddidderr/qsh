@@ -1759,7 +1759,7 @@ fn cgroup_policy_kills_detached_descendants_or_fails_before_exec() {
     if std::env::var_os("QSH_REQUIRE_DELEGATED_CGROUP").is_some() {
         assert!(
             cgroup_available,
-            "CI requested the delegated cgroup success path, but cgroup v2 is unavailable"
+            "QSH_REQUIRE_DELEGATED_CGROUP (just test-root) requested the delegated cgroup success path, but cgroup v2 is unavailable"
         );
     }
     let f = Fixture::start(&[]);

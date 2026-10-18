@@ -1044,9 +1044,12 @@ impl ProcessGroupGuard {
 
     /// Stop guarding the group.
     ///
-    /// Only correct once the leader has exited *and* its output has drained
-    /// to end of file. Nothing left is attached to this session, and reaping
-    /// the leader after disarming cannot race a later group signal.
+    /// Only correct once the leader has exited and its output has ended: at
+    /// end of file, or for a PTY, once the terminal went quiet or was left
+    /// to another process that still holds it, as after a normal exit. Or
+    /// once the session's cgroup has been killed, which reaches every
+    /// process in it. Reaping the leader after disarming cannot race a later
+    /// group signal.
     fn disarm(&mut self) {
         self.pid = None;
     }
@@ -1412,13 +1415,15 @@ async fn run_session(
     // that goes on retransmitting. `SessionStream` resets it on the way out
     // instead, which is the honest ending for a session nobody is listening to.
     let delivered = if matches!(drained, Drained::Fully) {
-        // Every byte the job wrote has been read; what remains is putting it
-        // on the wire, and the frame queue and QUIC's send buffer can hold
-        // megabytes that a slow or briefly interrupted path takes far longer
-        // than any fixed grace to carry. Cutting that short is the truncation
-        // `drain` refuses for pipes, so wait as long as the connection lives
-        // and the key may still use it; the idle timeout decides when the
-        // peer is gone.
+        // The output has ended: for pipes every byte was read. For a PTY
+        // that another process still holds, the deadline may have dropped a
+        // chunk already read and whatever was still unread (`drain_terminal`).
+        // What remains is putting the rest on the wire, and the frame queue
+        // and QUIC's send buffer can hold megabytes that a slow or briefly
+        // interrupted path takes far longer than any fixed grace to carry.
+        // Cutting that short is the truncation `drain` refuses for pipes, so
+        // wait as long as the connection lives and the key may still use it;
+        // the idle timeout decides when the peer is gone.
         let delivery = async {
             let _ = tx.send(Frame::Exit(exit)).await;
             drop(tx);
