@@ -6,7 +6,7 @@ pub(crate) mod diagnostics;
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
@@ -14,6 +14,7 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use nix::poll::{PollFd, PollFlags, PollTimeout};
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -52,7 +53,8 @@ const PTY_QUIET: Duration = Duration::from_millis(100);
 ///
 /// Reached only by a client that is not reading, or a job that never leaves the
 /// terminal quiet for [`PTY_QUIET`]; the session then ends with whatever was
-/// delivered.
+/// delivered. Output left over fails the session only once nothing else has
+/// the terminal open; see [`drain_terminal`].
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// How long to wait for the job to die before escalating to the next signal.
@@ -1255,7 +1257,7 @@ async fn run_session(
     // Drain with disconnect and policy watches still running. Pin the drain
     // future so a timer tick never restarts a partly completed drain.
     let drained = {
-        let pending = drain(&mut outputs, is_pty);
+        let pending = drain(&mut outputs, pty_fd.as_ref());
         tokio::pin!(pending);
         loop {
             tokio::select! {
@@ -1303,7 +1305,9 @@ async fn run_session(
 
     let exit = match drained {
         Drained::Fully => {
-            // Everything produced before exit has been delivered. Ordinary
+            // Everything produced before exit has been handed on, unless
+            // another process still holds the terminal: then the drain
+            // deadline may have dropped the rest (`drain_terminal`). Ordinary
             // sessions permit deliberately detached work; restricted sessions
             // have already killed their cgroup before output drain.
             if let Err(error) = guard.complete() {
@@ -1504,11 +1508,11 @@ enum Drained {
 ///
 /// The handles stay borrowed so that a cancelled drain leaves them intact for
 /// the caller to abort.
-async fn drain(tasks: &mut [Pump], is_pty: bool) -> Drained {
+async fn drain(tasks: &mut [Pump], terminal: Option<&OwnedFd>) -> Drained {
     let mut result = Drained::Fully;
     for pump in tasks.iter_mut() {
-        let end = if is_pty {
-            drain_terminal(pump).await
+        let end = if let Some(terminal) = terminal {
+            drain_terminal(pump, terminal).await
         } else {
             (&mut pump.task).await.unwrap_or(PumpEnd::Failed)
         };
@@ -1530,10 +1534,20 @@ async fn drain(tasks: &mut [Pump], is_pty: bool) -> Drained {
 /// The pump ends at end of file or at the first [`PTY_QUIET`] gap in the
 /// output. Time spent handing a chunk to a slow client does not count as a
 /// gap, so a backlog is not cut short. At [`DRAIN_GRACE`] it stops outright,
-/// and reports a chunk it could not hand over as lost output. A pending send
-/// does not by itself establish that the client stopped reading, but it does
-/// mean the output is incomplete.
-async fn drain_terminal(pump: &mut Pump) -> PumpEnd {
+/// and drops a chunk it could not hand over.
+///
+/// Whether that fails the session depends on who else has the terminal open.
+/// While another process does, usually a job the leader left behind, this
+/// ends like a quiet terminal and the session reports the leader's status,
+/// whoever wrote the chunk. A job that writes faster than the path carries
+/// can leave one at any deadline, however steadily the client reads, and from
+/// here that looks the same as the leader's own last output held up by a
+/// client that stopped reading, beside a job that writes nothing. So what is
+/// lost, the chunk and whatever is still unread in the terminal, can be the
+/// leader's output too; `exit` ends the session all the same. With nobody
+/// else left on the terminal, everything left is the session's own, and the
+/// output is incomplete.
+async fn drain_terminal(pump: &mut Pump, terminal: &OwnedFd) -> PumpEnd {
     if let Some(exited) = pump.leader_exited.take() {
         let _ = exited.send(());
     }
@@ -1543,7 +1557,23 @@ async fn drain_terminal(pump: &mut Pump) -> PumpEnd {
     if let Some(cancel) = pump.cancel.take() {
         let _ = cancel.send(());
     }
-    (&mut pump.task).await.unwrap_or(PumpEnd::Failed)
+    match (&mut pump.task).await.unwrap_or(PumpEnd::Failed) {
+        PumpEnd::CutoffPending if held_open(terminal) => PumpEnd::CutoffIdle,
+        end => end,
+    }
+}
+
+/// Does anything besides the server still have this terminal open?
+///
+/// Once the leader has exited, that is usually a job it left behind. This
+/// relies on the kernel reporting a hangup on the master as soon as the last
+/// descriptor for the other side is closed, with output still unread or not,
+/// as Linux does. Only a `poll` that reports nothing at all counts as yes: a
+/// hangup, an error or a failed call means no, and the session ends as
+/// incomplete.
+fn held_open(terminal: &OwnedFd) -> bool {
+    let mut fds = [PollFd::new(terminal.as_fd(), PollFlags::empty())];
+    nix::poll::poll(&mut fds, PollTimeout::ZERO) == Ok(0)
 }
 
 /// How an output pump finished.
@@ -1556,9 +1586,11 @@ enum PumpEnd {
     /// Nobody is left to receive the frames.
     ClientGone,
     /// The PTY went quiet after its leader exited, or the drain deadline
-    /// arrived while waiting for more output.
+    /// arrived while waiting for more output, or with a chunk in hand while
+    /// another process still has the terminal open.
     CutoffIdle,
     /// The PTY drain deadline arrived with a chunk still awaiting delivery.
+    /// [`drain_terminal`] decides whether that fails the session.
     CutoffPending,
     /// The forwarding task itself did not finish.
     Failed,
@@ -1724,7 +1756,7 @@ async fn pump<R: AsyncRead + Unpin>(
                     return PumpEnd::ReadError;
                 };
                 // Cancelling a pending send discards this chunk, so the pump
-                // itself reports incomplete output. No shared flag or task
+                // itself reports that it dropped one. No shared flag or task
                 // cancellation timing is needed to reconstruct that fact.
                 let sent = tokio::select! {
                     biased;
@@ -2469,12 +2501,43 @@ mod tests {
     #[tokio::test]
     async fn a_terminal_held_open_does_not_hold_up_the_end_of_the_session() {
         // A background job keeps the PTY open, so its reader never sees EOF.
+        let terminal = nix::pty::openpty(None, None).unwrap();
         let (_job, reader) = tokio::io::duplex(64);
         let (tx, _rx) = mpsc::channel(1);
         let mut pumps = vec![spawn_pump(reader, tx, Frame::Stdout)];
         let begin = std::time::Instant::now();
-        assert!(matches!(drain(&mut pumps, true).await, Drained::Fully));
+        assert!(matches!(
+            drain(&mut pumps, Some(&terminal.master)).await,
+            Drained::Fully
+        ));
         assert!(begin.elapsed() < DRAIN_GRACE / 2, "{:?}", begin.elapsed());
+    }
+
+    #[tokio::test]
+    async fn output_left_at_the_drain_deadline_fails_only_a_session_alone_on_the_terminal() {
+        async fn parked_at_the_deadline(held: bool) -> Drained {
+            let nix::pty::OpenptyResult { master, slave } = nix::pty::openpty(None, None).unwrap();
+            let holder = held.then_some(slave);
+            let (mut source, reader) = tokio::io::duplex(1);
+            let (tx, _rx) = mpsc::channel(1);
+            tx.send(Frame::Started).await.unwrap();
+            let mut pumps = vec![spawn_pump(reader, tx, Frame::Stdout)];
+            // As above: the pump holds `a` on the full channel, which nobody
+            // reads, until the deadline makes it drop it.
+            source.write_all(b"ab").await.unwrap();
+            let drained = drain(&mut pumps, Some(&master)).await;
+            drop(holder);
+            drained
+        }
+        let (held, alone) =
+            tokio::join!(parked_at_the_deadline(true), parked_at_the_deadline(false));
+        // Another process has the terminal open and writes nothing. The chunk
+        // is dropped and the session does not fail, whoever wrote it: a job
+        // that outwrites the path looks just like this, and so does the
+        // leader's own last output behind a client that stopped reading.
+        assert!(matches!(held, Drained::Fully));
+        // With nobody else on the terminal the chunk was the session's own.
+        assert!(matches!(alone, Drained::Incomplete(_)));
     }
 
     #[tokio::test]

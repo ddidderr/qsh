@@ -1876,38 +1876,44 @@ fn a_torn_authorize_cannot_pair_a_new_key_with_a_legacy_policy() {
     );
 }
 
+/// Fill the terminal and everything behind it, then stop the writer and exit
+/// 0. What is stuck is the session's own output, and nothing is left on the
+/// terminal. The writer counts as blocked once its byte count has not moved
+/// for half a second; a fixed time would not fill the path on a busy machine.
+/// That takes at least a second, typically one to one and a half; the tests
+/// below rely on it staying under four.
+const FILL_THE_PATH_AND_EXIT: &str = "cat /dev/zero & c=$!; w=; \
+     until sleep 0.5; [ \"$(grep wchar /proc/$c/io)\" = \"$w\" ]; do \
+     w=$(grep wchar /proc/$c/io); done; kill $c; exit 0";
+
 #[test]
 fn a_peer_that_never_reads_gets_the_stream_reset() {
     let f = Fixture::start(&[]);
 
-    // Same shape as the slow-reader case — a leader that exits leaving a
-    // descendant writing to the terminal — but this peer never comes back at
-    // all. It stops reading and stays gone past the server's *entire*
-    // shutdown budget: the drain deadline, then the exit-status send, then the
-    // writer. By the end of that there is still output the server holds and
-    // cannot deliver, and it has to give up.
+    // Same shape as the slow-reader case below — the session's own output
+    // stuck behind a peer that stopped reading, with nobody left on the
+    // terminal — but this peer never comes back at all. It stays gone past the
+    // server's *entire* shutdown budget: the drain deadline, the hang-up and
+    // terminate signals, then the exit-status send, then the writer. By the
+    // end of that there is still output the server holds and cannot deliver,
+    // and it has to give up.
     //
     // How it gives up is the point. quinn treats a dropped `SendStream` as a
     // graceful *finish* and goes on retransmitting, so a peer that came back
     // later would eventually see a clean end of stream and have no way to know
     // it had been abandoned mid-session. A reset is the honest ending, and
     // this asserts that is what actually goes on the wire.
-    let pidfile = f.tmp.path().join("writer.pid");
-    let marker = f.tmp.path().join("abandoned-writer");
-    let script = format!(
-        "sh -c 'trap \"\" HUP; echo $$ > {pid}; exec cat /dev/zero {marker}' & \
-         until [ -s {pid} ]; do sleep 0.1; done; exit 0",
-        pid = pidfile.display(),
-        marker = marker.display(),
-    );
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap();
     let ended = rt.block_on(async {
         let conn = raw_connect(&f.client_dir, f.port).await;
-        stalled_until_teardown(&conn, &["sh", "-c", &script], Duration::from_secs(12)).await
+        let argv = ["sh", "-c", FILL_THE_PATH_AND_EXIT];
+        // The server gives up about 10 s after the exit (drain deadline, both
+        // signals, exit status, writer), so this holds while filling takes
+        // under 5 s; past that the peer is back in time and sees a finish.
+        stalled_until_teardown(&conn, &argv, Duration::from_secs(15)).await
     });
 
     assert_eq!(
@@ -1921,29 +1927,32 @@ fn a_peer_that_never_reads_gets_the_stream_reset() {
 fn a_peer_that_stops_reading_never_gets_a_successful_exit() {
     let f = Fixture::start(&[]);
 
-    // A leader that exits at once, leaving a descendant writing to the
-    // terminal. That is the shape the PTY drain deadline exists for: a
-    // terminal has no last-writer guarantee, so the pump can never see EOF,
-    // and the deadline has to decide what the silence means.
+    // The session's own output stuck behind a peer that stops reading
+    // (`FILL_THE_PATH_AND_EXIT`): the pump is still holding some of it when
+    // the PTY drain deadline arrives, and nothing else is on the terminal. A
+    // job that is still on the terminal is another matter; see the next test.
     //
-    // `trap "" HUP` is load-bearing. The leader is the session leader with
-    // this pty as its controlling terminal, so the kernel hangs up the
-    // foreground process group when it exits — without the trap the writer
-    // dies immediately, nothing ever backs up, and the session drains cleanly.
-    // The disposition survives `exec`, so `cat` inherits it. It stays in the
-    // leader's process group, which is what teardown is supposed to reach.
+    // Beside it runs a job that is not on the terminal — its standard streams
+    // go to /dev/null — to show that a failed session does not leave it
+    // behind. `trap "" HUP` is load-bearing. The leader is the session leader
+    // with this pty as its controlling terminal, so the kernel hangs up the
+    // foreground process group when it exits — without the trap the job dies
+    // there and then, and the check at the end passes for nothing. The
+    // disposition survives `exec`. It stays in the leader's process group,
+    // which is what teardown is supposed to reach.
     //
     // It records its pid and carries a unique path in its argv, so the test
-    // can tell it apart from any other `cat` on the machine.
-    let pidfile = f.tmp.path().join("writer.pid");
-    let marker = f.tmp.path().join("stalled-writer");
+    // can tell it apart from any other process on the machine.
+    let pidfile = f.tmp.path().join("job.pid");
+    let marker = f.tmp.path().join("stalled-session-job");
     //
-    // The leader waits for the pid file before exiting. Without that wait the
-    // hangup can arrive while the descendant is still starting up, before its
-    // trap is installed, and the whole setup evaporates.
+    // The leader waits for the pid file before going on. Without that wait the
+    // hangup can arrive while the job is still starting up, before its trap is
+    // installed.
     let script = format!(
-        "sh -c 'trap \"\" HUP; echo $$ > {pid}; exec cat /dev/zero {marker}' & \
-         until [ -s {pid} ]; do sleep 0.1; done; exit 0",
+        "sh -c 'trap \"\" HUP; echo $$ > {pid}; exec sh -c \"while :; do sleep 1; done\" {marker}' \
+         < /dev/null > /dev/null 2>&1 & \
+         until [ -s {pid} ]; do sleep 0.1; done; {FILL_THE_PATH_AND_EXIT}",
         pid = pidfile.display(),
         marker = marker.display(),
     );
@@ -1954,11 +1963,13 @@ fn a_peer_that_stops_reading_never_gets_a_successful_exit() {
         .unwrap();
     let stalled = rt.block_on(async {
         let conn = raw_connect(&f.client_dir, f.port).await;
-        // Comfortably longer than the server's two-second drain deadline, so
-        // the decision is already made by the time this peer starts reading
-        // again — and short enough that reading resumes while the server is
-        // still tearing the session down, so its verdict can reach us.
-        stalled_session(&conn, &["sh", "-c", &script], Duration::from_secs(4)).await
+        // Comfortably longer than filling the path plus the server's
+        // two-second drain deadline, so the decision is already made by the
+        // time this peer starts reading again — and short enough that reading
+        // resumes while the server is still tearing the session down, so its
+        // verdict can reach us. Filling has to take under 4 s for that: a
+        // peer back before the deadline takes everything, and gets the 0.
+        stalled_session(&conn, &["sh", "-c", &script], Duration::from_secs(6)).await
     });
 
     // The scenario really did produce a backlog. Without this the rest could
@@ -1998,9 +2009,9 @@ fn a_peer_that_stops_reading_never_gets_a_successful_exit() {
     // And the job does not get to outlive the session that failed. This is the
     // half that does not depend on whether the exit status made it back: a
     // server that treated the timeout as a clean drain would disarm the guard
-    // and leave this process writing into a terminal nobody owns.
+    // and leave this process running.
     let pid: i32 = std::fs::read_to_string(&pidfile)
-        .expect("the descendant never recorded its pid")
+        .expect("the job never recorded its pid")
         .trim()
         .parse()
         .expect("unparseable pid");
@@ -2009,10 +2020,68 @@ fn a_peer_that_stops_reading_never_gets_a_successful_exit() {
     while running_with_marker(pid, &marker) {
         assert!(
             Instant::now() < deadline,
-            "the descendant survived the session it belonged to (pid {pid})"
+            "the job survived the session it belonged to (pid {pid})"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[test]
+fn a_job_left_writing_to_the_terminal_does_not_fail_the_session() {
+    let f = Fixture::start(&[]);
+
+    // A leader that exits at once, leaving a job that floods the terminal,
+    // and a peer that stops reading. The job keeps the terminal open, so the
+    // pump never sees EOF, and at the drain deadline it holds a chunk the peer
+    // has no room for. That is the job's output, which the session does not
+    // wait for: while the job has the terminal open, the session reports the
+    // leader's status, as an interactive `exit` past a background job does.
+    // The server cannot tell a peer that stopped reading for a while from a
+    // path the job outwrites, and on a slow enough path a peer that reads
+    // steadily looks just like this.
+    //
+    // `trap "" HUP` keeps the job alive past the kernel's hangup, as in the
+    // test above. It records its pid so the test can stop it: a normal exit
+    // does not.
+    let pidfile = f.tmp.path().join("writer.pid");
+    let marker = f.tmp.path().join("job-writer");
+    let script = format!(
+        "sh -c 'trap \"\" HUP; echo $$ > {pid}; exec cat /dev/zero {marker}' & \
+         until [ -s {pid} ]; do sleep 0.1; done; exit 0",
+        pid = pidfile.display(),
+        marker = marker.display(),
+    );
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let stalled = rt.block_on(async {
+        let conn = raw_connect(&f.client_dir, f.port).await;
+        // Past the two-second drain deadline, as above.
+        stalled_session(&conn, &["sh", "-c", &script], Duration::from_secs(4)).await
+    });
+    if let Some(pid) = std::fs::read_to_string(&pidfile)
+        .ok()
+        .and_then(|pid| pid.trim().parse().ok())
+    {
+        if running_with_marker(pid, &marker.to_string_lossy()) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+
+    assert!(
+        stalled.bytes > 1024 * 1024,
+        "the job did not produce enough output to back up: {stalled:?}"
+    );
+    assert_eq!(
+        (stalled.exit, stalled.error.as_deref(), stalled.reset),
+        (Some(0), None, false),
+        "the job's output failed the session: {stalled:?}"
+    );
 }
 
 #[test]

@@ -140,8 +140,9 @@ def test_revoking_mid_session_kills_the_process_group(make_client, server):
 # ---------------------------------------------------------------- LIFE-09
 #
 # How long the server reads a PTY after the shell has exited (DRAIN_GRACE in
-# src/server.rs), and what the README promises for it: "the session waits two
-# seconds for the rest of the output and then finishes anyway".
+# src/server.rs), and what the README promises for it: a job that keeps
+# writing holds up `exit` "for at most two seconds however fast the job
+# writes".
 PTY_DRAIN_GRACE = 2
 
 
@@ -194,21 +195,17 @@ def test_interactive_exit_past_a_background_job_that_keeps_writing(alice, server
 
 
 @pytest.mark.plan("LIFE-09")
-@pytest.mark.xfail(
-    strict=True,
-    reason="F25: a job that outwrites the terminal turns the exit into status 255 after about 6 s",
-)
 def test_interactive_exit_past_a_background_job_that_floods_the_terminal(alice, server):
     """The same, with a job that writes faster than the terminal reads.
 
-    `yes` outwrites the path whatever reads it: with this terminal read at
-    full speed the exit already failed in most runs. Here the terminal reads
-    nothing until the drain grace is over, as one that cannot keep up would,
-    which makes it fail every time: the server's output queue is full when
-    the grace runs out and it holds a chunk read but not yet queued. That is
-    output after the shell's exit, which the README says the session does
-    not wait for: it must not turn into a failed session, nor keep qsh after
-    the output already on its way has arrived.
+    `yes` outwrites the path whatever reads it, so when the grace runs out
+    the server's output queue is often full and it holds a chunk read but
+    not yet queued. Here the terminal reads nothing until the grace is over,
+    as one that cannot keep up would, which makes that so every time. The
+    chunk is the job's output, which the README says the session does not
+    wait for: while the job has the terminal open, it must not turn into a
+    failed session (F25: status 255 after about 6 s), nor keep qsh after the
+    output already on its way has arrived.
     """
     status, took, quiet, tail = exit_past_a_chatty_job(
         alice, server, "yes chatter-$((9190 + 1))", "chatter-9191", "yes chatter-9191", stall=PTY_DRAIN_GRACE + 0.5
