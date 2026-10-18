@@ -219,9 +219,10 @@ against, the boundaries it promises, and the trade-offs already decided.
   shows the remaining time.
 * Deleting `authorized/<name>.crt` (or `qsh-server revoke <name>`) takes
   effect after the next reload and policy check, normally within two seconds,
-  without a restart. The key's connections close and
-  the server signals each session's initial process group. A PTY shell can put
-  a foreground job in a different group; that job may survive if it ignores
+  without a restart. The key's connections close and the server logs each
+  one; the client prints `authorization withdrawn or expired`. The server
+  signals each session's initial process group. A PTY shell can put a
+  foreground job in a different group; that job may survive if it ignores
   the terminal hangup.
 * `--command` filters the executable name, not its arguments, subprocesses,
   filesystem access, or other capabilities. In particular, allowing `rsync`
