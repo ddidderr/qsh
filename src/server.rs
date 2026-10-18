@@ -112,14 +112,18 @@ const OUTPUT_QUEUE_FRAMES: usize = 8;
 /// ignored.
 ///
 /// # Errors
-/// Fails if the host identity is missing, the authorisation store cannot be
-/// read, the TLS configuration is invalid, or the socket cannot be bound.
+/// Fails if SIGHUP cannot be handled, the host identity is missing, the
+/// authorisation store cannot be read, the TLS configuration is invalid, or the
+/// socket cannot be bound.
 pub async fn serve(
     paths: &ServerPaths,
     cfg: &ServerConfig,
     listen_override: Option<SocketAddr>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
+    // First: until it is handled, SIGHUP's default action ends the server.
+    let hangups = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .context("handling SIGHUP")?;
     let identity = crypto::load_identity(&paths.cert(), &paths.key()).with_context(|| {
         format!(
             "loading the server identity from {} (run `qsh-server keygen` first)",
@@ -174,7 +178,7 @@ pub async fn serve(
     let per_key = Arc::new(PerKeyConnections::default());
     let sessions = SessionBudget::new();
 
-    let shutdown = ignoring_hangups(shutdown, &diagnostics)?;
+    let shutdown = ignoring_hangups(shutdown, hangups, &diagnostics);
     tokio::pin!(shutdown);
     loop {
         let incoming = tokio::select! {
@@ -234,28 +238,25 @@ pub async fn serve(
     Ok(())
 }
 
-/// Wait for `shutdown`, logging every SIGHUP meanwhile. There is nothing to
-/// reload, and the signal's default action would end the server without a
-/// word to its clients.
-fn ignoring_hangups<'a>(
-    shutdown: impl Future<Output = ()> + 'a,
-    diagnostics: &'a Diagnostics,
-) -> Result<impl Future<Output = ()> + 'a> {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut hangup = signal(SignalKind::hangup()).context("handling SIGHUP")?;
-    Ok(async move {
-        tokio::pin!(shutdown);
-        loop {
-            tokio::select! {
-                () = &mut shutdown => return,
-                Some(()) = hangup.recv() => diagnostics.record(|| {
-                    "qsh-server: ignoring SIGHUP: there is nothing to reload; authorized/ is \
-                     re-read every second, and other settings take effect on restart"
-                        .into()
-                }),
-            }
+/// Wait for `shutdown`, logging every SIGHUP meanwhile, including one that
+/// arrived during startup. There is nothing to reload, and the signal's default
+/// action would end the server without a word to its clients.
+async fn ignoring_hangups(
+    shutdown: impl Future<Output = ()>,
+    mut hangups: tokio::signal::unix::Signal,
+    diagnostics: &Diagnostics,
+) {
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            () = &mut shutdown => return,
+            Some(()) = hangups.recv() => diagnostics.record(|| {
+                "qsh-server: ignoring SIGHUP: there is nothing to reload; authorized/ is \
+                 re-read every second, and other settings take effect on restart"
+                    .into()
+            }),
         }
-    })
+    }
 }
 
 /// Close every connection, then log the shutdown. Without a `CONNECTION_CLOSE`

@@ -1060,22 +1060,52 @@ fn a_changed_host_key_is_refused() {
 
 #[test]
 fn sighup_is_logged_and_the_server_keeps_serving() {
-    let f = Fixture::start(&[]);
+    let mut f = Fixture::start(&[]);
     let log = f.tmp.path().join("server.log");
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(f.server.id() as i32),
-        nix::sys::signal::Signal::SIGHUP,
-    )
-    .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let text = std::fs::read_to_string(&log).unwrap();
-        if text.contains("qsh-server: ignoring SIGHUP: there is nothing to reload") {
-            break;
+    // Send it the moment the listening line appears, which is before the
+    // server's startup has finished. Ten rounds, since a server that is not
+    // yet handling it dies only most of the time.
+    for _ in 0..10 {
+        let _ = f.server.kill();
+        let _ = f.server.wait();
+        f.server = Command::new(SERVER_BIN)
+            .args([
+                "--dir",
+                f.server_dir.to_str().unwrap(),
+                "serve",
+                "--listen",
+                "127.0.0.1:0",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
+            .spawn()
+            .expect("starting qsh-server");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("listening on ")
+        {
+            assert!(Instant::now() < deadline, "no listening line");
         }
-        assert!(Instant::now() < deadline, "no SIGHUP line:\n{text}");
-        std::thread::sleep(Duration::from_millis(50));
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(f.server.id() as i32),
+            nix::sys::signal::Signal::SIGHUP,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let text = std::fs::read_to_string(&log).unwrap();
+            if text.contains("qsh-server: ignoring SIGHUP: there is nothing to reload") {
+                break;
+            }
+            if let Some(status) = f.server.try_wait().unwrap() {
+                panic!("the server ended on SIGHUP ({status}):\n{text}");
+            }
+            assert!(Instant::now() < deadline, "no SIGHUP line:\n{text}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
+    f.port = wait_for_port(&log);
     let (code, out, err) = f.exec(&["echo", "still serving"]);
     assert_eq!((code, out.as_str()), (0, "still serving\n"), "{err}");
 }
