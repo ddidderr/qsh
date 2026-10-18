@@ -156,6 +156,18 @@ rsync sends the paths inside its own protocol instead:
 rsync -e qsh -s -av ./data/ 'server:/backup/my data/'
 ```
 
+If a network outage cuts a transfer, the remote rsync cannot tell that its
+client is gone. It runs on until the server's idle timeout (60 seconds by
+default) and is then hung up. With `--partial`, and so with `-P`, it then
+moves the partial file it was writing to the destination name, over whatever
+a quick retry put there in the meantime, and nothing reports it. Keep partial
+files apart with `--partial-dir`, or wait out the idle timeout before you
+retry:
+
+```
+rsync -e qsh -P --partial-dir=.rsync-partial -av ./data/ server:/backup/data/
+```
+
 ## git
 
 git hands its ssh program the remote command as one string,

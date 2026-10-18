@@ -377,7 +377,7 @@ def test_an_rsync_retried_at_once_meets_the_old_receivers_cleanup(alice_fast, fa
     on any transport whose server side outlives its client: under ssh the old
     receiver lives until TCP gives up, minutes to hours later. What qsh adds
     is the bound, the idle timeout, which this pins, together with what the
-    README is to say about it: with `-P` alone the partial replaces a retry
+    README says about it: with `-P` alone the partial replaces a retry
     that finished in the meantime; with `--partial-dir` the retry's result
     stays. A change that ended abandoned sessions some other way, or never,
     fails one of the two. The first run is throttled so that the outage lands
@@ -433,8 +433,8 @@ def test_an_rsync_retried_at_once_meets_the_old_receivers_cleanup(alice_fast, fa
             kept = fast_server.node.run(["stat", "-c", "%s", f"{remote}/.rsync-partial/large.bin"])
             assert kept.rc == 0 and 0 < int(kept.stdout) < RSYNC_SIZE, f"no partial in .rsync-partial/: {kept.describe()}"
         else:
-            # The hazard the README is to describe: the old partial, in place
-            # of the retry's complete file.
+            # The hazard the README describes: the old partial, in place of
+            # the retry's complete file.
             assert got != want and 0 < size < RSYNC_SIZE, f"the destination has {size} of {RSYNC_SIZE} bytes"
     finally:
         if first is not None and first.poll() is None:
