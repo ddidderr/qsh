@@ -74,11 +74,16 @@ class Terminal:
 
         Bracketed paste is switched off too: its mode switches would otherwise
         surround every command's output.
+
+        The line is typed before the session is up, so it can come back more
+        than once: echoed by the client's terminal until qsh makes it raw, by
+        the server's terminal until the shell starts reading, and by the
+        shell's line editor. So the prompt is split in the line itself, and
+        the only match is the prompt the shell prints after running it.
+        Everything echoed comes before that.
         """
-        self.sendline(f"bind 'set enable-bracketed-paste off'; export PS1='{PROMPT}' PROMPT_COMMAND=''")
-        self.expect(PROMPT_RE)
-        # The echoed command line itself contained the prompt text once.
-        self.sendline("")
+        head, tail = PROMPT[: len(PROMPT) // 2], PROMPT[len(PROMPT) // 2 :]
+        self.sendline(f"bind 'set enable-bracketed-paste off'; export PS1='{head}''{tail}' PROMPT_COMMAND=''")
         self.expect(PROMPT_RE)
 
     def command(self, line: str, timeout: float | None = None) -> str:
