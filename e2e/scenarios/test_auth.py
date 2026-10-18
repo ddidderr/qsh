@@ -45,18 +45,40 @@ def test_authorize_takes_effect_without_a_restart(make_client, server):
         server.revoke(f"late-{newcomer.fingerprint[7:15]}", settle=False)
 
 
+# How a revoked key's running session ends on the client: the connection's
+# once-a-second check closes the connection with this reason and logs the
+# withdrawal, and the sessions end with the connection.
+WITHDRAWN = "closed by peer: authorization withdrawn or expired"
+
+
 @pytest.mark.plan("AUTH-03")
 def test_revoke_cuts_off_new_and_running_sessions(make_client, server):
+    """The client is told why, and the journal says which connection was closed, once.
+
+    Each session checks its key once a second too, on its own tick, but
+    leaves a withdrawn key to the connection's check. Since F30 it no longer
+    resets its stream ahead of the close.
+    """
     member = make_client("alice", authorize_as="alice")
     entry = member.entry
     marker = "5151.25"
+    since = server.cursor()
     proc = member.node.popen(member.argv("server", *ticker_marker(marker)), user="alice")
     server.node.wait_running(f"sleep {marker}", timeout=10)
     begin = time.monotonic()
     server.revoke(entry, settle=False)
     _, err = proc.communicate(timeout=30)
-    assert proc.returncode == 255, err.decode()
-    assert time.monotonic() - begin < 6, "revocation took too long to reach a running session"
+    took = time.monotonic() - begin
+    said = err.decode()
+    assert proc.returncode == 255, said
+    assert took < 6, f"revocation took {took:.1f}s to reach a running session"
+    assert WITHDRAWN in said and "stream reset" not in said, said
+    journal = server.journal(since)
+    login = re.search(rf"(?m)^qsh-server: (\S+) authenticated as `alice` \(key `{re.escape(entry)}`\)$", journal)
+    assert login, journal
+    withdrawn = f"qsh-server: {login[1]} is no longer authorized; closing the connection"
+    journal = server.wait_journal(rf"(?m)^{re.escape(withdrawn)}$", since, timeout=5)
+    assert journal.count(withdrawn) == 1, journal
     server.node.wait_gone(f"sleep {marker}", timeout=10)
     assert member.run("server", "true").rc == 255
 

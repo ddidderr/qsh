@@ -2452,6 +2452,123 @@ fn revocation_stops_a_running_session_on_an_established_connection() {
     });
 }
 
+/// Read a session stream to its end and say how it ended. Like qsh, close
+/// the connection on any ending but the connection's own close.
+async fn session_ending(conn: quinn::Connection, mut recv: quinn::RecvStream) -> String {
+    let mut buf = [0u8; 4096];
+    let ending = loop {
+        match recv.read(&mut buf).await {
+            Ok(Some(_)) => {}
+            Ok(None) => break "the stream finished".to_owned(),
+            Err(quinn::ReadError::ConnectionLost(lost)) => {
+                return format!("connection lost: {lost}")
+            }
+            Err(error) => break error.to_string(),
+        }
+    };
+    conn.close(0u32.into(), b"");
+    ending
+}
+
+#[test]
+fn a_revoked_session_always_ends_with_the_withdrawal() {
+    // A connection and each of its sessions check the authorization on their
+    // own once-a-second ticks, each counted from when it started. Only the
+    // connection's check acts on a withdrawn key: it closes the connection
+    // with the reason and logs it. A session that ended itself first would
+    // reset its stream ahead of that close, and qsh, seeing only "stream
+    // reset by peer: error 2", would exit and close the connection before
+    // the withdrawal was logged. qsh opens its session milliseconds after the
+    // connection, so its ticks seldom give a session that chance. Here they
+    // are spread out: each connection opens a session every quarter of a
+    // second, so the connection's check is the first to see a reload only in
+    // the last quarter before it, and the second connection, half a second
+    // later, has that quarter elsewhere. Whatever the phase of the reload,
+    // some session's check sees the revocation before its connection's.
+    let f = Fixture::start(&[]);
+    let log = f.tmp.path().join("server.log");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut sessions = Vec::new();
+        for _ in 0..2 {
+            let conn = raw_connect(&f.client_dir, f.port).await;
+            let connected = tokio::time::Instant::now();
+            for quarter in 1..=3 {
+                tokio::time::sleep_until(connected + Duration::from_millis(250 * quarter)).await;
+                let (send, mut recv) = raw_request(&conn, &["sleep", "60"], false)
+                    .await
+                    .expect("opening a session");
+                wait_for_started(&mut recv).await;
+                sessions.push((conn.clone(), send, recv));
+            }
+            tokio::time::sleep_until(connected + Duration::from_millis(1500)).await;
+        }
+
+        let dir = f.server_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            run(
+                SERVER_BIN,
+                &["--dir", dir.to_str().unwrap(), "revoke", "tester"],
+            );
+        })
+        .await
+        .unwrap();
+        let endings = sessions
+            .into_iter()
+            .map(|(conn, send, recv)| {
+                tokio::spawn(async move {
+                    let _send = send;
+                    session_ending(conn, recv).await
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut ended = Vec::new();
+        for ending in endings {
+            let ending = tokio::time::timeout(Duration::from_secs(10), ending)
+                .await
+                .expect("a revoked session did not end");
+            ended.push(ending.unwrap());
+        }
+        assert!(
+            ended.iter().all(|ending| ending
+                == "connection lost: closed by peer: authorization withdrawn or expired (code 1)"),
+            "{ended:#?}"
+        );
+
+        // And each connection's withdrawal is logged, once.
+        let text = || std::fs::read_to_string(&log).unwrap();
+        let peers = text()
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("qsh-server: ")?
+                    .split_once(" authenticated as ")
+                    .map(|(peer, _)| peer.to_owned())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(peers.len(), 2, "{}", text());
+        let withdrawals = || {
+            let text = text();
+            peers
+                .iter()
+                .map(|peer| {
+                    let line = format!(
+                        "qsh-server: {peer} is no longer authorized; closing the connection"
+                    );
+                    text.lines().filter(|l| *l == line).count()
+                })
+                .collect::<Vec<_>>()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while withdrawals().contains(&0) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(withdrawals(), [1, 1], "{}", text());
+    });
+}
+
 #[test]
 fn a_preopened_stream_uses_the_policy_when_its_request_arrives() {
     let f = Fixture::start(&[]);

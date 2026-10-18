@@ -600,6 +600,8 @@ async fn serve_connection_sessions(
                 continue;
             }
             _ = policy_tick.tick() => {
+                // A withdrawn key's running sessions end with this close, not
+                // by their own checks (see `Standing::Withdrawn`).
                 let current = crate::sync::read(&store);
                 if current
                     .lookup(&fingerprint)
@@ -950,7 +952,10 @@ impl RequestGrant {
 enum Standing {
     Allowed,
     /// The key is gone or expired. The connection watch closes the whole
-    /// connection with a reason and logs it; the session only has to stop.
+    /// connection with a reason and logs it, and the session ends with it.
+    /// The session must not stop first: its stream reset would reach the
+    /// client ahead of the reason, and a client that gives up on the reset
+    /// could close the connection before the withdrawal is logged.
     Withdrawn,
     /// The key may still connect, but no longer for this session.
     Narrowed(Narrowed),
@@ -1232,7 +1237,8 @@ async fn run_session(
     // Observe exit without reaping: a zombie keeps the leader's PID reserved
     // until every possible process-group signal has been sent.
     // `Err(Some(_))`: a policy change took this session away; `Err(None)`:
-    // the client, the connection or the key is gone.
+    // the client or the connection is gone, which is also how a withdrawn
+    // key ends a session.
     let leader_exited = loop {
         tokio::select! {
             exited = wait_for_leader_exit(pid) => {
@@ -1252,8 +1258,7 @@ async fn run_session(
                 }
             }
             _ = policy_tick.tick() => match standing(&authorization) {
-                Standing::Allowed => {}
-                Standing::Withdrawn => break Err(None),
+                Standing::Allowed | Standing::Withdrawn => {}
                 Standing::Narrowed(narrowed) => break Err(Some(narrowed)),
             },
         }
@@ -1310,8 +1315,7 @@ async fn run_session(
                     }
                 }
                 _ = policy_tick.tick() => match standing(&authorization) {
-                    Standing::Allowed => {}
-                    Standing::Withdrawn => break Err(None),
+                    Standing::Allowed | Standing::Withdrawn => {}
                     Standing::Narrowed(narrowed) => break Err(Some(narrowed)),
                 },
             }
@@ -1426,8 +1430,7 @@ async fn run_session(
                 () = &mut delivery => break true,
                 _ = conn.closed() => break false,
                 _ = policy_tick.tick() => match standing(&authorization) {
-                    Standing::Allowed => {}
-                    Standing::Withdrawn => break false,
+                    Standing::Allowed | Standing::Withdrawn => {}
                     Standing::Narrowed(narrowed) => {
                         record_narrowed(diagnostics, conn.remote_address(), &narrowed);
                         break false;
