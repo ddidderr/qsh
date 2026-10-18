@@ -496,9 +496,11 @@ run, gives `126`.
 When a signal ends qsh, qsh restores the terminal and closes the connection
 first, so the server ends the remote command at once, and it exits with
 `128+n`. Without a terminal, INT and TERM (Ctrl-C, or a supervisor stopping
-qsh) go to the remote command instead, and its status becomes qsh's. Without
-a terminal, a signal that was ignored when qsh started stays ignored: `nohup
-qsh host cmd` survives a hangup.
+qsh) go to the remote command instead, and its status becomes qsh's. A second
+INT or TERM before the command has ended ends qsh, so pressing Ctrl-C again
+gets you out even when the network has gone. Without a terminal, a signal
+that was ignored when qsh started stays ignored: `nohup qsh host cmd`
+survives a hangup.
 
 ## Running under systemd
 

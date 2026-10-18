@@ -308,20 +308,16 @@ def test_a_signal_that_ends_qsh_ends_the_remote_job_at_once(alice_fast, fast_ser
 
 
 @pytest.mark.plan("LIFE-10")
-@pytest.mark.xfail(
-    strict=True,
-    reason="F34: without a terminal qsh only relays INT, so on a dead path Ctrl-C waits out the idle timeout",
-)
 def test_ctrl_c_ends_a_command_whose_path_has_gone_dark(alice_fast, fast_server, make_link):
     """Ctrl-C, pressed until something happens, ends qsh even when the server cannot hear it.
 
     Without a terminal qsh relays INT and TERM to the remote command instead
     of exiting (EXEC-22), so that the command can clean up and its status
     becomes qsh's. When the path has gone dark the relayed signal never
-    arrives, and nothing else ends qsh before its idle timeout: 8 s on
-    server2, 60 s on a default server. ssh exits on the first INT. Proposed:
-    an INT or TERM that arrives while an earlier one is still unanswered
-    ends qsh locally, with 128+n, so pressing Ctrl-C again gets the user out.
+    arrives, so an INT or TERM that comes while an earlier one is still
+    unanswered ends qsh locally, with 128+n: pressing Ctrl-C again gets the
+    user out, where the idle timeout alone would take 8 s on server2 and
+    60 s on a default server. ssh exits on the first INT.
     """
     link = make_link("server2:2222")
     alice_fast.pin(link.host, fast_server.fp, port=link.port)

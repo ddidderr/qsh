@@ -986,18 +986,28 @@ impl FatalSignals {
     }
 }
 
-/// Relay INT and TERM to the remote command until a signal arrives that ends
-/// the session, and return 128+n for that one. The remote command decides
-/// what a relayed signal means, so that it can clean up and its status
-/// becomes qsh's.
+/// Wait for a signal that ends the session, and return 128+n for it.
+///
+/// A relayed signal goes to the remote command, so that it can clean up and
+/// its status becomes qsh's. Another one before that command has ended ends
+/// the session here: on a dead path the first never arrives, and pressing
+/// Ctrl-C again must still get the user out.
 async fn until_fatal(caught: &mut mpsc::Receiver<Caught>, tx: Outbound) -> Option<i32> {
-    loop {
-        let (sig, relayed) = caught.recv().await?;
-        let Some(name) = relayed else {
-            return Some(128 + sig);
-        };
-        let _ = tx.send(Frame::Signal(name.into())).await;
+    let (sig, relayed) = caught.recv().await?;
+    let Some(name) = relayed else {
+        return Some(128 + sig);
+    };
+    tokio::select! {
+        sent = tx.send(Frame::Signal(name.into())) => {
+            if sent.is_err() {
+                return Some(128 + sig);
+            }
+        }
+        // The queue can be full when the path is dead; the second signal must
+        // not wait for room.
+        next = caught.recv() => return Some(128 + next?.0),
     }
+    Some(128 + caught.recv().await?.0)
 }
 
 /// The signals whose default action ends qsh and that a handler can catch.
@@ -1287,28 +1297,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relayed_signals_reach_the_remote_command_and_the_rest_end_the_session() {
+    async fn a_second_signal_ends_the_session_that_the_first_was_relayed_to() {
         let (signals, mut caught) = mpsc::channel(1);
         let (tx, mut rx) = mpsc::channel(4);
         let session = tokio::spawn(async move { until_fatal(&mut caught, tx).await });
-        for (number, name) in [(libc::SIGINT, "INT"), (libc::SIGTERM, "TERM")] {
-            signals.send((number, Some(name))).await.unwrap();
-            assert!(matches!(rx.recv().await, Some(Frame::Signal(sent)) if sent == name));
-        }
+        signals.send((libc::SIGINT, Some("INT"))).await.unwrap();
+        assert!(matches!(rx.recv().await, Some(Frame::Signal(name)) if name == "INT"));
         tokio::task::yield_now().await;
-        assert!(!session.is_finished(), "a relayed signal ended the session");
-        signals.send((libc::SIGHUP, None)).await.unwrap();
+        assert!(
+            !session.is_finished(),
+            "the first relayed signal ended the session"
+        );
+        signals.send((libc::SIGTERM, Some("TERM"))).await.unwrap();
         let status = tokio::time::timeout(Duration::from_secs(1), session)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(status, Some(128 + libc::SIGHUP));
+        assert_eq!(status, Some(128 + libc::SIGTERM));
+        assert!(rx.try_recv().is_err(), "the second signal was relayed too");
+
+        // A signal that is not relayed ends the session at once.
+        let (signals, mut caught) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel(4);
+        signals.send((libc::SIGHUP, None)).await.unwrap();
+        assert_eq!(until_fatal(&mut caught, tx).await, Some(128 + libc::SIGHUP));
         assert!(rx.try_recv().is_err());
 
         // Without a watcher, nothing ends the session.
         let (signals, mut caught) = mpsc::channel::<Caught>(1);
         drop(signals);
         assert_eq!(until_fatal(&mut caught, mpsc::channel(1).0).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_second_signal_ends_the_session_while_the_first_waits_for_room() {
+        // On a dead path the outbound queue fills, and nothing drains it.
+        let (signals, mut caught) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(Frame::Stdin(vec![1])).await.unwrap();
+        let session = tokio::spawn(async move { until_fatal(&mut caught, tx).await });
+        signals.send((libc::SIGINT, Some("INT"))).await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!session.is_finished());
+        signals.send((libc::SIGINT, Some("INT"))).await.unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(1), session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, Some(128 + libc::SIGINT));
+        assert!(matches!(rx.recv().await, Some(Frame::Stdin(data)) if data == [1]));
+
+        // A relay that cannot be delivered at all ends the session at once.
+        let (signals, mut caught) = mpsc::channel(1);
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        signals.send((libc::SIGTERM, Some("TERM"))).await.unwrap();
+        assert_eq!(
+            until_fatal(&mut caught, tx).await,
+            Some(128 + libc::SIGTERM)
+        );
     }
 
     #[tokio::test]
