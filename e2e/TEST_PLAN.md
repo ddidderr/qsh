@@ -30,7 +30,10 @@ Each scenario has an ID (`AREA-NN`), never reused once published, and:
   - `automated`: a test tagged `@pytest.mark.plan("ID")` implements it;
   - `planned`: worth automating, not done yet;
   - `manual`: checked by hand, for example because it needs hardware;
-  - `blocked`: needs something the reference environment lacks (stated).
+  - `blocked`: needs something the reference environment lacks (stated);
+  - `deferred`: decided not to pursue for now. The entry says who decided,
+    when and why, and when to revisit it; the rest of it stays as the
+    record, and no test implements it.
 - **Priority**: `P0` protects a documented promise or a security boundary;
   `P1` a realistic workflow or failure mode; `P2` an edge case or a
   convenience.
@@ -39,9 +42,9 @@ Each scenario has an ID (`AREA-NN`), never reused once published, and:
   release next to the current one, `ldap` for the directory server and NSS
   client in the image).
 
-`e2e/run plan` (CI runs it) fails when a test names an ID this file does not
-have, when an `automated` scenario has no test, or when a test implements a
-scenario not marked `automated`.
+`e2e/run plan` (CI runs it) fails when a status is not one of these, when a
+test names an ID this file does not have, when an `automated` scenario has
+no test, or when a test implements a scenario not marked `automated`.
 
 Expected behaviour cites the README, `THREAT_MODEL.md` or the code. When a
 scenario found a bug, the [findings log](#findings-log) records it and the

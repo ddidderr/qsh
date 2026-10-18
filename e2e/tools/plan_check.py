@@ -5,9 +5,11 @@ Every scenario in the plan is a `### ID — title` heading followed by a
 `Status:` line. Every test that implements one carries
 `@pytest.mark.plan("ID", ...)`. This script fails when:
 
+- a status is not one the plan's Conventions define,
 - a test names an ID the plan does not have,
 - a scenario is marked `automated` but no test names it,
-- a test names a scenario that is not marked `automated`.
+- a test names a scenario that is not marked `automated` (a `deferred`
+  one keeps its plan entry, not its tests).
 
 It reads the files as text and needs nothing beyond the standard library,
 so it runs without the test environment (and as the first job of
@@ -29,6 +31,9 @@ HEADING = re.compile(r"^### ([A-Z]+-\d+) — (.+)$")
 STATUS = re.compile(r"^\s*-?\s*\*\*Status:\*\*\s*([a-z-]+)")
 MARK = re.compile(r"@pytest\.mark\.plan\(([^)]*)\)")
 TEST = re.compile(r"^\s*def (test_\w+)")
+
+# The statuses TEST_PLAN.md's Conventions define.
+STATUSES = {"automated", "planned", "manual", "blocked", "deferred"}
 
 
 def plan_entries() -> dict[str, str]:
@@ -67,6 +72,9 @@ def main() -> int:
     entries = plan_entries()
     claims = test_marks()
     problems = []
+    for plan_id, status in entries.items():
+        if status not in STATUSES:
+            problems.append(f"{plan_id} has status `{status}`, which TEST_PLAN.md's Conventions do not define")
     for plan_id, tests in sorted(claims.items()):
         if plan_id not in entries:
             problems.append(f"{', '.join(tests)} names {plan_id}, which TEST_PLAN.md does not have")
