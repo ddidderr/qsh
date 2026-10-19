@@ -20,7 +20,9 @@ use crate::net::transport_config;
 use crate::proto::{
     read_frame, write_frame, ExitStatus, Frame, PtyRequest, Request, CHUNK, PROTOCOL_VERSION,
 };
-use std::os::fd::RawFd;
+use std::os::fd::{AsFd, RawFd};
+
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 
 use crate::pty::{self, RawMode};
 
@@ -69,6 +71,8 @@ impl std::fmt::Display for AddressFamily {
 const IDLE_TIMEOUT_SECS: u64 = 60;
 /// Keep-alive interval for an established session.
 const KEEPALIVE_SECS: u64 = 15;
+/// How long a finished session lingers so that its close can leave.
+const CLOSE_GRACE: Duration = Duration::from_millis(250);
 /// Default deadline for reaching one address.
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
@@ -223,16 +227,37 @@ pub async fn run(mut opts: Options) -> Result<i32> {
         }
         known.set_if_new(&host_key, fp)?;
         if !opts.quiet {
-            eprintln!("qsh: permanently added {host_key} ({fp}) to known hosts");
+            let _ = writeln!(
+                std::io::stderr(),
+                "qsh: permanently added {host_key} ({fp}) to known hosts"
+            );
         }
         fp
     };
-    let config = client_config(PinnedServerVerifier::new(pinned), Some(&identity))?;
-    let (endpoint, conn) = connect_any(&addrs, &config, &opts).await?;
+    let verifier = PinnedServerVerifier::new(pinned);
+    let config = client_config(verifier.clone(), Some(&identity))?;
+    let (endpoint, conn) = match connect_any(&addrs, &config, &opts).await {
+        Ok(connected) => connected,
+        Err(error) => match verifier.mismatch() {
+            Some(offered) => bail!(
+                "the host key for {host_key} has changed.\n  \
+                 pinned:    {pinned}\n  \
+                 presented: {offered}\n\
+                 If the server's key was replaced on purpose, remove the old entry with \
+                 `{command} remove {host_key}` and pin the new one; otherwise someone may \
+                 be impersonating the server.",
+                command = opts.known_hosts_command(),
+            ),
+            None => return Err(error),
+        },
+    };
 
     let status = session(&conn, &opts).await;
     conn.close(0u32.into(), b"bye");
-    endpoint.wait_idle().await;
+    // The close goes out at once. Waiting for the whole draining period (three
+    // PTOs) would hold the caller's prompt for seconds on a long round trip,
+    // `~.` included, with nothing left to deliver.
+    let _ = tokio::time::timeout(CLOSE_GRACE, endpoint.wait_idle()).await;
     status
 }
 
@@ -387,7 +412,7 @@ async fn connect_one(
         Ok(Err(error)) => {
             let fatal = matches!(&error, quinn::ConnectionError::TransportError(te)
                 if te.to_string().contains("HostKeyMismatch"));
-            let error = connect_error(&error, opts, addr, &host.key(opts.port));
+            let error = connect_error(&error, opts, addr);
             if fatal {
                 Err(error.context(HostKeyRejected))
             } else {
@@ -403,33 +428,43 @@ async fn connect_one(
 }
 
 /// Turn a connection failure into a message that says what to do next.
-fn connect_error(
-    e: &quinn::ConnectionError,
-    opts: &Options,
-    addr: SocketAddr,
-    host_key: &str,
-) -> anyhow::Error {
+fn connect_error(e: &quinn::ConnectionError, opts: &Options, addr: SocketAddr) -> anyhow::Error {
     let base = anyhow!("cannot connect to {} ({addr}): {e}", opts.host);
     match e {
-        quinn::ConnectionError::TransportError(te)
-            if te.to_string().contains("HostKeyMismatch") =>
-        {
-            anyhow!(
-                "{}\n\nThe host key for {} has changed. If this is expected, remove the old \
-                 entry with `{} remove {}`; otherwise someone may be \
-                 impersonating the server.",
-                te,
-                host_key,
-                opts.known_hosts_command(),
-                host_key
-            )
-        }
         quinn::ConnectionError::TimedOut => anyhow!(
             "{base}\n\nNo response. Check that qsh-server is running and that UDP port {} is \
              reachable — QUIC needs UDP, not TCP.",
             opts.port
         ),
+        _ if closed_during_handshake(e) => anyhow!(
+            "{base}\n\nThe server ended the login before it completed: it allows {} seconds for \
+             the handshake, so the path may be too slow or too lossy (or the server was \
+             stopping or restarting).",
+            crate::server::HANDSHAKE_GRACE.as_secs()
+        ),
         _ => base,
+    }
+}
+
+/// Did the server close the connection before its side of the handshake was
+/// done? Whatever code and reason it gave, such a close arrives as a bare
+/// `APPLICATION_ERROR` (RFC 9000, section 10.2.3). From qsh-server that is its
+/// handshake deadline, or a shutdown at that moment: a refused key is a TLS
+/// error, and a close after the handshake keeps its reason.
+fn closed_during_handshake(e: &quinn::ConnectionError) -> bool {
+    matches!(e, quinn::ConnectionError::ConnectionClosed(close)
+        if close.error_code == quinn::TransportErrorCode::APPLICATION_ERROR)
+}
+
+/// The client finishes its side of the handshake one flight before the server
+/// does, so until the server's first frame its deadline can still end the
+/// login. Report that as [`connect_one`] would, not as a lost connection.
+fn before_start(conn: &quinn::Connection, opts: &Options, error: anyhow::Error) -> anyhow::Error {
+    match conn.close_reason() {
+        Some(reason) if closed_during_handshake(&reason) => {
+            connect_error(&reason, opts, conn.remote_address())
+        }
+        _ => error,
     }
 }
 
@@ -499,7 +534,10 @@ fn accept_new_host(host_key: &str, fp: Fingerprint, opts: &Options) -> Result<bo
     tty.flush()?;
     let mut answer = String::new();
     std::io::BufRead::read_line(&mut std::io::BufReader::new(&tty), &mut answer)?;
-    Ok(matches!(answer.trim(), "yes" | "y"))
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "yes" | "y"
+    ))
 }
 
 /// Should this session allocate a remote terminal?
@@ -535,7 +573,13 @@ async fn session(conn: &quinn::Connection, opts: &Options) -> Result<i32> {
         }
     }
 
-    let (mut send, mut recv) = conn.open_bi().await.context("opening the session stream")?;
+    let sent_size = pty_req.as_ref().map(|p| p.size);
+    let unstarted = |error: anyhow::Error| before_start(conn, opts, error);
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .context("opening the session stream")
+        .map_err(unstarted)?;
 
     write_frame(
         &mut send,
@@ -548,13 +592,17 @@ async fn session(conn: &quinn::Connection, opts: &Options) -> Result<i32> {
         }),
     )
     .await
-    .context("sending the session request")?;
+    .context("sending the session request")
+    .map_err(unstarted)?;
 
     // Wait for the server's verdict before touching the local terminal.
-    match read_frame(&mut recv).await? {
+    let verdict = read_frame(&mut recv)
+        .await
+        .map_err(|e| unstarted(e.into()))?;
+    match verdict {
         Some(Frame::Started) => {}
         Some(Frame::Error(msg)) => {
-            eprintln!("qsh: {msg}");
+            let _ = writeln!(std::io::stderr(), "qsh: {msg}");
             // Drain the exit status the server sends after an error.
             if let Ok(Some(Frame::Exit(s))) = read_frame(&mut recv).await {
                 return Ok(s.wait_status());
@@ -565,26 +613,77 @@ async fn session(conn: &quinn::Connection, opts: &Options) -> Result<i32> {
         None => bail!("server closed the session without a reply"),
     }
 
-    let raw = if use_pty && !opts.no_stdin && std::io::stdin().is_terminal() {
-        // Register the handlers *before* touching the terminal. `Drop` covers
-        // the ordinary paths, but a fatal signal does not unwind, and a signal
-        // arriving between changing the termios and the handler being ready
-        // would take the default action and leave the terminal raw — no echo,
-        // no line editing, and no obvious way back.
-        let signals = FatalSignals::install()?;
-        let guard = RawMode::enable(stdin_fd).context("switching the terminal to raw mode")?;
-        // Tokio installs a process-wide signal disposition that is not restored
-        // when a Signal stream is dropped. Keep this watcher for the process
-        // lifetime so an embedding process still terminates on a later signal.
-        tokio::spawn(signals.restore_on_fire(stdin_fd, guard.saved()));
-        Some(guard)
+    let terminal = use_pty && !opts.no_stdin && std::io::stdin().is_terminal();
+    // Register the handlers *before* touching the terminal. A signal
+    // arriving between changing the termios and the handler being ready
+    // would take the default action and leave the terminal raw — no echo,
+    // no line editing, and no obvious way back.
+    let signals = FatalSignals::install(terminal)?;
+    let raw = if terminal {
+        Some(RawMode::enable(stdin_fd).context("switching the terminal to raw mode")?)
     } else {
         None
     };
+    // Tokio installs a process-wide signal disposition that is not restored
+    // when a Signal stream is dropped. Keep this watcher for the process
+    // lifetime so an embedding process still terminates on a later signal.
+    let (to_session, caught) = mpsc::channel(1);
+    let saved = raw.as_ref().map(|guard| (stdin_fd, guard.saved()));
+    tokio::spawn(signals.watch(to_session, saved));
 
-    let result = pump(send, recv, use_pty, opts.no_stdin).await;
+    let blocking = BlockingStdio::enable();
+    let result = pump(send, recv, sent_size, opts.no_stdin, caught).await;
     drop(raw);
+    drop(blocking);
     result
+}
+
+/// The standard streams, switched to blocking mode for one session.
+///
+/// rsync starts any remote shell other than rsh with non-blocking pipes: its
+/// `--blocking-io` documentation notes that ssh prefers them. tokio reads and
+/// writes the standard streams on a blocking helper thread, where a full
+/// non-blocking pipe is an `EAGAIN` error instead of a wait, so a pull failed
+/// as soon as rsync fell behind. The flags belong to open file descriptions
+/// that may be shared with whoever started qsh, so they are put back after.
+struct BlockingStdio {
+    stdin: Option<OFlag>,
+    stdout: Option<OFlag>,
+    stderr: Option<OFlag>,
+}
+
+impl BlockingStdio {
+    fn enable() -> Self {
+        Self {
+            stdin: make_blocking(std::io::stdin()),
+            stdout: make_blocking(std::io::stdout()),
+            stderr: make_blocking(std::io::stderr()),
+        }
+    }
+}
+
+impl Drop for BlockingStdio {
+    fn drop(&mut self) {
+        restore_flags(std::io::stdin(), self.stdin);
+        restore_flags(std::io::stdout(), self.stdout);
+        restore_flags(std::io::stderr(), self.stderr);
+    }
+}
+
+/// Clear `O_NONBLOCK`; returns the flags to restore if anything changed.
+fn make_blocking(stream: impl AsFd) -> Option<OFlag> {
+    let flags = OFlag::from_bits_retain(fcntl(&stream, FcntlArg::F_GETFL).ok()?);
+    if !flags.contains(OFlag::O_NONBLOCK) {
+        return None;
+    }
+    fcntl(&stream, FcntlArg::F_SETFL(flags - OFlag::O_NONBLOCK)).ok()?;
+    Some(flags)
+}
+
+fn restore_flags(stream: impl AsFd, flags: Option<OFlag>) {
+    if let Some(flags) = flags {
+        let _ = fcntl(stream, FcntlArg::F_SETFL(flags));
+    }
 }
 
 /// Frames the input tasks want to put on the wire.
@@ -594,12 +693,17 @@ type Outbound = mpsc::Sender<Frame>;
 ///
 /// A cancelled codec must never resume on a partially consumed stream. Local
 /// cancellation abandons the entire receive loop and shuts down every task.
+/// A signal that ends qsh ends the session here too, so that `run` still
+/// closes the connection and the server ends the remote command at once,
+/// not at its idle timeout.
 async fn pump(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
-    use_pty: bool,
+    sent_size: Option<crate::proto::PtySize>,
     no_stdin: bool,
+    mut caught: mpsc::Receiver<Caught>,
 ) -> Result<i32> {
+    let use_pty = sent_size.is_some();
     let (tx, mut rx) = mpsc::channel::<Frame>(64);
     let (disconnect, disconnected) = oneshot::channel();
     // JoinSet aborts its tasks even if this future is cancelled or errors.
@@ -625,21 +729,22 @@ async fn pump(
             disconnect,
         ));
     }
-    if use_pty {
-        tasks.spawn(forward_winch(tx.clone()));
+    if let Some(sent) = sent_size {
+        tasks.spawn(forward_winch(tx.clone(), sent));
     }
-    if !terminal_input {
-        tasks.spawn(forward_signals(tx.clone()));
-    }
-    drop(tx);
 
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
-    let result = until_disconnect(
-        receive_output(&mut recv, &mut stdout, &mut stderr),
-        disconnected,
-    )
-    .await;
+    let result = tokio::select! {
+        biased;
+        Some(status) = until_fatal(&mut caught, tx) => Ok(status),
+        result = until_disconnect(
+            receive_output(&mut recv, &mut stdout, &mut stderr),
+            disconnected,
+        ) => result,
+    };
+    // From here on, a further signal exits, once the close has had its time.
+    drop(caught);
     tasks.shutdown().await;
     let _ = recv.stop(0u32.into());
     result
@@ -670,8 +775,17 @@ async fn receive_output(
     stderr: &mut (impl tokio::io::AsyncWrite + Unpin),
 ) -> Result<i32> {
     while let Some(frame) = read_frame(recv).await? {
-        if let Some(status) = apply(frame, stdout, stderr).await? {
-            return Ok(status.wait_status());
+        match apply(frame, stdout, stderr).await {
+            Ok(Some(status)) => return Ok(status.wait_status()),
+            Ok(None) => {}
+            // Whoever read our output has gone, as `head` does once it has
+            // its line. A local writer would die of SIGPIPE here, silently;
+            // end the same way. Leaving the session lets the server stop the
+            // remote writer.
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+                return Ok(128 + libc::SIGPIPE);
+            }
+            Err(error) => return Err(error.into()),
         }
     }
     bail!("the connection closed before the remote process reported an exit status")
@@ -682,7 +796,7 @@ async fn apply(
     frame: Frame,
     stdout: &mut (impl tokio::io::AsyncWrite + Unpin),
     stderr: &mut (impl tokio::io::AsyncWrite + Unpin),
-) -> Result<Option<ExitStatus>> {
+) -> std::io::Result<Option<ExitStatus>> {
     match frame {
         Frame::Stdout(data) => {
             stdout.write_all(&data).await?;
@@ -837,42 +951,173 @@ impl EscapeState {
     }
 }
 
-/// The signals that would otherwise kill the client without unwinding.
+/// A caught signal: its number, and the name it is relayed under, if it is.
+type Caught = (libc::c_int, Option<&'static str>);
+
+/// The signals that would otherwise kill the client without unwinding: without
+/// closing the connection, so that the remote command runs on until the
+/// server's idle timeout, and in raw mode without restoring the terminal.
 ///
-/// `SIGINT` is deliberately absent: in a PTY session Ctrl-C is just a byte for
-/// the remote terminal, and the local process should not act on it.
-struct FatalSignals {
-    term: tokio::signal::unix::Signal,
-    hup: tokio::signal::unix::Signal,
-    quit: tokio::signal::unix::Signal,
-}
+/// `SIGINT` is among them: in raw mode Ctrl-C is a byte for the remote
+/// terminal, not a signal, so an INT can only come from outside (`kill -INT`,
+/// `timeout -s INT`, a supervisor). Without a terminal, INT and TERM are
+/// relayed to the remote command instead.
+struct FatalSignals(Vec<(Caught, tokio::signal::unix::Signal)>);
 
 impl FatalSignals {
     /// Start listening. Registration happens here, synchronously, so that by
     /// the time this returns the disposition is already installed — waiting
     /// for a spawned task to be polled would leave a window with the terminal
     /// already in raw mode and nothing watching.
-    fn install() -> Result<Self> {
-        use tokio::signal::unix::{signal, SignalKind};
-        Ok(Self {
-            term: signal(SignalKind::terminate()).context("listening for SIGTERM")?,
-            hup: signal(SignalKind::hangup()).context("listening for SIGHUP")?,
-            quit: signal(SignalKind::quit()).context("listening for SIGQUIT")?,
-        })
+    ///
+    /// Without a terminal, INT and TERM are caught to be relayed. Any other
+    /// signal that was ignored when qsh started stays ignored, so that
+    /// `nohup qsh host cmd` survives the hangup.
+    fn install(terminal: bool) -> Result<Self> {
+        let mut signals = Vec::new();
+        for number in terminating_signals() {
+            let relayed = match number {
+                _ if terminal => None,
+                libc::SIGINT => Some("INT"),
+                libc::SIGTERM => Some("TERM"),
+                _ if ignored(number) => continue,
+                _ => None,
+            };
+            let kind = tokio::signal::unix::SignalKind::from_raw(number);
+            match tokio::signal::unix::signal(kind) {
+                Ok(signal) => signals.push(((number, relayed), signal)),
+                // Emulators such as qemu-user reserve some real-time signals.
+                // One that cannot be caught keeps its default action, as
+                // before qsh caught any.
+                Err(_) if relayed.is_none() => {}
+                Err(e) => return Err(e).with_context(|| format!("listening for signal {number}")),
+            }
+        }
+        Ok(Self(signals))
     }
 
-    /// Put the terminal back and exit when one of them arrives.
-    async fn restore_on_fire(mut self, fd: RawFd, saved: nix::sys::termios::Termios) {
-        let sig = tokio::select! {
-            _ = self.term.recv() => libc::SIGTERM,
-            _ = self.hup.recv() => libc::SIGHUP,
-            _ = self.quit.recv() => libc::SIGQUIT,
-        };
-        pty::restore_termios(fd, &saved);
-        let mut stdout = tokio::io::stdout();
-        let _ = stdout.flush().await;
-        std::process::exit(128 + sig);
+    async fn recv(&mut self) -> Caught {
+        std::future::poll_fn(|cx| {
+            for (caught, signal) in &mut self.0 {
+                if let std::task::Poll::Ready(Some(())) = signal.poll_recv(cx) {
+                    return std::task::Poll::Ready(*caught);
+                }
+            }
+            std::task::Poll::Pending
+        })
+        .await
     }
+
+    /// Hand each signal to the session. Once the session has ended, put the
+    /// terminal back, if there was one, and exit on the next.
+    async fn watch(
+        mut self,
+        session: mpsc::Sender<Caught>,
+        terminal: Option<(RawFd, nix::sys::termios::Termios)>,
+    ) {
+        loop {
+            let caught = self.recv().await;
+            if session.send(caught).await.is_err() {
+                // `run` is closing the connection: a closed terminal window
+                // sends HUP and ends the input at once, and either can end the
+                // session. Exiting before the close has left would keep the
+                // remote command until the server's idle timeout.
+                tokio::time::sleep(CLOSE_GRACE).await;
+                if let Some((fd, saved)) = &terminal {
+                    pty::restore_termios(*fd, saved);
+                }
+                let mut stdout = tokio::io::stdout();
+                let _ = stdout.flush().await;
+                std::process::exit(128 + caught.0);
+            }
+        }
+    }
+}
+
+/// How soon after a relayed signal the same one again is still that signal:
+/// `timeout` sends its signal to qsh and then to qsh's process group, and qsh
+/// can catch both.
+const REPEAT_GRACE: Duration = Duration::from_millis(200);
+
+/// Wait for a signal that ends the session, and return 128+n for it.
+///
+/// A relayed signal goes to the remote command, so that it can clean up and
+/// its status becomes qsh's. Another one before that command has ended ends
+/// the session here: on a dead path the first never arrives, and pressing
+/// Ctrl-C again must still get the user out.
+async fn until_fatal(caught: &mut mpsc::Receiver<Caught>, tx: Outbound) -> Option<i32> {
+    let (sig, relayed) = caught.recv().await?;
+    let Some(name) = relayed else {
+        return Some(128 + sig);
+    };
+    let relayed_at = std::time::Instant::now();
+    let mut next = std::pin::pin!(async {
+        loop {
+            let (number, _) = caught.recv().await?;
+            if number != sig || relayed_at.elapsed() >= REPEAT_GRACE {
+                return Some(128 + number);
+            }
+        }
+    });
+    tokio::select! {
+        sent = tx.send(Frame::Signal(name.into())) => {
+            if sent.is_err() {
+                return Some(128 + sig);
+            }
+        }
+        // The queue can be full when the path is dead; the second signal must
+        // not wait for room.
+        status = &mut next => return status,
+    }
+    next.await
+}
+
+/// The signals whose default action ends qsh and that a handler can catch.
+/// Not the faults (SEGV, BUS, FPE, ILL) or TRAP: those come from qsh's own
+/// instructions, and a handler that returns would only run into them again.
+/// Nor Linux's STKFLT, which nothing sends and libc lacks on some
+/// architectures.
+fn terminating_signals() -> Vec<libc::c_int> {
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut signals = vec![
+        libc::SIGHUP,
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGABRT,
+        libc::SIGALRM,
+        libc::SIGTERM,
+        libc::SIGUSR1,
+        libc::SIGUSR2,
+        libc::SIGVTALRM,
+        libc::SIGPROF,
+        libc::SIGXCPU,
+        libc::SIGXFSZ,
+        libc::SIGSYS,
+    ];
+    // Elsewhere SIGIO is ignored by default, and there is no SIGPWR.
+    #[cfg(target_os = "linux")]
+    signals.extend(
+        [libc::SIGIO, libc::SIGPWR]
+            .into_iter()
+            .chain(libc::SIGRTMIN()..=libc::SIGRTMAX()),
+    );
+    signals
+}
+
+/// Whether a signal is ignored, as `nohup` leaves SIGHUP.
+#[allow(
+    unsafe_code,
+    reason = "sigaction with no new action only reads the disposition, and nix has no safe way to"
+)]
+fn ignored(number: libc::c_int) -> bool {
+    let mut old = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+    // SAFETY: a null new action changes nothing, and sigaction fills in the
+    // old one on success.
+    if unsafe { libc::sigaction(number, std::ptr::null(), old.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: sigaction returned success, so it initialized the old action.
+    unsafe { old.assume_init() }.sa_sigaction == libc::SIG_IGN
 }
 
 /// A forced PTY may receive piped input while output still goes to a terminal.
@@ -884,14 +1129,18 @@ fn terminal_size() -> crate::proto::PtySize {
 }
 
 /// Forward terminal resizes.
-async fn forward_winch(tx: Outbound) {
+///
+/// `sent` is the size the request carried. A resize while the session was
+/// being set up, before this listens for SIGWINCH, is caught by comparing
+/// against it rather than against the size at the time this starts.
+async fn forward_winch(tx: Outbound, sent: crate::proto::PtySize) {
     let Ok(mut winch) =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
     else {
         return;
     };
-    let mut last = terminal_size();
-    while winch.recv().await.is_some() {
+    let mut last = sent;
+    loop {
         let size = terminal_size();
         if size != last {
             last = size;
@@ -899,25 +1148,7 @@ async fn forward_winch(tx: Outbound) {
                 break;
             }
         }
-    }
-}
-
-/// Without a terminal, local Ctrl-C must be relayed as a signal.
-async fn forward_signals(tx: Outbound) {
-    let Ok(mut int) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-    else {
-        return;
-    };
-    let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    else {
-        return;
-    };
-    loop {
-        let name = tokio::select! {
-            _ = int.recv() => "INT",
-            _ = term.recv() => "TERM",
-        };
-        if tx.send(Frame::Signal(name.into())).await.is_err() {
+        if winch.recv().await.is_none() {
             break;
         }
     }
@@ -1127,6 +1358,153 @@ mod tests {
                 .unwrap(),
             255
         );
+    }
+
+    #[tokio::test]
+    async fn a_second_signal_ends_the_session_that_the_first_was_relayed_to() {
+        let (signals, mut caught) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel(4);
+        let session = tokio::spawn(async move { until_fatal(&mut caught, tx).await });
+        signals.send((libc::SIGINT, Some("INT"))).await.unwrap();
+        assert!(matches!(rx.recv().await, Some(Frame::Signal(name)) if name == "INT"));
+        // `timeout` signals qsh and then its process group: one INT, caught twice.
+        signals.send((libc::SIGINT, Some("INT"))).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !session.is_finished(),
+            "the first relayed signal ended the session"
+        );
+        signals.send((libc::SIGTERM, Some("TERM"))).await.unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(1), session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, Some(128 + libc::SIGTERM));
+        assert!(rx.try_recv().is_err(), "the second signal was relayed too");
+
+        // A signal that is not relayed ends the session at once.
+        let (signals, mut caught) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel(4);
+        signals.send((libc::SIGHUP, None)).await.unwrap();
+        assert_eq!(until_fatal(&mut caught, tx).await, Some(128 + libc::SIGHUP));
+        assert!(rx.try_recv().is_err());
+
+        // Without a watcher, nothing ends the session.
+        let (signals, mut caught) = mpsc::channel::<Caught>(1);
+        drop(signals);
+        assert_eq!(until_fatal(&mut caught, mpsc::channel(1).0).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_second_signal_ends_the_session_while_the_first_waits_for_room() {
+        // On a dead path the outbound queue fills, and nothing drains it.
+        let (signals, mut caught) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(Frame::Stdin(vec![1])).await.unwrap();
+        let session = tokio::spawn(async move { until_fatal(&mut caught, tx).await });
+        signals.send((libc::SIGINT, Some("INT"))).await.unwrap();
+        signals.send((libc::SIGINT, Some("INT"))).await.unwrap();
+        tokio::time::sleep(REPEAT_GRACE).await;
+        assert!(
+            !session.is_finished(),
+            "the same INT at once ended the session"
+        );
+        // A user pressing Ctrl-C again.
+        signals.send((libc::SIGINT, Some("INT"))).await.unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(1), session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, Some(128 + libc::SIGINT));
+        assert!(matches!(rx.recv().await, Some(Frame::Stdin(data)) if data == [1]));
+
+        // A relay that cannot be delivered at all ends the session at once.
+        let (signals, mut caught) = mpsc::channel(1);
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        signals.send((libc::SIGTERM, Some("TERM"))).await.unwrap();
+        assert_eq!(
+            until_fatal(&mut caught, tx).await,
+            Some(128 + libc::SIGTERM)
+        );
+    }
+
+    #[tokio::test]
+    async fn caught_signals_come_with_the_name_they_are_relayed_under() {
+        use nix::sys::signal::{raise, Signal};
+        // Both are ignored by default, so neither can end the test binary.
+        let listen = |number| {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(number)).unwrap()
+        };
+        let mut signals = FatalSignals(vec![
+            ((libc::SIGURG, Some("URG")), listen(libc::SIGURG)),
+            ((libc::SIGWINCH, None), listen(libc::SIGWINCH)),
+        ]);
+        let next = Duration::from_secs(1);
+        raise(Signal::SIGWINCH).unwrap();
+        let caught = tokio::time::timeout(next, signals.recv()).await.unwrap();
+        assert_eq!(caught, (libc::SIGWINCH, None));
+        raise(Signal::SIGURG).unwrap();
+        let caught = tokio::time::timeout(next, signals.recv()).await.unwrap();
+        assert_eq!(caught, (libc::SIGURG, Some("URG")));
+    }
+
+    #[test]
+    fn every_terminating_signal_is_caught_except_the_faults() {
+        let caught = terminating_signals();
+        for number in [
+            libc::SIGHUP,
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGABRT,
+            libc::SIGALRM,
+            libc::SIGTERM,
+            libc::SIGUSR1,
+            libc::SIGUSR2,
+            libc::SIGVTALRM,
+            libc::SIGPROF,
+            libc::SIGXCPU,
+            libc::SIGXFSZ,
+            libc::SIGSYS,
+        ] {
+            assert!(caught.contains(&number), "signal {number} is not caught");
+        }
+        #[cfg(target_os = "linux")]
+        for number in [
+            libc::SIGIO,
+            libc::SIGPWR,
+            libc::SIGRTMIN(),
+            libc::SIGRTMIN() + 1,
+            libc::SIGRTMAX(),
+        ] {
+            assert!(caught.contains(&number), "signal {number} is not caught");
+        }
+        // Faults keep their default action, KILL and STOP cannot be caught,
+        // and the rest do not end qsh (the Rust runtime ignores PIPE).
+        for number in [
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGFPE,
+            libc::SIGILL,
+            libc::SIGTRAP,
+            libc::SIGKILL,
+            libc::SIGSTOP,
+            libc::SIGPIPE,
+            libc::SIGCHLD,
+            libc::SIGWINCH,
+            libc::SIGCONT,
+            libc::SIGTSTP,
+            libc::SIGURG,
+        ] {
+            assert!(!caught.contains(&number), "signal {number} is caught");
+        }
+    }
+
+    #[test]
+    fn an_ignored_signal_is_recognised() {
+        // The Rust runtime ignores SIGPIPE before `main`, as `nohup` does SIGHUP.
+        assert!(ignored(libc::SIGPIPE));
+        assert!(!ignored(libc::SIGWINCH));
     }
 
     fn verify(pem: &str) -> std::result::Result<ServerCertVerified, TlsError> {
@@ -1389,6 +1767,77 @@ mod tests {
         peer.close(0u32.into(), b"done");
         endpoint.close(0u32.into(), b"done");
         server.close(0u32.into(), b"done");
+    }
+
+    #[tokio::test]
+    async fn a_handshake_the_server_drops_is_reported_as_its_deadline() {
+        let server_dir = tempfile::tempdir().unwrap();
+        let server_id = test_identity(server_dir.path());
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![server_id.cert.clone()], server_id.key.clone_key())
+        .unwrap();
+        tls.alpn_protocols = vec![crate::proto::ALPN.to_vec()];
+        let config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap(),
+        ));
+        let server = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let opts = Options {
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+            user: None,
+            command: None,
+            pty: PtyPolicy::Never,
+            env: vec![],
+            host_key_policy: HostKeyPolicy::Refuse,
+            paths_dir: None,
+            quiet: true,
+            no_stdin: false,
+            family: AddressFamily::V4,
+            connect_timeout_secs: 5,
+        };
+        let pin = Fingerprint::of_cert(&server_id.cert).unwrap();
+        let config = client_config(PinnedServerVerifier::new(pin), None).unwrap();
+        let (client, ()) = tokio::join!(connect_one(addr, &config, &opts), async {
+            // What HANDSHAKE_GRACE does to a handshake that has not finished.
+            drop(server.accept().await.unwrap().accept().unwrap());
+        });
+        let error = format!("{:#}", client.unwrap_err());
+        assert!(
+            error.contains("The server ended the login before it completed: it allows 5 seconds"),
+            "{error}"
+        );
+        server.close(0u32.into(), b"done");
+    }
+
+    #[test]
+    fn only_a_close_during_the_handshake_is_taken_for_the_deadline() {
+        let transport = |error_code| {
+            quinn::ConnectionError::ConnectionClosed(quinn::ConnectionClose {
+                error_code,
+                frame_type: None,
+                reason: Vec::new().into(),
+            })
+        };
+        assert!(closed_during_handshake(&transport(
+            quinn::TransportErrorCode::APPLICATION_ERROR
+        )));
+        // An unauthorized key is refused by TLS, with an alert.
+        assert!(!closed_during_handshake(&transport(
+            quinn::TransportErrorCode::crypto(42)
+        )));
+        // Shutdowns and refusals after the handshake keep their reason.
+        let after = quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: 0u32.into(),
+            reason: b"server shutting down".to_vec().into(),
+        });
+        assert!(!closed_during_handshake(&after));
+        assert!(!closed_during_handshake(&quinn::ConnectionError::TimedOut));
     }
 
     #[test]

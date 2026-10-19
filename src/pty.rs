@@ -8,6 +8,8 @@ use std::task::{Context, Poll};
 
 use anyhow::{Context as _, Result};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use nix::sys::stat::Mode;
+use nix::unistd::{Gid, Uid};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -74,6 +76,25 @@ pub fn open(size: PtySize) -> Result<(PtyMaster, OwnedFd)> {
         },
         slave,
     ))
+}
+
+/// Hand a session's terminal to the account that will use it, as login and
+/// sshd do: owned by the user and, where a `tty` group exists, writable by it
+/// for `write` and `wall`; by nobody else. As allocated by a root daemon the
+/// terminal is root's, and the session cannot open its own terminal by name,
+/// as screen and pinentry do.
+///
+/// # Errors
+/// Fails if the owner or mode cannot be changed.
+pub fn assign(slave: &OwnedFd, uid: Uid, user_gid: Gid, tty_group: Option<Gid>) -> Result<()> {
+    let (gid, mode) = match tty_group {
+        Some(gid) => (gid, 0o620),
+        None => (user_gid, 0o600),
+    };
+    nix::unistd::fchown(slave, Some(uid), Some(gid)).context("giving the terminal to the user")?;
+    nix::sys::stat::fchmod(slave, Mode::from_bits_truncate(mode))
+        .context("setting the terminal's permissions")?;
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

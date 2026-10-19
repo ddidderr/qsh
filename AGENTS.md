@@ -17,7 +17,8 @@ its "Rules for reviews". In short:
 
 ## Checks
 
-`just check` runs the core CI checks: formatting, pedantic Clippy with
-warnings as errors, and the test suite. CI additionally runs root-only and
-delegated-cgroup tests, the MSRV build, workflow linting, and a dependency
-audit.
+There is no hosted CI, and no GitHub Actions workflows are wanted. `just
+check` runs the fast checks: formatting, pedantic Clippy with warnings as
+errors, and the test suite. `just verify` is what must pass before anything
+reaches `main`: those, the MSRV build, the root-only and delegated-cgroup
+tests, the dependency audit, and the multi-host suite.

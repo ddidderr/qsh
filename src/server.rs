@@ -6,7 +6,7 @@ pub(crate) mod diagnostics;
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
@@ -14,6 +14,7 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use nix::poll::{PollFd, PollFlags, PollTimeout};
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -35,13 +36,25 @@ use crate::proto::{
 };
 use crate::pty;
 
-/// How long to keep reading a PTY once the leader has exited.
+/// How long a PTY must be quiet, once its leader has exited, to count as
+/// drained.
 ///
 /// A pipe ends when its last writer closes it, so that case needs no deadline.
 /// A PTY master has no such guarantee: a job backgrounded from an interactive
 /// shell keeps the slave open after the shell exits, and without a bound the
-/// session would never finish — `sleep 300 &` then `exit` would hang the
-/// client forever.
+/// session would never finish. A gap rather than "nothing readable right now",
+/// because the kernel moves terminal output to the master side from a worker:
+/// right after a read, the rest of a backlog can be in flight and not yet
+/// readable. Output after the gap is a background job's, and the job outlives
+/// the session anyway, so `exit` returns at once.
+const PTY_QUIET: Duration = Duration::from_millis(100);
+
+/// The most a PTY's drain may take once its leader has exited.
+///
+/// Reached only by a client that is not reading, or a job that never leaves the
+/// terminal quiet for [`PTY_QUIET`]; the session then ends with whatever was
+/// delivered. Output left over fails the session only once nothing else has
+/// the terminal open; see [`drain_terminal`].
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// How long to wait for the job to die before escalating to the next signal.
@@ -88,7 +101,7 @@ const MAX_HANDSHAKES_PER_SOURCE: usize = 4;
 /// How long an accepted connection may take to finish its handshake. The idle
 /// timeout is far too generous for this — it would let half-open attempts hold
 /// admission slots for a minute each.
-const HANDSHAKE_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const HANDSHAKE_GRACE: Duration = Duration::from_secs(5);
 
 /// How long an opened session stream may take to say what it wants.
 const FIRST_FRAME_GRACE: Duration = Duration::from_secs(10);
@@ -97,16 +110,22 @@ const FIRST_FRAME_GRACE: Duration = Duration::from_secs(10);
 /// four MiB per session. Backpressure continues through the child's pipes.
 const OUTPUT_QUEUE_FRAMES: usize = 8;
 
-/// Run the server until the process is stopped.
+/// Run the server until `shutdown` completes. SIGHUP is logged and otherwise
+/// ignored.
 ///
 /// # Errors
-/// Fails if the host identity is missing, the authorisation store cannot be
-/// read, the TLS configuration is invalid, or the socket cannot be bound.
+/// Fails if SIGHUP cannot be handled, the host identity is missing, the
+/// authorisation store cannot be read, the TLS configuration is invalid, or the
+/// socket cannot be bound.
 pub async fn serve(
     paths: &ServerPaths,
     cfg: &ServerConfig,
     listen_override: Option<SocketAddr>,
+    shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
+    // First: until it is handled, SIGHUP's default action ends the server.
+    let hangups = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .context("handling SIGHUP")?;
     let identity = crypto::load_identity(&paths.cert(), &paths.key()).with_context(|| {
         format!(
             "loading the server identity from {} (run `qsh-server keygen` first)",
@@ -161,7 +180,19 @@ pub async fn serve(
     let per_key = Arc::new(PerKeyConnections::default());
     let sessions = SessionBudget::new();
 
-    while let Some(incoming) = endpoint.accept().await {
+    let shutdown = ignoring_hangups(shutdown, hangups, &diagnostics);
+    tokio::pin!(shutdown);
+    loop {
+        let incoming = tokio::select! {
+            incoming = endpoint.accept() => incoming,
+            () = &mut shutdown => {
+                shut_down(&endpoint, &diagnostics).await;
+                break;
+            }
+        };
+        let Some(incoming) = incoming else {
+            break;
+        };
         // Make the peer prove it can receive at its claimed address before we
         // spend anything on it. Without this, a spoofed-source flood would
         // reach the work below on every packet.
@@ -207,6 +238,42 @@ pub async fn serve(
     }
     refresher.abort();
     Ok(())
+}
+
+/// Wait for `shutdown`, logging every SIGHUP meanwhile, including one that
+/// arrived during startup. There is nothing to reload, and the signal's default
+/// action would end the server without a word to its clients.
+async fn ignoring_hangups(
+    shutdown: impl Future<Output = ()>,
+    mut hangups: tokio::signal::unix::Signal,
+    diagnostics: &Diagnostics,
+) {
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            () = &mut shutdown => return,
+            Some(()) = hangups.recv() => diagnostics.record(|| {
+                "qsh-server: ignoring SIGHUP: there is nothing to reload; authorized/ is \
+                 re-read every second, and other settings take effect on restart"
+                    .into()
+            }),
+        }
+    }
+}
+
+/// Close every connection, then log the shutdown. Without a `CONNECTION_CLOSE`
+/// clients wait on a dead session until their idle timeout, and the next
+/// process's stateless resets cannot reach them either.
+///
+/// The line goes through the queue and gets the same bounded wait as the
+/// closes: a blocked log sink must hold up neither.
+async fn shut_down(endpoint: &quinn::Endpoint, diagnostics: &Diagnostics) {
+    endpoint.close(0u32.into(), b"server shutting down");
+    diagnostics.record(|| "qsh-server: shutting down".into());
+    let _ = tokio::time::timeout(SHUTDOWN_GRACE, async {
+        tokio::join!(endpoint.wait_idle(), diagnostics.flush())
+    })
+    .await;
 }
 
 fn server_config(
@@ -533,6 +600,8 @@ async fn serve_connection_sessions(
                 continue;
             }
             _ = policy_tick.tick() => {
+                // A withdrawn key's running sessions end with this close, not
+                // by their own checks (see `Standing::Withdrawn`).
                 let current = crate::sync::read(&store);
                 if current
                     .lookup(&fingerprint)
@@ -695,12 +764,12 @@ async fn handle_session(
         Ok(Ok(None)) => return Ok(()),
         Ok(Err(error)) => {
             let error = anyhow!(error).context("reading the qsh/1 session request");
-            refuse_session(send, invalid_request_diagnostic(&error)).await;
+            refuse_session(send, invalid_request_diagnostic(&error), 126).await;
             return Err(error);
         }
         Err(_) => {
             let error = anyhow!("client opened a session but sent no request within 10 seconds");
-            refuse_session(send, invalid_request_diagnostic(&error)).await;
+            refuse_session(send, invalid_request_diagnostic(&error), 126).await;
             return Err(error);
         }
     };
@@ -774,8 +843,8 @@ async fn handle_session(
         Ok(s) => s,
         Err(e) => {
             // Report the refusal in-band so the client can print it, then end
-            // the session with a shell-like "cannot execute" status.
-            refuse_session(send, bounded_diagnostic(&e)).await;
+            // the session with a shell-like status.
+            refuse_session(send, bounded_diagnostic(&e), refusal_status(&e)).await;
             return Err(e);
         }
     };
@@ -806,15 +875,22 @@ async fn handle_session(
     result
 }
 
-async fn refuse_session(send: quinn::SendStream, message: String) {
+/// A shell's status for a session that could not start: 127 when the program
+/// does not exist, which rsync and scripts recognise, 126 for anything else.
+fn refusal_status(error: &anyhow::Error) -> i32 {
+    if error.is::<child::ProgramNotFound>() {
+        127
+    } else {
+        126
+    }
+}
+
+async fn refuse_session(send: quinn::SendStream, message: String, code: i32) {
     let mut stream = SessionStream::new(send);
     let _ = tokio::time::timeout(SHUTDOWN_GRACE, async {
         let _ = stream.write(&Frame::Error(message)).await;
         let _ = stream
-            .write(&Frame::Exit(ExitStatus {
-                code: 126,
-                signal: None,
-            }))
+            .write(&Frame::Exit(ExitStatus { code, signal: None }))
             .await;
         stream.finish().await;
     })
@@ -871,24 +947,71 @@ impl RequestGrant {
     }
 }
 
-fn request_still_authorized(auth: &LiveAuthorization) -> bool {
+/// Where a running session stands after the authorization store changed.
+#[derive(Debug, PartialEq, Eq)]
+enum Standing {
+    Allowed,
+    /// The key is gone or expired. The connection watch closes the whole
+    /// connection with a reason and logs it, and the session ends with it.
+    /// The session must not stop first: its stream reset would reach the
+    /// client ahead of the reason, and a client that gives up on the reset
+    /// could close the connection before the withdrawal is logged.
+    Withdrawn,
+    /// The key may still connect, but no longer for this session.
+    Narrowed(Narrowed),
+}
+
+/// What an administrator's policy change took away from a running session.
+#[derive(Debug, PartialEq, Eq)]
+struct Narrowed {
+    key: String,
+    why: String,
+}
+
+/// What the client is told when its session ends because of [`Narrowed`].
+/// Deliberately generic: the key holder learns that its permissions changed,
+/// the server log says which.
+const NARROWED_NOTICE: &str = "the server ended this session: this key's permissions changed";
+
+fn standing(auth: &LiveAuthorization) -> Standing {
     let current = crate::sync::read(&auth.store);
-    current.lookup(&auth.fingerprint).is_some_and(|entry| {
-        entry.meta.user == auth.authorized_user
-            && entry.meta.kill_session_processes == auth.restricted
-            && !entry.meta.is_expired(unix_now())
-            && match &auth.grant {
-                RequestGrant::Shell => entry.meta.allow_shell,
-                RequestGrant::Exec(program) => {
-                    entry.meta.allow_exec
-                        && (entry.meta.allowed_commands.is_empty()
-                            || entry
-                                .meta
-                                .allowed_commands
-                                .iter()
-                                .any(|allowed| allowed == program))
-                }
+    let Some(entry) = current.lookup(&auth.fingerprint) else {
+        return Standing::Withdrawn;
+    };
+    if entry.meta.is_expired(unix_now()) {
+        return Standing::Withdrawn;
+    }
+    let meta = &entry.meta;
+    let why = if meta.user != auth.authorized_user {
+        format!(
+            "it now logs in as `{}`, not `{}`",
+            meta.user, auth.authorized_user
+        )
+    } else if meta.kill_session_processes != auth.restricted {
+        "its session cleanup policy changed".to_owned()
+    } else {
+        match &auth.grant {
+            RequestGrant::Shell if !meta.allow_shell => {
+                "login shells are no longer allowed".to_owned()
             }
+            RequestGrant::Exec(_) if !meta.allow_exec => {
+                "commands are no longer allowed".to_owned()
+            }
+            RequestGrant::Exec(program)
+                if !meta.allowed_commands.is_empty()
+                    && !meta
+                        .allowed_commands
+                        .iter()
+                        .any(|allowed| allowed == program) =>
+            {
+                format!("`{program}` is no longer an allowed command")
+            }
+            _ => return Standing::Allowed,
+        }
+    };
+    Standing::Narrowed(Narrowed {
+        key: entry.name.clone(),
+        why,
     })
 }
 
@@ -921,9 +1044,12 @@ impl ProcessGroupGuard {
 
     /// Stop guarding the group.
     ///
-    /// Only correct once the leader has exited *and* its output has drained
-    /// to end of file. Nothing left is attached to this session, and reaping
-    /// the leader after disarming cannot race a later group signal.
+    /// Only correct once the leader has exited and its output has ended: at
+    /// end of file, or for a PTY, once the terminal went quiet or was left
+    /// to another process that still holds it, as after a normal exit. Or
+    /// once the session's cgroup has been killed, which reaches every
+    /// process in it. Reaping the leader after disarming cannot race a later
+    /// group signal.
     fn disarm(&mut self) {
         self.pid = None;
     }
@@ -1113,33 +1239,49 @@ async fn run_session(
 
     // Observe exit without reaping: a zombie keeps the leader's PID reserved
     // until every possible process-group signal has been sent.
+    // `Err(Some(_))`: a policy change took this session away; `Err(None)`:
+    // the client or the connection is gone, which is also how a withdrawn
+    // key ends a session.
     let leader_exited = loop {
         tokio::select! {
             exited = wait_for_leader_exit(pid) => {
                 if let Err(error) = exited {
                     diagnostics.emit(|| format!("qsh-server: could not observe child exit: {error:#}"));
-                    break None;
+                    break Err(None);
                 }
-                break Some(());
+                break Ok(());
             }
-            _ = &mut control => break None,
-            _ = conn.closed() => break None,
+            _ = &mut control => break Err(None),
+            _ = conn.closed() => break Err(None),
             event = events_rx.recv() => {
                 if let Some(event) = event {
                     apply_control_event(event, pty_fd.as_ref(), pid);
                 } else {
-                    break None;
+                    break Err(None);
                 }
             }
-            _ = policy_tick.tick() => {
-                if !request_still_authorized(&authorization) {
-                    break None;
-                }
-            }
+            _ = policy_tick.tick() => match standing(&authorization) {
+                Standing::Allowed | Standing::Withdrawn => {}
+                Standing::Narrowed(narrowed) => break Err(Some(narrowed)),
+            },
         }
     };
-    if leader_exited.is_none() {
+    if let Err(narrowed) = leader_exited {
         control.stop().await;
+        if let Some(narrowed) = narrowed {
+            let peer = conn.remote_address();
+            return end_narrowed(
+                &mut guard,
+                &mut child,
+                outputs,
+                tx,
+                writer,
+                peer,
+                narrowed,
+                diagnostics,
+            )
+            .await;
+        }
         writer.stop().await;
         return abandon(&mut guard, &mut child, outputs).await;
     }
@@ -1161,38 +1303,56 @@ async fn run_session(
     // Drain with disconnect and policy watches still running. Pin the drain
     // future so a timer tick never restarts a partly completed drain.
     let drained = {
-        let pending = drain(&mut outputs, is_pty);
+        let pending = drain(&mut outputs, pty_fd.as_ref());
         tokio::pin!(pending);
         loop {
             tokio::select! {
-                result = &mut pending => break Some(result),
-                _ = &mut control => break None,
-                _ = conn.closed() => break None,
+                result = &mut pending => break Ok(result),
+                _ = &mut control => break Err(None),
+                _ = conn.closed() => break Err(None),
                 event = events_rx.recv() => {
                     if let Some(event) = event {
                         apply_control_event(event, pty_fd.as_ref(), pid);
                     } else {
-                        break None;
+                        break Err(None);
                     }
                 }
-                _ = policy_tick.tick() => {
-                    if !request_still_authorized(&authorization) {
-                        break None;
-                    }
-                }
+                _ = policy_tick.tick() => match standing(&authorization) {
+                    Standing::Allowed | Standing::Withdrawn => {}
+                    Standing::Narrowed(narrowed) => break Err(Some(narrowed)),
+                },
             }
         }
     };
-    let Some(drained) = drained else {
-        control.stop().await;
-        writer.stop().await;
-        return abandon(&mut guard, &mut child, outputs).await;
+    let drained = match drained {
+        Ok(drained) => drained,
+        Err(narrowed) => {
+            control.stop().await;
+            if let Some(narrowed) = narrowed {
+                let peer = conn.remote_address();
+                return end_narrowed(
+                    &mut guard,
+                    &mut child,
+                    outputs,
+                    tx,
+                    writer,
+                    peer,
+                    narrowed,
+                    diagnostics,
+                )
+                .await;
+            }
+            writer.stop().await;
+            return abandon(&mut guard, &mut child, outputs).await;
+        }
     };
     control.stop().await;
 
     let exit = match drained {
         Drained::Fully => {
-            // Everything produced before exit has been delivered. Ordinary
+            // Everything produced before exit has been handed on, unless
+            // another process still holds the terminal: then the drain
+            // deadline may have dropped the rest (`drain_terminal`). Ordinary
             // sessions permit deliberately detached work; restricted sessions
             // have already killed their cgroup before output drain.
             if let Err(error) = guard.complete() {
@@ -1248,22 +1408,104 @@ async fn run_session(
         }
     }
 
-    let _ = tokio::time::timeout(SHUTDOWN_GRACE, tx.send(Frame::Exit(exit))).await;
-    drop(tx);
-
     // The writer finishes the stream itself once the channel closes. If it is
     // still stuck on a peer that is not reading, cancel it and wait for that
     // to take effect: dropping the handle would detach a task that still owns
     // the stream, and quinn treats a dropped `SendStream` as a graceful finish
     // that goes on retransmitting. `SessionStream` resets it on the way out
     // instead, which is the honest ending for a session nobody is listening to.
-    if tokio::time::timeout(SHUTDOWN_GRACE, &mut writer)
-        .await
-        .is_err()
-    {
+    let delivered = if matches!(drained, Drained::Fully) {
+        // The output has ended: for pipes every byte was read. For a PTY
+        // that another process still holds, the deadline may have dropped a
+        // chunk already read and whatever was still unread (`drain_terminal`).
+        // What remains is putting the rest on the wire, and the frame queue
+        // and QUIC's send buffer can hold megabytes that a slow or briefly
+        // interrupted path takes far longer than any fixed grace to carry.
+        // Cutting that short is the truncation `drain` refuses for pipes, so
+        // wait as long as the connection lives and the key may still use it;
+        // the idle timeout decides when the peer is gone.
+        let delivery = async {
+            let _ = tx.send(Frame::Exit(exit)).await;
+            drop(tx);
+            let _ = (&mut writer).await;
+        };
+        tokio::pin!(delivery);
+        loop {
+            tokio::select! {
+                () = &mut delivery => break true,
+                _ = conn.closed() => break false,
+                _ = policy_tick.tick() => match standing(&authorization) {
+                    Standing::Allowed | Standing::Withdrawn => {}
+                    Standing::Narrowed(narrowed) => {
+                        record_narrowed(diagnostics, conn.remote_address(), &narrowed);
+                        break false;
+                    }
+                },
+            }
+        }
+    } else {
+        let _ = tokio::time::timeout(SHUTDOWN_GRACE, tx.send(Frame::Exit(exit))).await;
+        drop(tx);
+        tokio::time::timeout(SHUTDOWN_GRACE, &mut writer)
+            .await
+            .is_ok()
+    };
+    if !delivered {
         writer.stop().await;
     }
     Ok(())
+}
+
+/// A policy change took this session away while the key may still connect.
+///
+/// A withdrawn key's connection is closed with a reason; this session ends on
+/// its own, so it says why in-band before the job is stopped. A bare stream
+/// reset would tell the user nothing, and the administrator would find no
+/// trace of what their change ended.
+#[allow(clippy::too_many_arguments)]
+async fn end_narrowed(
+    guard: &mut ProcessGroupGuard,
+    child: &mut tokio::process::Child,
+    outputs: Vec<Pump>,
+    tx: mpsc::Sender<Frame>,
+    mut writer: AbortOnDrop<()>,
+    peer: SocketAddr,
+    narrowed: Narrowed,
+    diagnostics: &Diagnostics,
+) -> Result<()> {
+    record_narrowed(diagnostics, peer, &narrowed);
+    // No more output after the notice: the pumps hold the other senders.
+    stop_outputs(outputs).await;
+    let notice = async {
+        let _ = tx.send(Frame::Error(NARROWED_NOTICE.to_owned())).await;
+        let _ = tx
+            .send(Frame::Exit(ExitStatus {
+                code: 255,
+                signal: None,
+            }))
+            .await;
+        drop(tx);
+        let _ = (&mut writer).await;
+    };
+    if tokio::time::timeout(SHUTDOWN_GRACE, notice).await.is_err() {
+        writer.stop().await;
+    }
+    let stopped = guard.terminate().await;
+    let _ = child.wait().await;
+    stopped?;
+    guard.clean_cgroup().await?;
+    Ok(())
+}
+
+/// The audit line for [`Narrowed`]: an administrator's change ended a session,
+/// which, like a withdrawn authorization, must not share the peer budget.
+fn record_narrowed(diagnostics: &Diagnostics, peer: SocketAddr, narrowed: &Narrowed) {
+    diagnostics.record(|| {
+        format!(
+            "qsh-server: {peer} (key `{}`): ended a session its authorization no longer allows: {}",
+            narrowed.key, narrowed.why
+        )
+    });
 }
 
 /// The client is gone: kill the job, reap it, and stop.
@@ -1306,28 +1548,17 @@ enum Drained {
 /// deliver, and cutting that short on a timer is what turned a slow reader
 /// into a truncated file with a successful exit status.
 ///
-/// A PTY gets a deadline, because it has no last-writer guarantee — a job
+/// A PTY gets deadlines, because it has no last-writer guarantee — a job
 /// backgrounded from an interactive shell holds the slave open indefinitely.
-/// The pump reports whether cutoff discarded a chunk already read from the
-/// PTY. A pending send means output is lost, even when the client is reading
-/// steadily; it does not by itself establish that the client stopped reading.
-/// This preserves the existing bounded drain policy and its incomplete-output
-/// status while making cancellation outcomes explicit.
+/// See [`drain_terminal`].
 ///
 /// The handles stay borrowed so that a cancelled drain leaves them intact for
 /// the caller to abort.
-async fn drain(tasks: &mut [Pump], is_pty: bool) -> Drained {
+async fn drain(tasks: &mut [Pump], terminal: Option<&OwnedFd>) -> Drained {
     let mut result = Drained::Fully;
     for pump in tasks.iter_mut() {
-        let end = if is_pty {
-            if let Ok(joined) = tokio::time::timeout(DRAIN_GRACE, &mut pump.task).await {
-                joined.unwrap_or(PumpEnd::Failed)
-            } else {
-                if let Some(cancel) = pump.cancel.take() {
-                    let _ = cancel.send(());
-                }
-                (&mut pump.task).await.unwrap_or(PumpEnd::Failed)
-            }
+        let end = if let Some(terminal) = terminal {
+            drain_terminal(pump, terminal).await
         } else {
             (&mut pump.task).await.unwrap_or(PumpEnd::Failed)
         };
@@ -1344,6 +1575,53 @@ async fn drain(tasks: &mut [Pump], is_pty: bool) -> Drained {
     result
 }
 
+/// Finish a PTY's output once its leader has exited.
+///
+/// The pump ends at end of file or at the first [`PTY_QUIET`] gap in the
+/// output. Time spent handing a chunk to a slow client does not count as a
+/// gap, so a backlog is not cut short. At [`DRAIN_GRACE`] it stops outright,
+/// and drops a chunk it could not hand over.
+///
+/// Whether that fails the session depends on who else has the terminal open.
+/// While another process does, usually a job the leader left behind, this
+/// ends like a quiet terminal and the session reports the leader's status,
+/// whoever wrote the chunk. A job that writes faster than the path carries
+/// can leave one at any deadline, however steadily the client reads, and from
+/// here that looks the same as the leader's own last output held up by a
+/// client that stopped reading, beside a job that writes nothing. So what is
+/// lost, the chunk and whatever is still unread in the terminal, can be the
+/// leader's output too; `exit` ends the session all the same. With nobody
+/// else left on the terminal, everything left is the session's own, and the
+/// output is incomplete.
+async fn drain_terminal(pump: &mut Pump, terminal: &OwnedFd) -> PumpEnd {
+    if let Some(exited) = pump.leader_exited.take() {
+        let _ = exited.send(());
+    }
+    if let Ok(joined) = tokio::time::timeout(DRAIN_GRACE, &mut pump.task).await {
+        return joined.unwrap_or(PumpEnd::Failed);
+    }
+    if let Some(cancel) = pump.cancel.take() {
+        let _ = cancel.send(());
+    }
+    match (&mut pump.task).await.unwrap_or(PumpEnd::Failed) {
+        PumpEnd::CutoffPending if held_open(terminal) => PumpEnd::CutoffIdle,
+        end => end,
+    }
+}
+
+/// Does anything besides the server still have this terminal open?
+///
+/// Once the leader has exited, that is usually a job it left behind. This
+/// relies on the kernel reporting a hangup on the master as soon as the last
+/// descriptor for the other side is closed, with output still unread or not,
+/// as Linux does. Only a `poll` that reports nothing at all counts as yes: a
+/// hangup, an error or a failed call means no, and the session ends as
+/// incomplete.
+fn held_open(terminal: &OwnedFd) -> bool {
+    let mut fds = [PollFd::new(terminal.as_fd(), PollFlags::empty())];
+    nix::poll::poll(&mut fds, PollTimeout::ZERO) == Ok(0)
+}
+
 /// How an output pump finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PumpEnd {
@@ -1353,9 +1631,12 @@ enum PumpEnd {
     ReadError,
     /// Nobody is left to receive the frames.
     ClientGone,
-    /// The PTY drain deadline arrived while waiting for more output.
+    /// The PTY went quiet after its leader exited, or the drain deadline
+    /// arrived while waiting for more output, or with a chunk in hand while
+    /// another process still has the terminal open.
     CutoffIdle,
     /// The PTY drain deadline arrived with a chunk still awaiting delivery.
+    /// [`drain_terminal`] decides whether that fails the session.
     CutoffPending,
     /// The forwarding task itself did not finish.
     Failed,
@@ -1420,9 +1701,12 @@ impl Drop for SessionStream {
     }
 }
 
-/// One output stream being forwarded, with a cooperative drain cutoff.
+/// One output stream being forwarded. A PTY's pump is told when the leader
+/// exits, so it can end once the terminal goes quiet, and has a cooperative
+/// drain cutoff.
 struct Pump {
     task: AbortOnDrop<PumpEnd>,
+    leader_exited: Option<tokio::sync::oneshot::Sender<()>>,
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -1480,9 +1764,11 @@ fn spawn_pump<R: AsyncRead + Unpin + Send + 'static>(
     tx: mpsc::Sender<Frame>,
     wrap: fn(Vec<u8>) -> Frame,
 ) -> Pump {
+    let (leader_exited, exited) = tokio::sync::oneshot::channel();
     let (cancel, cancelled) = tokio::sync::oneshot::channel();
     Pump {
-        task: AbortOnDrop::new(tokio::spawn(pump(src, tx, wrap, cancelled))),
+        task: AbortOnDrop::new(tokio::spawn(pump(src, tx, wrap, exited, cancelled))),
+        leader_exited: Some(leader_exited),
         cancel: Some(cancel),
     }
 }
@@ -1491,14 +1777,21 @@ async fn pump<R: AsyncRead + Unpin>(
     mut src: R,
     tx: mpsc::Sender<Frame>,
     wrap: fn(Vec<u8>) -> Frame,
+    mut exited: tokio::sync::oneshot::Receiver<()>,
     mut cancelled: tokio::sync::oneshot::Receiver<()>,
 ) -> PumpEnd {
     let mut buf = vec![0u8; CHUNK];
+    let mut leader_gone = false;
     loop {
         // `read` is cancel-safe. Only this branch can stop without owing a chunk.
         let read = tokio::select! {
             biased;
             _ = &mut cancelled => return PumpEnd::CutoffIdle,
+            _ = &mut exited, if !leader_gone => {
+                leader_gone = true;
+                continue;
+            }
+            () = tokio::time::sleep(PTY_QUIET), if leader_gone => return PumpEnd::CutoffIdle,
             read = src.read(&mut buf) => read,
         };
         match read {
@@ -1509,7 +1802,7 @@ async fn pump<R: AsyncRead + Unpin>(
                     return PumpEnd::ReadError;
                 };
                 // Cancelling a pending send discards this chunk, so the pump
-                // itself reports incomplete output. No shared flag or task
+                // itself reports that it dropped one. No shared flag or task
                 // cancellation timing is needed to reconstruct that fact.
                 let sent = tokio::select! {
                     biased;
@@ -1951,12 +2244,99 @@ mod tests {
             authorized_user: "guest".into(),
             restricted: false,
         };
-        assert!(request_still_authorized(&live));
+        assert_eq!(standing(&live), Standing::Allowed);
 
         meta.kill_session_processes = true;
         std::fs::write(&policy, toml::to_string(&meta).unwrap()).unwrap();
         *crate::sync::write(&store) = AuthStore::load(dir.path()).unwrap();
-        assert!(!request_still_authorized(&live));
+        assert_eq!(
+            standing(&live),
+            Standing::Narrowed(Narrowed {
+                key: "client".into(),
+                why: "its session cleanup policy changed".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_narrowed_policy_names_what_it_took_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pem, _) = crypto::generate_identity("client", &["client".into()], 30).unwrap();
+        std::fs::write(dir.path().join("client.crt"), &pem).unwrap();
+        let fingerprint = Fingerprint::of_cert(&crypto::cert_from_pem(&pem).unwrap()).unwrap();
+        let policy = dir.path().join("client.toml");
+        let store = Arc::new(RwLock::new(AuthStore::default()));
+        let live = |grant| LiveAuthorization {
+            store: Arc::clone(&store),
+            fingerprint,
+            grant,
+            authorized_user: "guest".into(),
+            restricted: false,
+        };
+        let why = |meta: &AuthMeta, grant| {
+            std::fs::write(&policy, toml::to_string(meta).unwrap()).unwrap();
+            *crate::sync::write(&store) = AuthStore::load(dir.path()).unwrap();
+            match standing(&live(grant)) {
+                Standing::Narrowed(narrowed) => {
+                    assert_eq!(narrowed.key, "client");
+                    Some(narrowed.why)
+                }
+                Standing::Allowed => None,
+                Standing::Withdrawn => panic!("the key is still authorized"),
+            }
+        };
+        let base = AuthMeta {
+            user: "guest".into(),
+            key_fingerprint: Some(fingerprint.to_string()),
+            ..Default::default()
+        };
+        let exec = || RequestGrant::Exec("rsync".into());
+
+        assert_eq!(why(&base, RequestGrant::Shell), None);
+        assert_eq!(why(&base, exec()), None);
+        let no_shell = AuthMeta {
+            allow_shell: false,
+            ..base.clone()
+        };
+        assert_eq!(
+            why(&no_shell, RequestGrant::Shell).unwrap(),
+            "login shells are no longer allowed"
+        );
+        assert_eq!(why(&no_shell, exec()), None);
+        let no_exec = AuthMeta {
+            allow_exec: false,
+            ..base.clone()
+        };
+        assert_eq!(
+            why(&no_exec, exec()).unwrap(),
+            "commands are no longer allowed"
+        );
+        let only_tar = AuthMeta {
+            allowed_commands: vec!["tar".into()],
+            ..base.clone()
+        };
+        assert_eq!(
+            why(&only_tar, exec()).unwrap(),
+            "`rsync` is no longer an allowed command"
+        );
+        let only_rsync = AuthMeta {
+            allowed_commands: vec!["rsync".into()],
+            ..base.clone()
+        };
+        assert_eq!(why(&only_rsync, exec()), None);
+        let other_user = AuthMeta {
+            user: "admin".into(),
+            ..base.clone()
+        };
+        assert_eq!(
+            why(&other_user, exec()).unwrap(),
+            "it now logs in as `admin`, not `guest`"
+        );
+
+        std::fs::remove_file(&policy).unwrap();
+        std::fs::remove_file(dir.path().join("client.crt")).unwrap();
+        *crate::sync::write(&store) = AuthStore::load(dir.path()).unwrap();
+        assert_eq!(standing(&live(exec())), Standing::Withdrawn);
     }
 
     /// Start a job that ignores the polite signals, in its own process group.
@@ -2145,6 +2525,65 @@ mod tests {
         source.write_all(b"ab").await.unwrap();
         pump.cancel.take().unwrap().send(()).unwrap();
         assert_eq!(pump.task.await.unwrap(), PumpEnd::CutoffPending);
+    }
+
+    #[tokio::test]
+    async fn a_backlog_behind_a_slow_client_is_not_a_quiet_terminal() {
+        let (mut source, reader) = tokio::io::duplex(1);
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(Frame::Started).await.unwrap();
+        let mut pump = spawn_pump(reader, tx, Frame::Stdout);
+        // As above: the pump holds `a` and waits on the full channel, and `b`
+        // is buffered behind it. The client then stalls past the quiet gap.
+        source.write_all(b"ab").await.unwrap();
+        pump.leader_exited.take().unwrap().send(()).unwrap();
+        tokio::time::sleep(PTY_QUIET * 3).await;
+        assert!(matches!(rx.recv().await, Some(Frame::Started)));
+        assert!(matches!(rx.recv().await, Some(Frame::Stdout(data)) if data == b"a"));
+        assert!(matches!(rx.recv().await, Some(Frame::Stdout(data)) if data == b"b"));
+        assert_eq!(pump.task.await.unwrap(), PumpEnd::CutoffIdle);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_held_open_does_not_hold_up_the_end_of_the_session() {
+        // A background job keeps the PTY open, so its reader never sees EOF.
+        let terminal = nix::pty::openpty(None, None).unwrap();
+        let (_job, reader) = tokio::io::duplex(64);
+        let (tx, _rx) = mpsc::channel(1);
+        let mut pumps = vec![spawn_pump(reader, tx, Frame::Stdout)];
+        let begin = std::time::Instant::now();
+        assert!(matches!(
+            drain(&mut pumps, Some(&terminal.master)).await,
+            Drained::Fully
+        ));
+        assert!(begin.elapsed() < DRAIN_GRACE / 2, "{:?}", begin.elapsed());
+    }
+
+    #[tokio::test]
+    async fn output_left_at_the_drain_deadline_fails_only_a_session_alone_on_the_terminal() {
+        async fn parked_at_the_deadline(held: bool) -> Drained {
+            let nix::pty::OpenptyResult { master, slave } = nix::pty::openpty(None, None).unwrap();
+            let holder = held.then_some(slave);
+            let (mut source, reader) = tokio::io::duplex(1);
+            let (tx, _rx) = mpsc::channel(1);
+            tx.send(Frame::Started).await.unwrap();
+            let mut pumps = vec![spawn_pump(reader, tx, Frame::Stdout)];
+            // As above: the pump holds `a` on the full channel, which nobody
+            // reads, until the deadline makes it drop it.
+            source.write_all(b"ab").await.unwrap();
+            let drained = drain(&mut pumps, Some(&master)).await;
+            drop(holder);
+            drained
+        }
+        let (held, alone) =
+            tokio::join!(parked_at_the_deadline(true), parked_at_the_deadline(false));
+        // Another process has the terminal open and writes nothing. The chunk
+        // is dropped and the session does not fail, whoever wrote it: a job
+        // that outwrites the path looks just like this, and so does the
+        // leader's own last output behind a client that stopped reading.
+        assert!(matches!(held, Drained::Fully));
+        // With nobody else on the terminal the chunk was the session's own.
+        assert!(matches!(alone, Drained::Incomplete(_)));
     }
 
     #[tokio::test]

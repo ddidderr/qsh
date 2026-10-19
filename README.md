@@ -9,6 +9,12 @@ nothing else:
   byte for byte,
 * **rsync** — because of the above, `rsync -e qsh` just works.
 
+qsh is not an ssh clone. It is new software with its own design decisions,
+and it is deliberately kept simple. Where it behaves like ssh, that is because
+the behaviour is right for qsh, not to match ssh: it accepts none of ssh's
+options or flags for compatibility's sake, and an ssh option it does not have
+is an error, never silently ignored.
+
 Everything runs over a single QUIC connection: TLS 1.3 by construction, one
 UDP port, no head-of-line blocking between sessions, and connection migration
 if your laptop changes network.
@@ -44,12 +50,12 @@ indirection rather than rustls directly.
 ## Install
 
 ```
-cargo install --path .          # installs qsh and qsh-server
+cargo install --path . --locked # installs qsh and qsh-server
 ```
 
 Requires a Unix-like system (Linux is what it is tested on) and Rust 1.88+,
-which is what the pinned dependency graph in `Cargo.lock` needs. CI builds
-both that version and current stable with `--locked`.
+which is what the pinned dependency graph in `Cargo.lock` needs. `just msrv`
+builds and tests with that version.
 
 ## Setup
 
@@ -68,6 +74,9 @@ prints the host key fingerprint.
 
 Without root, everything moves to `~/.config/qsh-server` and the server can
 only run sessions as the account it runs under.
+
+`serve` runs in the foreground; stop it with Ctrl-C. It ignores SIGHUP, so
+closing the terminal leaves it running, holding the port, with nowhere to log.
 
 ### On the client
 
@@ -140,6 +149,59 @@ want globbing or redirection, ask for it explicitly:
 qsh server sh -c 'echo hello > /tmp/out'
 ```
 
+rsync 3.2.4 and later escape remote paths for the remote shell that ssh
+would start. qsh starts none, so a remote path with spaces or shell
+metacharacters would arrive with literal backslashes and name a different
+directory. Pass `-s` (`--secluded-args`), or set `RSYNC_PROTECT_ARGS=1`, and
+rsync sends the paths inside its own protocol instead:
+
+```
+rsync -e qsh -s -av ./data/ 'server:/backup/my data/'
+```
+
+If a network outage cuts a transfer, the remote rsync cannot tell that its
+client is gone. It runs on until the server's idle timeout (60 seconds by
+default) and is then hung up. With `--partial`, and so with `-P`, it then
+moves the partial file it was writing to the destination name, over whatever
+a quick retry put there in the meantime, and nothing reports it. Keep partial
+files apart with `--partial-dir`, or wait out the idle timeout before you
+retry:
+
+```
+rsync -e qsh -P --partial-dir=.rsync-partial -av ./data/ server:/backup/data/
+```
+
+## git
+
+git hands its ssh program the remote command as one string,
+`git-upload-pack '/srv/repo.git'`, for a remote shell to parse, and adds
+ssh's `-o SendEnv=GIT_PROTOCOL`. qsh starts no shell and takes no `-o`, so
+give git a wrapper that asks for a shell and drops the option:
+
+```
+#!/bin/bash
+# qsh-git: git passes ssh's -o options, then the remote command as one
+# string, for a shell.
+args=()
+while [ $# -gt 1 ]; do
+    case $1 in
+        -o) shift 2 ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+exec qsh "${args[@]}" sh -c "$1"
+```
+
+```
+export GIT_SSH_COMMAND=qsh-git GIT_SSH_VARIANT=ssh
+git clone server:repo.git
+git clone ssh://server:2222/srv/repo.git
+```
+
+`GIT_SSH_VARIANT=ssh` makes git pass the port of an `ssh://` URL as `-p`.
+Without `GIT_PROTOCOL` on the server, git speaks its original protocol
+(v0), which every git server understands.
+
 ## Security model
 
 There is no password authentication, no PKI, and no CA. Both sides hold a
@@ -172,9 +234,12 @@ against, the boundaries it promises, and the trade-offs already decided.
   shows the remaining time.
 * Deleting `authorized/<name>.crt` (or `qsh-server revoke <name>`) takes
   effect after the next reload and policy check, normally within two seconds,
-  without a restart. The key's connections close and
-  the server signals each session's initial process group. A PTY shell can put
-  a foreground job in a different group; that job may survive if it ignores
+  without a restart. The key's connections close and the server logs each
+  one; the client prints `authorization withdrawn or expired`. A session the
+  server is still checking at that moment may be refused instead, with status
+  126 and `client authorization was withdrawn`. The server signals each
+  session's initial process group. A PTY shell can put a
+  foreground job in a different group; that job may survive if it ignores
   the terminal hangup.
 * `--command` filters the executable name, not its arguments, subprocesses,
   filesystem access, or other capabilities. In particular, allowing `rsync`
@@ -198,12 +263,14 @@ against, the boundaries it promises, and the trade-offs already decided.
   `/tmp/tool` because it ends in `tool` would permit a replacement executable.
   A bare name is resolved through the server's own fixed
   `PATH`; to allow a program elsewhere, authorize its absolute path.
-* A session is torn down with its connection. If the client is killed, the
-  server notices when the QUIC idle timeout expires (60s by default, with
-  15-second keep-alives) and signals the session's process group `SIGHUP`, then
-  `SIGTERM`, then `SIGKILL`. That watch stays up for the whole session,
-  including while the last of the output is still draining, so a descendant
-  that outlives the command it was started from is cleaned up too.
+* A session is torn down with its connection. A client ended by a signal
+  once the session has started closes the connection on its way out. If the
+  client is killed outright (`SIGKILL`), crashes, or loses the network, the
+  server notices when the QUIC idle timeout expires (60s by default, with 15-second keep-alives).
+  Either way it signals the session's process group `SIGHUP`, then `SIGTERM`,
+  then `SIGKILL`. That watch stays up for the whole session, including while
+  the last of the output is still draining, so a descendant that outlives the
+  command it was started from is cleaned up too.
 
   For an ordinary key, an intentional detached job may survive. PTY job
   control or `setsid` can move work to another process group, beyond those
@@ -258,23 +325,39 @@ against, the boundaries it promises, and the trade-offs already decided.
   than logged one line per attempt.
   Live diagnostics use a bounded queue and a dedicated writer. Peer-triggered
   detail, such as session errors, shares a global limit of 16 messages per
-  second, with periodic suppression counts. Logins, withdrawn authorizations,
-  admission counters, and failed `cgroup.kill` attempts do not draw on that
-  budget, so a flood of failing sessions cannot silence them. They still share
-  the bounded queue; a line that finds it full is dropped and counted as
-  suppressed. While stderr is blocked, the newest authorization-reload
-  warnings wait in a small backlog. Logging is best effort: a failed write is
-  not retried. A full log pipe cannot block session handling or authorization
-  reload.
+  second, with periodic suppression counts. Logins, withdrawn or narrowed
+  authorizations, admission counters, and failed `cgroup.kill` attempts do
+  not draw on that budget, so a flood of failing sessions cannot silence them.
+  They still share the bounded queue; a line that finds it full is dropped and
+  counted as suppressed. While stderr is blocked, the newest
+  authorization-reload warnings wait in a small backlog. Logging is best
+  effort: a failed write is not retried. A full log pipe cannot block session
+  handling, authorization reload, or a stop.
 
   This is a fairness reservation, not a rate limit: nothing is remembered
   after an attempt ends, so there is no per-address table to grow or expire.
   It bounds concurrency, not attempt rate, and it says nothing about a
   distributed flood from many addresses — for that, put the port behind
   whatever the host already uses for the rest of its services.
+
+  Clients behind one NAT address share that address's 4 handshake slots. An
+  attempt over the limit gets no answer, and the client sends it again on
+  QUIC's retransmission timer, about 1, 3 and 7 seconds after the first. So
+  when many clients behind one address connect at the same moment over a WAN
+  path, about four get in per retry: of 32 at once, about 16 log in, and a
+  longer `--connect-timeout` lets no more in. The rest fail, usually with
+  `timed out`. Stagger such bursts.
 * A key's policy is re-read for every session, not captured when the
   connection was made, so revoking a key also cuts off the connections it
-  already has.
+  already has. A change that no longer allows a running session (shells or
+  commands switched off, its program dropped from `allowed_commands`, another
+  account or cleanup policy) ends that session at the next policy check: the
+  client prints that the key's permissions changed and exits 255, and the
+  server logs which key lost what.
+* qsh does not use PAM or the shadow file. An expired or locked account,
+  `/etc/nologin` and login records (`utmp`, `wtmp`, `last`) play no part:
+  a key's authorization is the only gate. Withdraw it with `qsh-server
+  revoke`, or give it a deadline with `--expires-in-days`.
 * The client cannot set arbitrary environment variables. Only `TERM`, `LANG`,
   `COLORTERM`, `LC_*` and `QSH_*` survive; `PATH` is fixed by the server. The
   remote process gets a fresh session (`setsid`) and, when root, a full
@@ -289,6 +372,16 @@ against, the boundaries it promises, and the trade-offs already decided.
   A non-root daemon inherits its account's supplementary groups at startup and
   cannot reset them. Restart it after removing group membership, and do not
   grant service-specific supplementary groups that remote sessions should lack.
+* Accounts and groups come from NSS (`/etc/passwd`, LDAP, SSSD) and are looked
+  up afresh for every session. While a directory does not answer, a session
+  for one of its accounts waits out the NSS module's timeouts, holding its
+  place in the session budget, and then fails with status 126 and
+  ``looking up user `alice`: ENOENT: No such file or directory``: glibc reports
+  a source it cannot reach as `ENOENT`, so this reads like a missing account.
+  A local account's session can wait for its group lookup too, and then starts
+  without its directory groups. root needs no directory lookup and is not
+  affected. Give the NSS module finite timeouts; nslcd's `timelimit`, for one,
+  waits for ever by default. A stop or restart does not wait for stuck lookups.
 
 What 1.0 does **not** have, on purpose: port forwarding, agent forwarding, X11
 forwarding, `sftp`, jump hosts, certificate authorities, host key rotation
@@ -353,6 +446,12 @@ Environment overrides for both binaries: `QSH_HOME` (client directory) and
 `QSH_SERVER_HOME` (server directory); `qsh-server --dir` and `qsh -i` do the
 same per invocation.
 
+qsh-server reads `qsh-server.toml`, the host key and certificate, and its
+command line and environment only at startup; restart it to apply a change,
+which ends running sessions. `authorized/` is re-read every second, so
+`authorize`, `revoke` and edits there need no restart. Accounts and groups
+are looked up for every session.
+
 ## Client reference
 
 ```
@@ -370,15 +469,27 @@ qsh [options] [user@]host [command [args...]]
 | `--refuse-new` | Never pin automatically |
 | `-4` / `-6` | Restrict to IPv4 / IPv6 |
 | `--connect-timeout SECS` | Deadline per address, default 10 |
-| `-o OPTION` | Ignored, for ssh compatibility; `StrictHostKeyChecking=accept-new\|yes` is honoured |
-| `-q`, `-v`, `-C` | Accepted for ssh compatibility |
+| `-n` | Send EOF without reading local stdin |
+| `-q`, `--quiet` | Suppress qsh's own messages |
 
 Subcommands: `qsh keygen`, `qsh fingerprint`, `qsh known-hosts list|add|remove`.
+
+Options go before the host: everything after it is the remote command, so
+`qsh host ls -l` runs `ls -l` and `qsh host -p 2222 true` runs `-p` remotely.
+There is no ssh-style `-o`, `-v`, `-C`, `-a` or `-x`; each is an unknown option
+like any other. Choose the host-key policy with `--accept-new` or
+`--refuse-new`.
 
 A host name that resolves to several addresses is tried with a 250 ms stagger,
 at most two attempts at once, and an interleaved IPv6/IPv4 order. Each address
 gets its own connect timeout, so a dual-stack name still works when only one
 family is reachable.
+
+The server gives each login 5 seconds to finish its QUIC handshake, and a
+longer `--connect-timeout` cannot extend that. In testing at 50 ms each way,
+logins were reliable up to 20% loss each way, about half failed at 50%, and
+most failed from 60%. A path with a round trip of 5 seconds or more cannot log
+in at all. When the server ends a login this way, qsh says so.
 
 Host pins normalize DNS case, IP address spelling, and numeric ports. Existing
 equivalent entries with conflicting keys fail closed. A DNS name ending in `.`
@@ -414,13 +525,38 @@ qsh server sh -c 'nohup ./daemon >/dev/null 2>&1 &'
 
 An interactive session is different, because a terminal has no equivalent of
 "the last writer closed it": a job you background with `&` keeps the terminal
-open after the shell exits. There the session waits two seconds for the rest of
-the output and then finishes anyway, so `sleep 300 &` followed by `exit` still
-returns you to your prompt.
+open after the shell exits. So the session does not wait for the terminal:
+`exit` or Ctrl-D delivers what the shell printed and returns you to your prompt
+at once, with the shell's exit status. Only a job that writes to the terminal
+more than ten times a second, or a connection too slow to take the shell's last
+output, can hold that up, for at most two seconds however fast the job writes;
+output already on its way still arrives first. If a background job, or any
+other process, still has the terminal open at that point, the rest of the
+output is dropped, the shell's own last lines included, and you still get the
+shell's status. With nothing else on the terminal, output that could not be
+sent by then makes the status 255. The
+background job keeps running, as after `exit` in a local terminal, but its
+later output goes nowhere. A key with `kill_session_processes` ends it
+instead. A session that ends abnormally
+(`~.`, a lost connection) hangs up the shell, and bash passes that on to its
+`&` jobs; `nohup`, `setsid` or `disown` keeps a job running.
 
 qsh exits with the remote command's exit status, `128+n` if it died from
-signal `n`, and `255` for its own failures — the same convention as ssh, which
-is what makes it a drop-in for scripts and for rsync.
+signal `n`, and `255` for its own failures — the convention scripts and rsync
+expect from a remote shell. As from a shell, a remote program that does not
+exist gives `127`, and one that cannot be executed, or that the key may not
+run, gives `126`.
+
+When a signal ends qsh once the session has started, qsh restores the
+terminal and closes the connection first, so the server ends the remote
+command at once, and it exits with `128+n`. Without a terminal, INT and TERM
+(Ctrl-C, or a supervisor stopping qsh) go to the remote command instead, and
+its status becomes qsh's. A second INT or TERM before the command has ended
+ends qsh, so pressing Ctrl-C again gets you out even when the network has
+gone. The same signal again within 0.2 s counts as the first: `timeout` sends
+its signal to qsh and to qsh's process group. Without a terminal, any other
+signal that was ignored when qsh started stays ignored: `nohup qsh host cmd`
+survives a hangup.
 
 ## Running under systemd
 
@@ -428,10 +564,13 @@ is what makes it a drop-in for scripts and for rsync.
 [Unit]
 Description=qsh server
 After=network.target
+# Keep retrying, for example until the listen address exists.
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/usr/local/bin/qsh-server serve
 Restart=on-failure
+RestartSec=2s
 # The server must start as root to switch to the target user.
 User=root
 Delegate=yes
@@ -441,8 +580,25 @@ KillMode=control-group
 WantedBy=multi-user.target
 ```
 
+A server that cannot start exits, and systemd tries again every two seconds
+for as long as it takes; each try logs why it failed. A `listen` address that
+arrives after boot (a DHCP lease, a floating IP) is served within a couple of
+seconds of appearing. Without `StartLimitIntervalSec=0`, systemd gives up after
+five starts within ten seconds, a `systemctl restart` included, and the unit
+stays failed. The repository ships this unit, with comments and a few more
+settings, as `contrib/qsh-server.service`.
+
 Open the port with `ufw allow 2222/udp` (or the nftables equivalent) — UDP,
 not TCP. This is the single most common reason a first connection times out.
+
+qsh-server has nothing to reload, so the unit has no `ExecReload=` and
+`systemctl reload qsh-server` is refused; after changing `qsh-server.toml`,
+run `systemctl restart qsh-server`. SIGHUP is ignored: the server logs that
+there is nothing to reload and keeps serving. A stop or restart closes every
+connection first, so clients exit at once saying the server is shutting down.
+qsh-server is gone within a few seconds, even while journald is not reading or
+account lookups are stuck. A detached job of a session that ignores SIGTERM
+still holds the stop until systemd's `TimeoutStopSec=` kills it.
 
 ## Protocol
 
@@ -485,19 +641,29 @@ The end-to-end tests start a real `qsh-server` on a loopback UDP port and
 drive the real `qsh` binary against it, including a binary round trip and, if
 `rsync` is installed, an actual `rsync -e qsh` transfer.
 
-### Continuous integration
+The multi-host suite in [`e2e/`](e2e/README.md) goes further: Docker
+containers as separate machines, `qsh-server` under the shipped systemd unit,
+a network simulator that loses, delays, reorders and re-addresses traffic,
+and real rsync, tar and terminal sessions. `just e2e` runs it;
+[`e2e/TEST_PLAN.md`](e2e/TEST_PLAN.md) lists what it checks and why.
 
-`.github/workflows/ci.yml` runs rustfmt, pedantic clippy as errors, the tests
-on both stable and the declared MSRV with `--locked`, an end-to-end run with
-rsync installed, a **root** end-to-end run (without it the privilege-drop path
-is never executed, since an unprivileged server never switches account), a
-check that the declared MSRV still matches the lockfile, and `cargo audit
---deny warnings` so an unmaintained dependency fails the build rather than
-waiting to be noticed.
+### Checks before merging
 
-`actionlint` runs over the workflow itself, because a workflow that does not
-parse runs nothing and reports no failure — which is exactly how an earlier
-version of this file sat there doing nothing.
+There is no hosted CI. `just verify` runs everything that must pass before a
+change reaches `main`, with `--locked` throughout:
+
+- `just check`: rustfmt, pedantic clippy with warnings as errors, and the
+  tests (the end-to-end tests need rsync installed).
+- `just msrv`: a check that the declared MSRV still matches the lockfile,
+  and the tests on that version.
+- `just test-root`: the tests that need root. Without root the privilege-drop
+  path is never executed, since an unprivileged server never switches
+  account, and the session cgroup needs a delegated systemd scope.
+- `just audit-deps`: `cargo audit --deny warnings`, so an advisory or an
+  unmaintained dependency stops the merge rather than waiting to be noticed.
+  An advisory is fixed by updating the dependency.
+- `just e2e-plan` and `just e2e`: the test plan agrees with the scenarios,
+  and the multi-host suite passes, slow scenarios included.
 
 ### Lints
 

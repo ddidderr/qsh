@@ -1,0 +1,5 @@
+# Host-side dependencies of the e2e suite. `e2e/run` installs them into
+# target/e2e/venv. Pinned for reproducible runs; update deliberately.
+pytest==9.1.1
+pytest-timeout==2.4.0
+pexpect==4.9.0

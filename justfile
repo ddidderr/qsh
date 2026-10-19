@@ -1,8 +1,10 @@
 # qsh — common development commands.
 #
 #   just            list the recipes
-#   just check      what CI runs: format, lints, tests
+#   just check      the fast checks: format, lints, tests
+#   just verify     everything that must pass before merging to main
 #   just demo       a throwaway server + client in /tmp, ready to poke at
+#   just e2e        the multi-host end-to-end suite (Docker)
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
@@ -32,8 +34,12 @@ clean:
 
 # ---------------------------------------------------------------- quality
 
-# Everything CI checks, in the order that fails fastest.
+# The fast checks, in the order that fails fastest.
 check: fmt-check lint test
+
+# Everything that must pass before a change reaches main (README "Checks
+# before merging"). Needs rustup, cargo-audit, sudo, systemd and Docker.
+verify: check msrv test-root audit-deps e2e-plan e2e
 
 # Format the source.
 fmt:
@@ -45,11 +51,28 @@ fmt-check:
 
 # Pedantic clippy, warnings are errors.
 lint:
-    cargo clippy --all-targets --all-features -- -D warnings
+    cargo clippy --all-targets --all-features --locked -- -D warnings
 
 # Unit tests plus the end-to-end suite.
 test:
-    cargo test --all-features
+    cargo test --all-features --locked
+
+# Check the declared MSRV against Cargo.lock, then test with it (via rustup).
+msrv:
+    python3 ci/check-msrv.py
+    cargo +"$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" test --all-features --locked
+
+# The tests that need root: the privilege drop, and the session cgroup in a
+# delegated systemd scope. Built as you first, so that root only runs them and
+# target/ stays yours.
+test-root:
+    cargo test --locked --no-run --lib --test e2e
+    sudo -E env "PATH=$PATH" cargo test --locked --test e2e
+    sudo -E env "PATH=$PATH" cargo test --locked --lib child::tests::mixed_credentials_cannot_reach_remote_exec
+    sudo -E env "PATH=$PATH" cargo test --locked --lib child::tests::sessions_do_not_inherit_service_capabilities
+    sudo -E env "PATH=$PATH" systemd-run --scope --quiet --collect --same-dir -p Delegate=yes \
+        env QSH_REQUIRE_DELEGATED_CGROUP=1 cargo test --locked --test e2e \
+        cgroup_policy_kills_detached_descendants_or_fails_before_exec -- --exact --nocapture
 
 # Just the fast unit tests.
 test-unit:
@@ -58,6 +81,15 @@ test-unit:
 # Just the end-to-end suite, with output shown.
 test-e2e:
     cargo test --test e2e -- --nocapture
+
+# Multi-host end-to-end suite in Docker; args go to pytest (e2e/README.md).
+[positional-arguments]
+e2e *ARGS:
+    e2e/run test "$@"
+
+# Check e2e/TEST_PLAN.md against the scenarios that implement it.
+e2e-plan:
+    e2e/run plan
 
 # List every justified `unsafe` exception and count the blocks per file.
 audit-unsafe:
@@ -68,15 +100,10 @@ audit-unsafe:
     @echo "unsafe blocks per file:"
     @grep -rc 'unsafe ' --include='*.rs' src | grep -v ':0$' || true
 
-# Check dependencies for advisories, including unmaintained crates — the same
-# policy CI enforces (needs `cargo install cargo-audit`).
+# Check dependencies for advisories, including unmaintained crates (needs
+# `cargo install cargo-audit`). Fix an advisory by updating the dependency.
 audit-deps:
     cargo audit --deny warnings
-
-# Validate the GitHub Actions workflows (needs docker).
-audit-ci:
-    docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
-    python3 ci/check-msrv.py
 
 # Build the API documentation and open it.
 doc:

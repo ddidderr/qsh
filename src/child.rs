@@ -149,6 +149,8 @@ fn needs_identity_switch(user: &User) -> Result<bool> {
 pub(crate) struct PreparedIdentity {
     switch: bool,
     groups: Vec<libc::gid_t>,
+    /// Group for the session's terminal: `tty` where the system has one.
+    terminal_group: Option<Gid>,
 }
 
 /// Resolve the target's supplementary groups before spawning a child.
@@ -167,7 +169,21 @@ pub(crate) fn prepare_identity(user: &User) -> Result<PreparedIdentity> {
     } else {
         Vec::new()
     };
-    Ok(PreparedIdentity { switch, groups })
+    // A failed lookup must not refuse sessions, most of which need no
+    // terminal: like sshd, fall back to the user's own group.
+    let terminal_group = if switch {
+        nix::unistd::Group::from_name("tty")
+            .ok()
+            .flatten()
+            .map(|group| group.gid)
+    } else {
+        None
+    };
+    Ok(PreparedIdentity {
+        switch,
+        groups,
+        terminal_group,
+    })
 }
 
 /// Start the process described by `req` as `user`.
@@ -194,7 +210,11 @@ pub(crate) fn spawn_prepared(
     identity: PreparedIdentity,
     cgroup: Option<&SessionCgroup>,
 ) -> Result<Spawned> {
-    let PreparedIdentity { switch, groups } = identity;
+    let PreparedIdentity {
+        switch,
+        groups,
+        terminal_group,
+    } = identity;
     let cgroup_procs = cgroup.map(SessionCgroup::attach_fd).transpose()?;
 
     let home = home_of(user);
@@ -242,6 +262,9 @@ pub(crate) fn spawn_prepared(
 
     let master = if let Some(p) = &req.pty {
         let (master, slave) = pty::open(p.size)?;
+        if switch {
+            pty::assign(&slave, user.uid, user.gid, terminal_group)?;
+        }
         let slave_in = slave.try_clone().context("duplicating the PTY slave")?;
         let slave_out = slave.try_clone().context("duplicating the PTY slave")?;
         cmd.stdin(Stdio::from(slave_in))
@@ -285,7 +308,7 @@ pub(crate) fn spawn_prepared(
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let _guard = pty::spawn_lock()?;
         cmd.spawn()
-            .with_context(|| describe(req.command.as_ref(), &shell))?
+            .map_err(|error| spawn_error(error, req.command.as_ref(), &shell, &home))?
     };
     let io = if let Some(master) = master {
         ChildIo::Pty(master)
@@ -356,6 +379,58 @@ fn clear_inheritable_capabilities() -> std::io::Result<()> {
 )]
 fn clear_inheritable_capabilities() -> std::io::Result<()> {
     Ok(())
+}
+
+/// exec found no file to run: the program itself, or the interpreter or loader
+/// it names. A shell reports 127 for both.
+#[derive(Debug)]
+pub struct ProgramNotFound {
+    /// The program exists, so what is missing is what it needs to run.
+    exists: bool,
+}
+
+impl std::fmt::Display for ProgramNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The wording bash uses for each case.
+        f.write_str(if self.exists {
+            "cannot execute: required file not found"
+        } else {
+            "command not found"
+        })
+    }
+}
+
+fn spawn_error(
+    error: std::io::Error,
+    command: Option<&Vec<String>>,
+    shell: &Path,
+    home: &Path,
+) -> anyhow::Error {
+    let not_found = error.kind() == std::io::ErrorKind::NotFound;
+    let program = match command.and_then(|argv| argv.first()) {
+        Some(program) => Path::new(program),
+        None => shell,
+    };
+    let error = anyhow::Error::new(error).context(describe(command, shell));
+    if not_found {
+        error.context(ProgramNotFound {
+            exists: program_exists(program, home),
+        })
+    } else {
+        error
+    }
+}
+
+/// Whether `program` exists where exec looks for it: relative to the session's
+/// home when it names a path, otherwise in the fixed `PATH`.
+fn program_exists(program: &Path, home: &Path) -> bool {
+    if program.components().count() > 1 {
+        home.join(program).exists()
+    } else {
+        DEFAULT_PATH
+            .split(':')
+            .any(|dir| Path::new(dir).join(program).exists())
+    }
 }
 
 fn describe(command: Option<&Vec<String>>, shell: &Path) -> String {
@@ -564,6 +639,33 @@ mod tests {
         assert_eq!(o, "out");
         assert_eq!(e, "err");
         assert_eq!(sp.child.wait().await.unwrap().code(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn exec_finding_no_file_is_reported_as_not_found() {
+        let user = current_user().unwrap();
+        let Err(missing) = spawn(&user, &request(&["/nonexistent/qsh-program"], false)) else {
+            panic!("spawning a missing program succeeded");
+        };
+        assert!(missing.is::<ProgramNotFound>(), "{missing:#}");
+        assert!(format!("{missing:#}").contains("command not found"));
+        // Found but not executable: a shell says 126, not 127.
+        let Err(refused) = spawn(&user, &request(&["/etc/hostname"], false)) else {
+            panic!("executing a data file succeeded");
+        };
+        assert!(!refused.is::<ProgramNotFound>(), "{refused:#}");
+        // A script whose interpreter is missing: still 127, as from a shell,
+        // but not described as a missing command.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("orphan.sh");
+        std::fs::write(&script, "#!/nonexistent/interpreter\n").unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let Err(orphan) = spawn(&user, &request(&[script.to_str().unwrap()], false)) else {
+            panic!("a script without an interpreter ran");
+        };
+        assert!(orphan.is::<ProgramNotFound>(), "{orphan:#}");
+        assert!(format!("{orphan:#}").contains("required file not found"));
     }
 
     #[tokio::test]
