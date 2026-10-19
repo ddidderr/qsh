@@ -189,6 +189,20 @@ impl Fixture {
     /// `idle_timeout_secs` overrides how quickly the server gives up on a
     /// silent peer, which is what bounds cleanup after a client is killed.
     fn start_with(extra_authorize: &[&str], idle_timeout_secs: Option<u64>) -> Self {
+        Self::start_full(extra_authorize, idle_timeout_secs, &[])
+    }
+
+    /// The same, with extra environment for the server process. A test that
+    /// wants a known number of Tokio workers sets `TOKIO_WORKER_THREADS`.
+    fn start_with_env(extra_authorize: &[&str], env: &[(&str, &str)]) -> Self {
+        Self::start_full(extra_authorize, None, env)
+    }
+
+    fn start_full(
+        extra_authorize: &[&str],
+        idle_timeout_secs: Option<u64>,
+        env: &[(&str, &str)],
+    ) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let server_dir = tmp.path().join("server");
         let client_dir = tmp.path().join("client");
@@ -229,14 +243,18 @@ impl Fixture {
         // Let the kernel choose the port and learn it from the server's own
         // log line; picking a port up front would race with parallel tests.
         let log = tmp.path().join("server.log");
-        let server = Command::new(SERVER_BIN)
-            .args([
-                "--dir",
-                server_dir.to_str().unwrap(),
-                "serve",
-                "--listen",
-                "127.0.0.1:0",
-            ])
+        let mut command = Command::new(SERVER_BIN);
+        command.args([
+            "--dir",
+            server_dir.to_str().unwrap(),
+            "serve",
+            "--listen",
+            "127.0.0.1:0",
+        ]);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let server = command
             .stdout(Stdio::null())
             .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
             .spawn()

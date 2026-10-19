@@ -810,32 +810,43 @@ async fn handle_session(
 
         // Recheck after slow preparation. A changed user or cleanup policy
         // needs fresh preparation; a withdrawn or narrowed grant cannot spawn.
-        let current = crate::sync::read(&store);
-        let entry = current
-            .lookup(&fingerprint)
-            .ok_or_else(|| anyhow!("client authorization was withdrawn"))?;
-        authorize_request(entry, &req, unix_now())?;
-        if entry.meta.user != authorized_user {
-            bail!("client authorization changed its target user");
+        {
+            let current = crate::sync::read(&store);
+            let entry = current
+                .lookup(&fingerprint)
+                .ok_or_else(|| anyhow!("client authorization was withdrawn"))?;
+            authorize_request(entry, &req, unix_now())?;
+            if entry.meta.user != authorized_user {
+                bail!("client authorization changed its target user");
+            }
+            if entry.meta.kill_session_processes != restricted {
+                bail!("client authorization changed its session cleanup policy");
+            }
         }
-        if entry.meta.kill_session_processes != restricted {
-            bail!("client authorization changed its session cleanup policy");
-        }
-        drop(current);
 
         if conn.close_reason().is_some() {
             bail!("connection closed before starting the remote process");
         }
 
+        // fork/exec blocks the calling thread until the child has exec'd,
+        // and how long that takes is the client's choice: it names the
+        // program, which can sit on a filesystem it controls and never
+        // answer. On a Tokio worker, enough such sessions stall the whole
+        // server, so the spawn runs on the blocking pool.
+        //
         // The periodic session check handles a policy change racing this
         // final check. Do not hold the shared store lock over fork/exec.
-        Ok::<_, anyhow::Error>((
-            child::spawn_prepared(&user, &req, identity, cgroup.as_ref())?,
-            cgroup,
-            authorized_user,
-            grant,
-            restricted,
-        ))
+        let spawning = tokio::task::spawn_blocking(move || {
+            let spawned = child::spawn_prepared(&user, &req, identity, cgroup.as_ref());
+            (spawned, cgroup)
+        });
+        // Awaited unconditionally, never raced against the connection
+        // closing: a child this task has already spawned must come back to
+        // an owner that kills and reaps it.
+        let (spawned, cgroup) = spawning
+            .await
+            .context("spawning the remote process")?;
+        Ok::<_, anyhow::Error>((spawned?, cgroup, authorized_user, grant, restricted))
     }
     .await;
 
@@ -848,11 +859,6 @@ async fn handle_session(
             return Err(e);
         }
     };
-
-    // Child spawn has consumed the request; keep only the command identity
-    // needed to detect a later policy change, not its potentially large argv,
-    // environment and terminal metadata for the lifetime of the process.
-    drop(req);
 
     let authorization = LiveAuthorization {
         store,

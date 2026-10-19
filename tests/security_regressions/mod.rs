@@ -1,6 +1,7 @@
 //! Cross-component regressions for request and session admission boundaries.
 
 use super::*;
+use std::os::fd::AsRawFd;
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
@@ -181,4 +182,195 @@ fn local_escape_restores_the_terminal_without_waiting_for_the_remote_job() {
         );
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// A mounted filesystem that never answers a single request. Every lookup
+/// under it blocks in the kernel until the connection is aborted, which is
+/// what an authorized client can arrange for a program of its own (FUSE
+/// mounts are unprivileged on Linux, and a stalled network filesystem does
+/// the same).
+struct HangingMount {
+    dir: PathBuf,
+    /// Kept open for the lifetime of the mount; closing it alone would not
+    /// release the pending requests.
+    _fuse: std::fs::File,
+    /// Set when this test mounted `fusectl` itself, and so has to take it
+    /// away again.
+    mounted_fusectl: bool,
+}
+
+impl HangingMount {
+    /// `None` where this machine cannot mount one: not root, or no FUSE.
+    #[allow(
+        unsafe_code,
+        reason = "mount(2) has no safe wrapper in the enabled nix features"
+    )]
+    fn new(dir: PathBuf) -> Option<Self> {
+        if !nix::unistd::Uid::effective().is_root() {
+            eprintln!("skipping: not running as root, cannot mount a filesystem");
+            return None;
+        }
+        let fuse = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/fuse")
+            .map_err(|error| eprintln!("skipping: cannot open /dev/fuse: {error}"))
+            .ok()?;
+        // `fusectl` is how a stuck request is observed and released. It is
+        // not mounted everywhere; mount it, and take it away again at the
+        // end if it was this test that put it there.
+        let mounted_fusectl = !fusectl_mounted() && mount_fusectl();
+        if !fusectl_mounted() {
+            eprintln!("skipping: {FUSE_CONNECTIONS} is not available");
+            return None;
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
+        let options = std::ffi::CString::new(format!(
+            "fd={},rootmode=40755,user_id=0,group_id=0",
+            fuse.as_raw_fd()
+        ))
+        .unwrap();
+        let source = std::ffi::CString::new("qsh-hangfs").unwrap();
+        let fstype = std::ffi::CString::new("fuse").unwrap();
+        // SAFETY: four NUL-terminated strings and no flags; the descriptor in
+        // `options` stays open for as long as the mount does.
+        let mounted = unsafe {
+            libc::mount(
+                source.as_ptr(),
+                target.as_ptr(),
+                fstype.as_ptr(),
+                0,
+                options.as_ptr().cast(),
+            )
+        };
+        if mounted != 0 {
+            eprintln!(
+                "skipping: cannot mount a FUSE filesystem: {}",
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+        Some(Self {
+            dir,
+            _fuse: fuse,
+            mounted_fusectl,
+        })
+    }
+
+    /// A path under the mount. Executing it blocks in `execve` forever.
+    fn program(&self) -> PathBuf {
+        self.dir.join("program")
+    }
+
+    /// The kernel's connection directory, found through `mountinfo` because
+    /// stat'ing the mount point would itself block.
+    fn connection(&self) -> Option<PathBuf> {
+        let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+        let point = self.dir.to_str()?;
+        for line in mounts.lines() {
+            let mut fields = line.split_whitespace();
+            let device = fields.nth(2)?;
+            if fields.nth(1) == Some(point) {
+                let minor = device.split(':').nth(1)?;
+                return Some(PathBuf::from(FUSE_CONNECTIONS).join(minor));
+            }
+        }
+        None
+    }
+
+    /// How many requests the kernel is holding for a filesystem that never
+    /// answers: the test's proof that a session really is stuck in `execve`.
+    fn waiting(&self) -> u64 {
+        self.connection()
+            .and_then(|dir| std::fs::read_to_string(dir.join("waiting")).ok())
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn wait_for_a_stuck_request(&self, stage: &str) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while self.waiting() == 0 {
+            assert!(Instant::now() < deadline, "no request ever stuck: {stage}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for HangingMount {
+    #[allow(unsafe_code, reason = "umount2(2) has no safe wrapper here")]
+    fn drop(&mut self) {
+        // Abort first: a pending request outlives the unmount otherwise, and
+        // with it the server's stuck spawn.
+        if let Some(connection) = self.connection() {
+            let _ = std::fs::write(connection.join("abort"), "1");
+        }
+        let target = std::ffi::CString::new(self.dir.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path; a lazy unmount cannot block.
+        unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+        if self.mounted_fusectl {
+            let target = std::ffi::CString::new(FUSE_CONNECTIONS).unwrap();
+            // SAFETY: as above.
+            unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+        }
+    }
+}
+
+const FUSE_CONNECTIONS: &str = "/sys/fs/fuse/connections";
+
+fn fusectl_mounted() -> bool {
+    std::fs::read_to_string("/proc/self/mountinfo").is_ok_and(|mounts| {
+        mounts
+            .lines()
+            .any(|line| line.split_whitespace().nth(4) == Some(FUSE_CONNECTIONS))
+    })
+}
+
+#[allow(unsafe_code, reason = "mount(2) has no safe wrapper here")]
+fn mount_fusectl() -> bool {
+    let source = std::ffi::CString::new("fusectl").unwrap();
+    let target = std::ffi::CString::new(FUSE_CONNECTIONS).unwrap();
+    let fstype = std::ffi::CString::new("fusectl").unwrap();
+    // SAFETY: three NUL-terminated strings, no flags and no options.
+    let mounted = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    mounted == 0
+}
+
+/// An authorized client names the program it wants to run, so it chooses how
+/// long `execve` takes. Running the spawn on a Tokio worker let one client
+/// stall every other session on the server (threat model, actor 3: "It cannot
+/// crash the server or block its async workers").
+#[test]
+fn a_session_stuck_in_exec_does_not_stall_the_server() {
+    let tmp = tempfile::tempdir().unwrap();
+    // One worker, so a single stuck spawn is the whole runtime.
+    let fixture = Fixture::start_with_env(&[], &[("TOKIO_WORKER_THREADS", "1")]);
+    let Some(mount) = HangingMount::new(tmp.path().join("hang")) else {
+        return;
+    };
+
+    let mut stuck = fixture
+        .client()
+        .arg(mount.program())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("starting the client whose program hangs");
+    mount.wait_for_a_stuck_request("the session that runs a program on a hanging filesystem");
+
+    let (code, out, err) = fixture.exec(&["/bin/echo", "alive"]);
+    assert_eq!(code, 0, "an ordinary session was refused: {err}");
+    assert_eq!(out.trim_end(), "alive", "{err}");
+
+    let _ = stuck.kill();
+    let _ = stuck.wait();
 }
