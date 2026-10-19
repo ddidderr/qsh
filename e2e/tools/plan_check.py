@@ -8,8 +8,7 @@ Every scenario in the plan is a `### ID — title` heading followed by a
 - a status is not one the plan's Conventions define,
 - a test names an ID the plan does not have,
 - a scenario is marked `automated` but no test names it,
-- a test names a scenario that is not marked `automated` (a `deferred`
-  one keeps its plan entry, not its tests).
+- a test names a scenario that is not marked `automated`.
 
 It reads the files as text and needs nothing beyond the standard library,
 so it runs without the test environment (`e2e/run plan`).
@@ -32,7 +31,7 @@ MARK = re.compile(r"@pytest\.mark\.plan\(([^)]*)\)")
 TEST = re.compile(r"^\s*def (test_\w+)")
 
 # The statuses TEST_PLAN.md's Conventions define.
-STATUSES = {"automated", "planned", "manual", "blocked", "deferred"}
+STATUSES = {"automated", "planned", "manual", "blocked"}
 
 
 def plan_entries() -> dict[str, str]:
