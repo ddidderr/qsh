@@ -194,12 +194,11 @@ struct HangingMount {
     /// Kept open for the lifetime of the mount; closing it alone would not
     /// release the pending requests.
     _fuse: std::fs::File,
-    /// Set when this test mounted `fusectl` itself, and so has to take it
-    /// away again.
-    mounted_fusectl: bool,
     /// Requests already waiting before anything touched the mount: the
     /// kernel counts its own INIT request, which nobody answers either.
     baseline: u64,
+    /// Last, so it is released only once the mount is gone.
+    _fusectl: Fusectl,
 }
 
 impl HangingMount {
@@ -219,15 +218,14 @@ impl HangingMount {
             .open("/dev/fuse")
             .map_err(|error| eprintln!("skipping: cannot open /dev/fuse: {error}"))
             .ok()?;
-        // `fusectl` is how a stuck request is observed and released. It is
-        // not mounted everywhere; mount it, and take it away again at the
-        // end if it was this test that put it there.
-        let mounted_fusectl = !fusectl_mounted() && mount_fusectl();
-        if !fusectl_mounted() {
+        // `fusectl` is how a stuck request is observed and released.
+        let fusectl = Fusectl::acquire().or_else(|| {
             eprintln!("skipping: {FUSE_CONNECTIONS} is not available");
-            return None;
-        }
-        std::fs::create_dir_all(&dir).unwrap();
+            None
+        })?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|error| eprintln!("skipping: cannot create {}: {error}", dir.display()))
+            .ok()?;
         let target = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
         let options = std::ffi::CString::new(format!(
             "fd={},rootmode=40755,user_id=0,group_id=0",
@@ -257,8 +255,8 @@ impl HangingMount {
         let mut mount = Self {
             dir,
             _fuse: fuse,
-            mounted_fusectl,
             baseline: 0,
+            _fusectl: fusectl,
         };
         mount.baseline = mount.waiting();
         Some(mount)
@@ -314,15 +312,63 @@ impl Drop for HangingMount {
         let target = std::ffi::CString::new(self.dir.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: a NUL-terminated path; a lazy unmount cannot block.
         unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
-        if self.mounted_fusectl {
+    }
+}
+
+const FUSE_CONNECTIONS: &str = "/sys/fs/fuse/connections";
+
+/// Every `HangingMount` shares the host's `fusectl` mount. One at a time, so
+/// the test that mounted it cannot take it away while another still reads it.
+static FUSECTL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The lock over `fusectl`, and the mount itself if this test made it.
+/// Unmounted again on every way out; a host's own mount is left alone.
+struct Fusectl {
+    mounted: bool,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Fusectl {
+    fn acquire() -> Option<Self> {
+        // A failed FUSE test must not fail every later one.
+        let lock = FUSECTL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fusectl = Self {
+            mounted: !fusectl_mounted() && mount_fusectl(),
+            _lock: lock,
+        };
+        fusectl_mounted().then_some(fusectl)
+    }
+}
+
+impl Drop for Fusectl {
+    #[allow(unsafe_code, reason = "umount2(2) has no safe wrapper here")]
+    fn drop(&mut self) {
+        if self.mounted {
             let target = std::ffi::CString::new(FUSE_CONNECTIONS).unwrap();
-            // SAFETY: as above.
+            // SAFETY: a NUL-terminated path; a lazy unmount cannot block.
             unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
         }
     }
 }
 
-const FUSE_CONNECTIONS: &str = "/sys/fs/fuse/connections";
+/// Setting up a `HangingMount` can fail after `fusectl` was mounted for it.
+#[test]
+fn a_failed_hanging_mount_leaves_fusectl_as_it_found_it() {
+    let Some(first) = Fusectl::acquire() else {
+        return;
+    };
+    let ours = first.mounted;
+    drop(first);
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("file"), "").unwrap();
+    assert!(HangingMount::new(tmp.path().join("file/hang")).is_none());
+
+    let after = Fusectl::acquire().expect("fusectl could not be mounted again");
+    assert_eq!(after.mounted, ours, "a failed setup left fusectl changed");
+}
 
 fn fusectl_mounted() -> bool {
     std::fs::read_to_string("/proc/self/mountinfo").is_ok_and(|mounts| {
@@ -430,6 +476,86 @@ fn a_session_stuck_in_exec_does_not_hold_other_sessions_open() {
         Some(0),
         "closing its input did not end the session while another was stuck in exec"
     );
+
+    let _ = stuck.kill();
+    let _ = stuck.wait();
+}
+
+/// A child stuck in `execve` belongs to its session: when the client goes
+/// away, the child must die before it can run anything (threat model, actor
+/// 3: session cleanup on disconnect).
+#[test]
+fn a_session_stuck_in_exec_ends_with_its_connection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = Fixture::start(&[]);
+    let Some(mount) = HangingMount::new(tmp.path().join("hang")) else {
+        return;
+    };
+
+    runtime().block_on(async {
+        let conn = raw_connect(&fixture.client_dir, fixture.port).await;
+        let _streams = raw_request(&conn, &[mount.program().to_str().unwrap()], false)
+            .await
+            .expect("sending the request whose program hangs");
+        mount.wait_for_a_stuck_request("the session that runs a program on a hanging filesystem");
+        conn.close(0u32.into(), b"disconnect while exec is pending");
+
+        // A killed waiter withdraws its unanswered request, so the count
+        // drops while the filesystem still hangs: the child died before it
+        // could run.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while mount.waiting() > mount.baseline {
+            assert!(
+                Instant::now() < deadline,
+                "a child stuck in exec outlived its connection"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    let (code, _, err) = fixture.exec(&["/bin/echo", "alive"]);
+    assert_eq!(code, 0, "an ordinary session was refused: {err}");
+}
+
+/// A graceful stop drops every session, including one whose child is still
+/// in `execve`; that child must not be left to run once the filesystem
+/// answers.
+#[test]
+fn a_session_stuck_in_exec_dies_with_the_server() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = Fixture::start(&[]);
+    let Some(mount) = HangingMount::new(tmp.path().join("hang")) else {
+        return;
+    };
+
+    let mut stuck = fixture
+        .client()
+        .arg(mount.program())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("starting the client whose program hangs");
+    mount.wait_for_a_stuck_request("the session that runs a program on a hanging filesystem");
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(fixture.server.id()).unwrap()),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fixture.server.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the server did not stop");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while mount.waiting() > mount.baseline {
+        assert!(
+            Instant::now() < deadline,
+            "a child stuck in exec outlived the server"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     let _ = stuck.kill();
     let _ = stuck.wait();

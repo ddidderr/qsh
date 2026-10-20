@@ -156,6 +156,9 @@ pub(crate) struct PreparedIdentity {
     groups: Vec<libc::gid_t>,
     /// Group for the session's terminal: `tty` where the system has one.
     terminal_group: Option<Gid>,
+    /// Checked here because the account's home can sit on a slow filesystem,
+    /// and the fork runs on an async worker.
+    home: PathBuf,
 }
 
 /// Resolve the target's supplementary groups before spawning a child.
@@ -188,6 +191,7 @@ pub(crate) fn prepare_identity(user: &User) -> Result<PreparedIdentity> {
         switch,
         groups,
         terminal_group,
+        home: home_of(user),
     })
 }
 
@@ -200,29 +204,35 @@ pub(crate) fn prepare_identity(user: &User) -> Result<PreparedIdentity> {
 /// Fails if the target user cannot be assumed, a PTY cannot be allocated, or
 /// the program cannot be executed.
 pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
-    spawn_prepared(user, req, prepare_identity(user)?, None)
+    let (spawned, exec) = spawn_prepared(user, req, prepare_identity(user)?, None)?;
+    exec.wait()?;
+    Ok(spawned)
 }
 
 /// Spawn using identity data that was resolved before the final authorization
 /// check. The caller must not use this for another account.
 ///
+/// Returns once the child leads its own process group and has closed every
+/// descriptor it inherited, before it can block; whether exec succeeds is
+/// left to [`PendingExec::wait`].
+///
 /// # Errors
-/// Fails if a PTY cannot be allocated or the program cannot be executed.
+/// Fails if a PTY cannot be allocated or the child cannot be forked.
 #[allow(unsafe_code, reason = "pre_exec runs between fork and exec")]
 pub(crate) fn spawn_prepared(
     user: &User,
     req: &Request,
     identity: PreparedIdentity,
     cgroup: Option<&SessionCgroup>,
-) -> Result<Spawned> {
+) -> Result<(Spawned, PendingExec)> {
     let PreparedIdentity {
         switch,
         groups,
         terminal_group,
+        home,
     } = identity;
     let cgroup_procs = cgroup.map(SessionCgroup::attach_fd).transpose()?;
 
-    let home = home_of(user);
     let shell = shell_of(user);
 
     let (mut cmd, arg0) =
@@ -288,7 +298,7 @@ pub(crate) fn spawn_prepared(
     // once exec succeeds, and the client decides how long exec takes: its
     // program can sit on a filesystem that never answers. A child stuck there
     // would keep those sessions from ever seeing EOF. So the hook closes
-    // everything first, then execs by itself and reports a failure through
+    // everything before it can block, then execs by itself and reports a failure through
     // this pipe; std's own report channel is among what gets closed, and std
     // takes that as success, so the outcome is read from here instead.
     let (status_read, status_write) = exec_status_pipe()?;
@@ -307,17 +317,14 @@ pub(crate) fn spawn_prepared(
     unsafe {
         cmd.as_std_mut().pre_exec(move || exec.run());
     }
+    let program = req.command.as_ref().and_then(|argv| argv.first()).cloned();
     let mut child = {
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let _guard = pty::spawn_lock()?;
         cmd.spawn()
-            .map_err(|error| spawn_error(error, req.command.as_ref(), &shell, &home))?
+            .map_err(|error| spawn_error(error, program.as_deref(), &shell, &home))?
     };
     drop(status_write);
-    if let Some(error) = read_exec_status(status_read)? {
-        // The child has exited; tokio reaps it once `child` is dropped.
-        return Err(spawn_error(error, req.command.as_ref(), &shell, &home));
-    }
     let io = if let Some(master) = master {
         ChildIo::Pty(master)
     } else {
@@ -328,7 +335,43 @@ pub(crate) fn spawn_prepared(
             stderr: child.stderr.take().ok_or_else(missing)?,
         }
     };
-    Ok(Spawned { child, io })
+    let exec = PendingExec {
+        status: status_read,
+        program,
+        shell,
+        home,
+    };
+    Ok((Spawned { child, io }, exec))
+}
+
+/// A child that has not exec'd yet. Holds only the status pipe and what an
+/// error message needs, never the child.
+#[must_use]
+pub(crate) struct PendingExec {
+    status: OwnedFd,
+    program: Option<String>,
+    shell: PathBuf,
+    home: PathBuf,
+}
+
+impl PendingExec {
+    /// Wait until the child has exec'd. Blocks for as long as exec does,
+    /// which the client's filesystem decides.
+    ///
+    /// # Errors
+    /// Fails if the program cannot be executed.
+    pub(crate) fn wait(self) -> Result<()> {
+        match read_exec_status(self.status)? {
+            None => Ok(()),
+            // The child has exited; tokio reaps it once its handle is dropped.
+            Some(error) => Err(spawn_error(
+                error,
+                self.program.as_deref(),
+                &self.shell,
+                &self.home,
+            )),
+        }
+    }
 }
 
 /// The pipe through which the pre-exec hook reports a failed exec. The write
@@ -349,9 +392,10 @@ fn exec_status_pipe() -> Result<(OwnedFd, OwnedFd)> {
     Ok((read, write))
 }
 
-/// Wait until the child has exec'd, and return the error if it could not.
-/// A child that is still trying holds nothing but its own session's
-/// descriptors, so this may block as long as exec does.
+/// Read the exec outcome for `PendingExec::wait`: `None` once the child has
+/// exec'd, or the error if it could not. A child that is still trying holds
+/// nothing but its own session's descriptors, so this may block as long as
+/// exec does.
 fn read_exec_status(status: OwnedFd) -> Result<Option<std::io::Error>> {
     let mut report = Vec::with_capacity(4);
     File::from(status)
@@ -395,8 +439,6 @@ impl ChildExec {
 
     #[allow(unsafe_code, reason = "runs between fork and exec")]
     fn try_run(&self) -> std::io::Result<Infallible> {
-        // First, before anything that can block.
-        close_descriptors_except([self.status, self.cgroup_procs.unwrap_or(self.status)])?;
         clear_inheritable_capabilities()?;
         // SAFETY: async-signal-safe syscalls on prepared, NUL-terminated data.
         unsafe {
@@ -415,6 +457,11 @@ impl ChildExec {
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            // Close only after the process group and cgroup are set up: std's
+            // spawn returns once its report channel closes, so from then on
+            // the server's group and cgroup signals reach this process.
+            // Nothing before the close can block.
+            close_descriptors_except([self.status, self.cgroup_procs.unwrap_or(self.status)])?;
             // stdin is the PTY slave; make it our controlling terminal.
             if self.controlling_terminal && libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
@@ -639,16 +686,14 @@ impl std::fmt::Display for ProgramNotFound {
 
 fn spawn_error(
     error: std::io::Error,
-    command: Option<&Vec<String>>,
+    program: Option<&str>,
     shell: &Path,
     home: &Path,
 ) -> anyhow::Error {
     let not_found = error.kind() == std::io::ErrorKind::NotFound;
-    let program = match command.and_then(|argv| argv.first()) {
-        Some(program) => Path::new(program),
-        None => shell,
-    };
-    let error = anyhow::Error::new(error).context(describe(command, shell));
+    let described = describe(program, shell);
+    let program = program.map_or(shell, Path::new);
+    let error = anyhow::Error::new(error).context(described);
     if not_found {
         error.context(ProgramNotFound {
             exists: program_exists(program, home),
@@ -670,8 +715,8 @@ fn program_exists(program: &Path, home: &Path) -> bool {
     }
 }
 
-fn describe(command: Option<&Vec<String>>, shell: &Path) -> String {
-    match command.and_then(|argv| argv.first()) {
+fn describe(program: Option<&str>, shell: &Path) -> String {
+    match program {
         Some(program) => format!("executing `{program}`"),
         None => format!("starting login shell `{}`", shell.display()),
     }
@@ -1012,6 +1057,50 @@ mod tests {
             "{out}"
         );
         let _ = sp.child.wait().await;
+    }
+
+    /// The server arms its group guard as soon as the spawn returns, so by then
+    /// the child must already lead its own group.
+    #[allow(unsafe_code, reason = "sched_setaffinity(2) has no safe wrapper here")]
+    #[tokio::test]
+    async fn the_child_leads_its_group_as_soon_as_spawn_returns() {
+        // On one CPU, the parent runs as soon as spawn can return, before the
+        // child gets further. Without this, closing too early slips through
+        // most runs. The harness gives each test its own thread.
+        // SAFETY: a zeroed set is valid, and it outlives the call.
+        unsafe {
+            let mut cpus: libc::cpu_set_t = std::mem::zeroed();
+            assert_eq!(
+                libc::sched_getaffinity(0, size_of_val(&cpus), &raw mut cpus),
+                0
+            );
+            let first = (0..libc::CPU_SETSIZE as usize)
+                .find(|&cpu| libc::CPU_ISSET(cpu, &cpus))
+                .unwrap();
+            libc::CPU_ZERO(&mut cpus);
+            libc::CPU_SET(first, &mut cpus);
+            assert_eq!(
+                libc::sched_setaffinity(0, size_of_val(&cpus), &raw const cpus),
+                0
+            );
+        }
+        let user = current_user().unwrap();
+        for _ in 0..50 {
+            let (mut spawned, _exec) = spawn_prepared(
+                &user,
+                &request(&["sleep", "30"], false),
+                prepare_identity(&user).unwrap(),
+                None,
+            )
+            .unwrap();
+            let pid = spawned.child.id().unwrap();
+            let leader = Pid::from_raw(i32::try_from(pid).unwrap());
+            let group = nix::unistd::getpgid(Some(leader));
+            signal_process_group(pid, libc::SIGKILL);
+            let _ = spawned.child.start_kill();
+            let _ = spawned.child.wait().await;
+            assert_eq!(group, Ok(leader));
+        }
     }
 
     #[tokio::test]

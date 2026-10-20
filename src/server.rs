@@ -828,29 +828,37 @@ async fn handle_session(
             bail!("connection closed before starting the remote process");
         }
 
-        // fork/exec blocks the calling thread until the child has exec'd,
-        // and how long that takes is the client's choice: it names the
-        // program, which can sit on a filesystem it controls and never
-        // answer. On a Tokio worker, enough such sessions stall the whole
-        // server, so the spawn runs on the blocking pool.
-        //
         // The periodic session check handles a policy change racing this
-        // final check. Do not hold the shared store lock over fork/exec.
-        let spawning = tokio::task::spawn_blocking(move || {
-            let spawned = child::spawn_prepared(&user, &req, identity, cgroup.as_ref());
-            (spawned, cgroup)
+        // final check, from the moment exec completes. Do not hold the
+        // shared store lock over fork/exec.
+        //
+        // std's spawn returns once the child has closed its inherited
+        // descriptors, before anything in it can block, so the fork runs
+        // here. `guard` is declared after `spawned`, so it drops first and
+        // signals while the leader is still unreaped.
+        let (mut spawned, mut guard, exec) = spawn_guarded(&user, &req, identity, cgroup)?;
+        // exec takes as long as the client's filesystem wants. Only the
+        // status pipe waits for it, and the retained lease keeps a child
+        // stuck there counted until it dies.
+        let exec_lease = lease.retain();
+        let execing = tokio::task::spawn_blocking(move || {
+            let _lease = exec_lease;
+            exec.wait()
         });
-        // Awaited unconditionally, never raced against the connection
-        // closing: a child this task has already spawned must come back to
-        // an owner that kills and reaps it.
-        let (spawned, cgroup) = spawning
-            .await
-            .context("spawning the remote process")?;
-        Ok::<_, anyhow::Error>((spawned?, cgroup, authorized_user, grant, restricted))
+        tokio::select! {
+            _ = conn.closed() => {
+                // A disconnect like any other: the cgroup leaf goes only
+                // once the child has died.
+                abandon(&mut guard, &mut spawned.child, Vec::new()).await?;
+                bail!("connection closed while starting the remote process");
+            }
+            execed = execing => execed.context("starting the remote process")??,
+        }
+        Ok::<_, anyhow::Error>((spawned, guard, authorized_user, grant, restricted))
     }
     .await;
 
-    let (spawned, cgroup, authorized_user, grant, restricted) = match start {
+    let (spawned, guard, authorized_user, grant, restricted) = match start {
         Ok(s) => s,
         Err(e) => {
             // Report the refusal in-band so the client can print it, then end
@@ -867,18 +875,22 @@ async fn handle_session(
         authorized_user,
         restricted,
     };
-    let result = run_session(
-        send,
-        recv,
-        conn,
-        authorization,
-        spawned,
-        cgroup,
-        diagnostics,
-    )
-    .await;
+    let result = run_session(send, recv, conn, authorization, spawned, guard, diagnostics).await;
     drop(lease);
     result
+}
+
+/// Fork the child with its cleanup already owned: dropping what this returns,
+/// at any point before the session takes it, kills the job.
+fn spawn_guarded(
+    user: &nix::unistd::User,
+    req: &Request,
+    identity: child::PreparedIdentity,
+    cgroup: Option<SessionCgroup>,
+) -> Result<(Spawned, ProcessGroupGuard, child::PendingExec)> {
+    let (spawned, exec) = child::spawn_prepared(user, req, identity, cgroup.as_ref())?;
+    let guard = ProcessGroupGuard::with_cgroup(spawned.child.id(), cgroup);
+    Ok((spawned, guard, exec))
 }
 
 /// A shell's status for a session that could not start: 127 when the program
@@ -1169,13 +1181,14 @@ async fn run_session(
     conn: quinn::Connection,
     authorization: LiveAuthorization,
     spawned: Spawned,
-    cgroup: Option<SessionCgroup>,
+    guard: ProcessGroupGuard,
     diagnostics: &Diagnostics,
 ) -> Result<()> {
     let Spawned { mut child, io } = spawned;
     let pid = child.id();
-    // Armed before anything that can fail, so no error path can leak the job.
-    let mut guard = ProcessGroupGuard::with_cgroup(pid, cgroup);
+    // Rebound after `child` so it drops first: the group signal must land
+    // while the leader is still unreaped.
+    let mut guard = guard;
 
     let (tx, mut rx) = mpsc::channel::<Frame>(OUTPUT_QUEUE_FRAMES);
 
@@ -2405,6 +2418,35 @@ mod tests {
             .unwrap();
         let _ = child.wait().await;
         assert!(!child::process_group_alive(pid));
+    }
+
+    #[tokio::test]
+    async fn a_start_cancelled_before_the_session_takes_it_kills_the_child() {
+        let (started, pid) = tokio::sync::oneshot::channel();
+        // Cancelled while it still holds the spawn, as a daemon shutdown
+        // cancels a session whose exec is pending.
+        let task = tokio::spawn(async move {
+            let user = child::current_user().unwrap();
+            let identity = child::prepare_identity(&user).unwrap();
+            let req = request(Some(&["sleep", "30"]));
+            let (spawned, _guard, _exec) = spawn_guarded(&user, &req, identity, None).unwrap();
+            started.send(spawned.child.id().unwrap()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let pid = pid.await.unwrap();
+        assert!(child::process_group_alive(pid));
+        task.abort();
+        let _ = task.await;
+
+        // Tokio's orphan queue reaps the killed leader.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while child::process_group_alive(pid) {
+            if tokio::time::Instant::now() >= deadline {
+                child::signal_process_group(pid, libc::SIGKILL);
+                panic!("a cancelled session start left its child running");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     #[tokio::test]
