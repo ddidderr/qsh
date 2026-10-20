@@ -197,6 +197,9 @@ struct HangingMount {
     /// Set when this test mounted `fusectl` itself, and so has to take it
     /// away again.
     mounted_fusectl: bool,
+    /// Requests already waiting before anything touched the mount: the
+    /// kernel counts its own INIT request, which nobody answers either.
+    baseline: u64,
 }
 
 impl HangingMount {
@@ -251,11 +254,14 @@ impl HangingMount {
             );
             return None;
         }
-        Some(Self {
+        let mut mount = Self {
             dir,
             _fuse: fuse,
             mounted_fusectl,
-        })
+            baseline: 0,
+        };
+        mount.baseline = mount.waiting();
+        Some(mount)
     }
 
     /// A path under the mount. Executing it blocks in `execve` forever.
@@ -290,7 +296,7 @@ impl HangingMount {
 
     fn wait_for_a_stuck_request(&self, stage: &str) {
         let deadline = Instant::now() + Duration::from_secs(20);
-        while self.waiting() == 0 {
+        while self.waiting() <= self.baseline {
             assert!(Instant::now() < deadline, "no request ever stuck: {stage}");
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -370,6 +376,60 @@ fn a_session_stuck_in_exec_does_not_stall_the_server() {
     let (code, out, err) = fixture.exec(&["/bin/echo", "alive"]);
     assert_eq!(code, 0, "an ordinary session was refused: {err}");
     assert_eq!(out.trim_end(), "alive", "{err}");
+
+    let _ = stuck.kill();
+    let _ = stuck.wait();
+}
+
+/// A forked child holds a copy of every descriptor the server has open until
+/// it execs. One stuck in `execve` used to keep other sessions' pipes open
+/// with it, so those sessions never saw end of file and never ended (threat
+/// model, actor 3: "It cannot degrade other keys beyond the per-key limits").
+#[test]
+fn a_session_stuck_in_exec_does_not_hold_other_sessions_open() {
+    use std::io::{BufRead, Write};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = Fixture::start(&[]);
+    let Some(mount) = HangingMount::new(tmp.path().join("hang")) else {
+        return;
+    };
+
+    // A session that ends when its input does. Once it has echoed a line, the
+    // server holds the write end of its stdin.
+    let mut open = fixture
+        .client()
+        .arg("cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("starting the client that runs cat");
+    let mut input = open.stdin.take().unwrap();
+    let mut output = std::io::BufReader::new(open.stdout.take().unwrap());
+    writeln!(input, "ready").unwrap();
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    assert_eq!(line, "ready\n");
+
+    // Forked while that descriptor is open, so it starts with a copy of it.
+    let mut stuck = fixture
+        .client()
+        .arg(mount.program())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("starting the client whose program hangs");
+    mount.wait_for_a_stuck_request("the session that runs a program on a hanging filesystem");
+
+    drop(input);
+    let status = wait_with_deadline_status(&mut open, Duration::from_secs(20));
+    assert_eq!(
+        status,
+        Some(0),
+        "closing its input did not end the session while another was stuck in exec"
+    );
 
     let _ = stuck.kill();
     let _ = stuck.wait();
