@@ -53,9 +53,8 @@ indirection rather than rustls directly.
 cargo install --path . --locked # installs qsh and qsh-server
 ```
 
-Requires a Unix-like system (Linux is what it is tested on) and Rust 1.88+,
-which is what the pinned dependency graph in `Cargo.lock` needs. `just msrv`
-builds and tests with that version.
+Requires Linux and Rust 1.88+, which is what the pinned dependency graph in
+`Cargo.lock` needs. `just msrv` builds and tests with that version.
 
 ## Setup
 

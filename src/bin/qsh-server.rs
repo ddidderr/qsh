@@ -187,10 +187,11 @@ fn serve(paths: &ServerPaths, args: Serve) -> Result<()> {
         args.listen,
         shutdown_signal(),
     ));
-    // Dropping the runtime would wait for every blocking task, and a session
-    // preparation stuck in an account lookup waits out the directory's
-    // timeouts. It holds no lock and has started no child. The bound still
-    // gives the workers time to drop every session, which kills its job.
+    // Dropping the runtime would wait for every blocking task, and an account
+    // lookup or an exec-status wait can outlast the directory's or the
+    // filesystem's timeouts. Neither holds a lock or a child: a child still
+    // in `execve` belongs to its session's guard, and dropping the session,
+    // which this bound gives the workers time to do, kills it.
     runtime.shutdown_timeout(BLOCKING_GRACE);
     served
 }

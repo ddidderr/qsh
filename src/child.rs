@@ -1,12 +1,17 @@
 //! Spawning the remote process: privilege drop, environment, PTY setup.
 
-use std::ffi::CString;
-use std::os::fd::AsRawFd;
+use std::convert::Infallible;
+use std::ffi::{CString, OsStr, OsString};
+use std::fs::File;
+use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::{Gid, Pid, Uid, User};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
@@ -151,6 +156,9 @@ pub(crate) struct PreparedIdentity {
     groups: Vec<libc::gid_t>,
     /// Group for the session's terminal: `tty` where the system has one.
     terminal_group: Option<Gid>,
+    /// Checked here because the account's home can sit on a slow filesystem,
+    /// and the fork runs on an async worker.
+    home: PathBuf,
 }
 
 /// Resolve the target's supplementary groups before spawning a child.
@@ -183,6 +191,7 @@ pub(crate) fn prepare_identity(user: &User) -> Result<PreparedIdentity> {
         switch,
         groups,
         terminal_group,
+        home: home_of(user),
     })
 }
 
@@ -195,52 +204,57 @@ pub(crate) fn prepare_identity(user: &User) -> Result<PreparedIdentity> {
 /// Fails if the target user cannot be assumed, a PTY cannot be allocated, or
 /// the program cannot be executed.
 pub fn spawn(user: &User, req: &Request) -> Result<Spawned> {
-    spawn_prepared(user, req, prepare_identity(user)?, None)
+    let (spawned, exec) = spawn_prepared(user, req, prepare_identity(user)?, None)?;
+    exec.wait()?;
+    Ok(spawned)
 }
 
 /// Spawn using identity data that was resolved before the final authorization
 /// check. The caller must not use this for another account.
 ///
+/// Returns once the child leads its own process group and has closed every
+/// descriptor it inherited, before it can block; whether exec succeeds is
+/// left to [`PendingExec::wait`].
+///
 /// # Errors
-/// Fails if a PTY cannot be allocated or the program cannot be executed.
+/// Fails if a PTY cannot be allocated or the child cannot be forked.
 #[allow(unsafe_code, reason = "pre_exec runs between fork and exec")]
 pub(crate) fn spawn_prepared(
     user: &User,
     req: &Request,
     identity: PreparedIdentity,
     cgroup: Option<&SessionCgroup>,
-) -> Result<Spawned> {
+) -> Result<(Spawned, PendingExec)> {
     let PreparedIdentity {
         switch,
         groups,
         terminal_group,
+        home,
     } = identity;
     let cgroup_procs = cgroup.map(SessionCgroup::attach_fd).transpose()?;
 
-    let home = home_of(user);
     let shell = shell_of(user);
 
-    let mut cmd =
+    let (mut cmd, arg0) =
         if let Some((program, args)) = req.command.as_deref().and_then(<[String]>::split_first) {
             let mut cmd = Command::new(program);
             cmd.args(args);
-            cmd
+            (cmd, OsString::from(program))
         } else {
             // No command: an interactive login shell, exactly like `ssh host`.
             // The leading `-` in argv[0] is how a shell learns it is a login shell.
-            let mut cmd = Command::new(&shell);
             let base = shell.file_name().and_then(|s| s.to_str()).unwrap_or("sh");
-            cmd.as_std_mut().arg0(format!("-{base}"));
-            cmd
+            (Command::new(&shell), OsString::from(format!("-{base}")))
         };
 
+    // The working directory is set in the pre-exec hook, after the inherited
+    // descriptors are gone: like exec, chdir can block on a slow filesystem.
     cmd.env_clear()
         .env("PATH", DEFAULT_PATH)
         .env("HOME", &home)
         .env("USER", &user.name)
         .env("LOGNAME", &user.name)
-        .env("SHELL", &shell)
-        .current_dir(&home);
+        .env("SHELL", &shell);
 
     if let Some(p) = &req.pty {
         cmd.env("TERM", sanitize_term(&p.term));
@@ -277,13 +291,159 @@ pub(crate) fn spawn_prepared(
             .stderr(Stdio::piped());
         None
     };
-    let controlling_terminal = master.is_some();
-    // SAFETY: only async-signal-safe libc calls between fork and exec.
+
+    // A forked child holds a copy of every descriptor the server had open at
+    // the fork: other sessions' pipes and terminals, including the child ends
+    // of spawns in flight on other threads. Close-on-exec only releases them
+    // once exec succeeds, and the client decides how long exec takes: its
+    // program can sit on a filesystem that never answers. A child stuck there
+    // would keep those sessions from ever seeing EOF. So the hook closes
+    // everything before it can block, then execs by itself and reports a failure through
+    // this pipe; std's own report channel is among what gets closed, and std
+    // takes that as success, so the outcome is read from here instead.
+    let (status_read, status_write) = exec_status_pipe()?;
+    let exec = ChildExec {
+        program: PreparedExec::new(cmd.as_std(), &arg0, &home)?,
+        status: status_write.as_raw_fd(),
+        cgroup_procs: cgroup_procs.as_ref().map(AsRawFd::as_raw_fd),
+        controlling_terminal: master.is_some(),
+        switch,
+        groups,
+        uid,
+        gid,
+    };
+    // SAFETY: `run` only makes async-signal-safe libc calls, on memory
+    // prepared before the fork.
     unsafe {
-        cmd.as_std_mut().pre_exec(move || {
-            clear_inheritable_capabilities()?;
-            if let Some(procs) = &cgroup_procs {
-                cgroup::join_pre_exec(procs.as_raw_fd())?;
+        cmd.as_std_mut().pre_exec(move || exec.run());
+    }
+    let program = req.command.as_ref().and_then(|argv| argv.first()).cloned();
+    let mut child = {
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let _guard = pty::spawn_lock()?;
+        cmd.spawn()
+            .map_err(|error| spawn_error(error, program.as_deref(), &shell, &home))?
+    };
+    drop(status_write);
+    let io = if let Some(master) = master {
+        ChildIo::Pty(master)
+    } else {
+        let missing = || anyhow::anyhow!("a piped standard stream was not created");
+        ChildIo::Pipes {
+            stdin: child.stdin.take().ok_or_else(missing)?,
+            stdout: child.stdout.take().ok_or_else(missing)?,
+            stderr: child.stderr.take().ok_or_else(missing)?,
+        }
+    };
+    let exec = PendingExec {
+        status: status_read,
+        program,
+        shell,
+        home,
+    };
+    Ok((Spawned { child, io }, exec))
+}
+
+/// A child that has not exec'd yet. Holds only the status pipe and what an
+/// error message needs, never the child.
+#[must_use]
+pub(crate) struct PendingExec {
+    status: OwnedFd,
+    program: Option<String>,
+    shell: PathBuf,
+    home: PathBuf,
+}
+
+impl PendingExec {
+    /// Wait until the child has exec'd. Blocks for as long as exec does,
+    /// which the client's filesystem decides.
+    ///
+    /// # Errors
+    /// Fails if the program cannot be executed.
+    pub(crate) fn wait(self) -> Result<()> {
+        match read_exec_status(self.status)? {
+            None => Ok(()),
+            // The child has exited; tokio reaps it once its handle is dropped.
+            Some(error) => Err(spawn_error(
+                error,
+                self.program.as_deref(),
+                &self.shell,
+                &self.home,
+            )),
+        }
+    }
+}
+
+/// The pipe through which the pre-exec hook reports a failed exec. The write
+/// end is close-on-exec, so a successful exec reads as end of file, and it is
+/// kept above the standard descriptors that std's `dup2` overwrites.
+fn exec_status_pipe() -> Result<(OwnedFd, OwnedFd)> {
+    let (read, write) = nix::unistd::pipe2(OFlag::O_CLOEXEC).context("creating a pipe")?;
+    let write = if write.as_raw_fd() > 2 {
+        write
+    } else {
+        let raised = fcntl(&write, FcntlArg::F_DUPFD_CLOEXEC(3)).context("moving a pipe")?;
+        // SAFETY: `fcntl` just returned this descriptor, and nothing else owns it.
+        #[allow(unsafe_code, reason = "adopting a descriptor fcntl returned")]
+        unsafe {
+            OwnedFd::from_raw_fd(raised)
+        }
+    };
+    Ok((read, write))
+}
+
+/// Read the exec outcome for `PendingExec::wait`: `None` once the child has
+/// exec'd, or the error if it could not. A child that is still trying holds
+/// nothing but its own session's descriptors, so this may block as long as
+/// exec does.
+fn read_exec_status(status: OwnedFd) -> Result<Option<std::io::Error>> {
+    let mut report = Vec::with_capacity(4);
+    File::from(status)
+        .read_to_end(&mut report)
+        .context("reading the exec status of the remote process")?;
+    if report.is_empty() {
+        return Ok(None);
+    }
+    let errno = <[u8; 4]>::try_from(report.as_slice())
+        .map(i32::from_ne_bytes)
+        .map_err(|_| anyhow::anyhow!("malformed exec status from the remote process"))?;
+    Ok(Some(std::io::Error::from_raw_os_error(errno)))
+}
+
+/// Everything the child does between fork and exec, prepared before the fork.
+struct ChildExec {
+    program: PreparedExec,
+    /// Write end of the exec status pipe.
+    status: RawFd,
+    cgroup_procs: Option<RawFd>,
+    controlling_terminal: bool,
+    switch: bool,
+    groups: Vec<libc::gid_t>,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+}
+
+impl ChildExec {
+    /// Runs in the forked child, and never returns: once std's report channel
+    /// is closed, an error returned to std would abort the child.
+    #[allow(unsafe_code, reason = "runs between fork and exec")]
+    fn run(&self) -> ! {
+        let Err(error) = self.try_run();
+        let errno = error.raw_os_error().unwrap_or(libc::EINVAL).to_ne_bytes();
+        // SAFETY: async-signal-safe calls on a stack buffer.
+        unsafe {
+            libc::write(self.status, errno.as_ptr().cast(), errno.len());
+            libc::_exit(127)
+        }
+    }
+
+    #[allow(unsafe_code, reason = "runs between fork and exec")]
+    fn try_run(&self) -> std::io::Result<Infallible> {
+        clear_inheritable_capabilities()?;
+        // SAFETY: async-signal-safe syscalls on prepared, NUL-terminated data.
+        unsafe {
+            if let Some(procs) = self.cgroup_procs {
+                cgroup::join_pre_exec(procs)?;
                 #[cfg(target_os = "linux")]
                 {
                     // An opted-in account must not use a setuid binary or
@@ -297,30 +457,154 @@ pub(crate) fn spawn_prepared(
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            // Close only after the process group and cgroup are set up: std's
+            // spawn returns once its report channel closes, so from then on
+            // the server's group and cgroup signals reach this process.
+            // Nothing before the close can block.
+            close_descriptors_except([self.status, self.cgroup_procs.unwrap_or(self.status)])?;
             // stdin is the PTY slave; make it our controlling terminal.
-            if controlling_terminal && libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+            if self.controlling_terminal && libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            drop_privileges(switch, &groups, uid, gid)
-        });
-    }
-    let mut child = {
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let _guard = pty::spawn_lock()?;
-        cmd.spawn()
-            .map_err(|error| spawn_error(error, req.command.as_ref(), &shell, &home))?
-    };
-    let io = if let Some(master) = master {
-        ChildIo::Pty(master)
-    } else {
-        let missing = || anyhow::anyhow!("a piped standard stream was not created");
-        ChildIo::Pipes {
-            stdin: child.stdin.take().ok_or_else(missing)?,
-            stdout: child.stdout.take().ok_or_else(missing)?,
-            stderr: child.stderr.take().ok_or_else(missing)?,
+            if libc::chdir(self.program.home.as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
         }
-    };
-    Ok(Spawned { child, io })
+        drop_privileges(self.switch, &self.groups, self.uid, self.gid)?;
+        self.program.exec()
+    }
+}
+
+/// Program, argument and environment arrays for `execvp`, built before the
+/// fork because nothing may allocate after it.
+struct PreparedExec {
+    program: CString,
+    argv: CStringArray,
+    envp: CStringArray,
+    home: CString,
+}
+
+impl PreparedExec {
+    /// Take everything from `cmd`, which stays the one description of what
+    /// runs; only `argv[0]`, which std does not expose, comes separately.
+    fn new(cmd: &std::process::Command, name: &OsStr, home: &Path) -> Result<Self> {
+        let c_string = |text: &OsStr| {
+            CString::new(text.as_bytes()).context("argument or environment contains a NUL byte")
+        };
+        let argv = std::iter::once(name)
+            .chain(cmd.get_args())
+            .map(c_string)
+            .collect::<Result<_>>()?;
+        let envp = cmd
+            .get_envs()
+            .filter_map(|(key, value)| Some((key, value?)))
+            .map(|(key, value)| {
+                let mut entry = key.to_owned();
+                entry.push("=");
+                entry.push(value);
+                c_string(&entry)
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            program: c_string(cmd.get_program())?,
+            argv: CStringArray::new(argv),
+            envp: CStringArray::new(envp),
+            home: c_string(home.as_os_str())?,
+        })
+    }
+
+    /// Exec, searching `PATH` in the new environment the way std does. Only
+    /// returns on failure.
+    #[allow(unsafe_code, reason = "exec runs between fork and exec")]
+    fn exec(&self) -> std::io::Result<Infallible> {
+        extern "C" {
+            static mut environ: *const *const libc::c_char;
+        }
+        // SAFETY: this is the forked child, which has a single thread; the
+        // arrays are NULL-terminated and live until exec.
+        unsafe {
+            environ = self.envp.as_ptr();
+            libc::execvp(self.program.as_ptr(), self.argv.as_ptr());
+        }
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// A NULL-terminated array of pointers into strings it owns.
+struct CStringArray {
+    _strings: Vec<CString>,
+    pointers: Vec<*const libc::c_char>,
+}
+
+// SAFETY: the pointers refer into `_strings`, whose heap buffers never move or
+// change while the array exists; sharing it is sharing immutable bytes.
+#[allow(unsafe_code, reason = "raw pointers into owned, immutable strings")]
+unsafe impl Send for CStringArray {}
+#[allow(unsafe_code, reason = "raw pointers into owned, immutable strings")]
+unsafe impl Sync for CStringArray {}
+
+impl CStringArray {
+    fn new(strings: Vec<CString>) -> Self {
+        let pointers = strings
+            .iter()
+            .map(|string| string.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+        Self {
+            _strings: strings,
+            pointers,
+        }
+    }
+
+    fn as_ptr(&self) -> *const *const libc::c_char {
+        self.pointers.as_ptr()
+    }
+}
+
+/// Close every descriptor from 3 up except those in `keep`. Runs between fork
+/// and exec, so it only uses syscalls.
+#[allow(unsafe_code, reason = "close_range runs between fork and exec")]
+fn close_descriptors_except(mut keep: [RawFd; 2]) -> std::io::Result<()> {
+    keep.sort_unstable();
+    let mut first: RawFd = 3;
+    for fd in keep {
+        if fd > first {
+            close_range(first, fd - 1)?;
+        }
+        first = first.max(fd.saturating_add(1));
+    }
+    close_range(first, RawFd::MAX)
+}
+
+#[allow(unsafe_code, reason = "close_range runs between fork and exec")]
+fn close_range(first: RawFd, last: RawFd) -> std::io::Result<()> {
+    // SAFETY: plain syscalls on descriptor numbers; nothing in the child
+    // uses the closed descriptors afterwards.
+    unsafe {
+        #[cfg(target_os = "linux")]
+        {
+            if libc::syscall(libc::SYS_close_range, first, last, 0) == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ENOSYS) {
+                return Err(error);
+            }
+        }
+        // Kernels before 5.9: close one at a time, up to the descriptor limit.
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let end = RawFd::try_from(limit.rlim_cur).unwrap_or(RawFd::MAX);
+        for fd in first..end.min(last.saturating_add(1)) {
+            libc::close(fd);
+        }
+    }
+    Ok(())
 }
 
 /// Service-specific inheritable or ambient capabilities must not reach remote
@@ -402,16 +686,14 @@ impl std::fmt::Display for ProgramNotFound {
 
 fn spawn_error(
     error: std::io::Error,
-    command: Option<&Vec<String>>,
+    program: Option<&str>,
     shell: &Path,
     home: &Path,
 ) -> anyhow::Error {
     let not_found = error.kind() == std::io::ErrorKind::NotFound;
-    let program = match command.and_then(|argv| argv.first()) {
-        Some(program) => Path::new(program),
-        None => shell,
-    };
-    let error = anyhow::Error::new(error).context(describe(command, shell));
+    let described = describe(program, shell);
+    let program = program.map_or(shell, Path::new);
+    let error = anyhow::Error::new(error).context(described);
     if not_found {
         error.context(ProgramNotFound {
             exists: program_exists(program, home),
@@ -433,8 +715,8 @@ fn program_exists(program: &Path, home: &Path) -> bool {
     }
 }
 
-fn describe(command: Option<&Vec<String>>, shell: &Path) -> String {
-    match command.and_then(|argv| argv.first()) {
+fn describe(program: Option<&str>, shell: &Path) -> String {
+    match program {
         Some(program) => format!("executing `{program}`"),
         None => format!("starting login shell `{}`", shell.display()),
     }
@@ -775,6 +1057,50 @@ mod tests {
             "{out}"
         );
         let _ = sp.child.wait().await;
+    }
+
+    /// The server arms its group guard as soon as the spawn returns, so by then
+    /// the child must already lead its own group.
+    #[allow(unsafe_code, reason = "sched_setaffinity(2) has no safe wrapper here")]
+    #[tokio::test]
+    async fn the_child_leads_its_group_as_soon_as_spawn_returns() {
+        // On one CPU, the parent runs as soon as spawn can return, before the
+        // child gets further. Without this, closing too early slips through
+        // most runs. The harness gives each test its own thread.
+        // SAFETY: a zeroed set is valid, and it outlives the call.
+        unsafe {
+            let mut cpus: libc::cpu_set_t = std::mem::zeroed();
+            assert_eq!(
+                libc::sched_getaffinity(0, size_of_val(&cpus), &raw mut cpus),
+                0
+            );
+            let first = (0..libc::CPU_SETSIZE as usize)
+                .find(|&cpu| libc::CPU_ISSET(cpu, &cpus))
+                .unwrap();
+            libc::CPU_ZERO(&mut cpus);
+            libc::CPU_SET(first, &mut cpus);
+            assert_eq!(
+                libc::sched_setaffinity(0, size_of_val(&cpus), &raw const cpus),
+                0
+            );
+        }
+        let user = current_user().unwrap();
+        for _ in 0..50 {
+            let (mut spawned, _exec) = spawn_prepared(
+                &user,
+                &request(&["sleep", "30"], false),
+                prepare_identity(&user).unwrap(),
+                None,
+            )
+            .unwrap();
+            let pid = spawned.child.id().unwrap();
+            let leader = Pid::from_raw(i32::try_from(pid).unwrap());
+            let group = nix::unistd::getpgid(Some(leader));
+            signal_process_group(pid, libc::SIGKILL);
+            let _ = spawned.child.start_kill();
+            let _ = spawned.child.wait().await;
+            assert_eq!(group, Ok(leader));
+        }
     }
 
     #[tokio::test]
